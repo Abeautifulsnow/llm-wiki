@@ -1,0 +1,5 @@
+# AI assistant / tooling local state
+.trellis/
+.zcode/
+.claude/
+.codex/
