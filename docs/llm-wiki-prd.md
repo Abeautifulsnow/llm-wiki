@@ -7,7 +7,7 @@
 > 首期验证输入：具有多级目录结构的 Markdown `docs/` 目录  
 > 长期方向：作为 Knowledge Provider / Context Infrastructure 接入 TypeScript Agent Harness
 
-> 修订记录：R1 收敛版本范围并补齐发布/安全/Eval 契约；R2 补齐稳定身份、分层规划与 build/replan 边界；R3 完成跨章节一致性审查；R4 明确 Registry revision、路径规范和运行期观测契约。
+> 修订记录：R1 收敛版本范围并补齐发布/安全/Eval 契约；R2 补齐稳定身份、分层规划与 build/replan 边界；R3 完成跨章节一致性审查；R4 明确 Registry revision、路径规范和运行期观测契约；R5 补齐 MDX 支持、语言标注与平行语料策略、默认 exclude 一致性和全文直塞基线。
 
 ---
 
@@ -452,7 +452,10 @@ V0.1：
 ```text
 *.md
 *.markdown
+*.mdx
 ```
+
+`.mdx` 按 Markdown 解析，但必须先经过确定性的组件降级（见 §9）。
 
 ### 8.2 扫描结果
 
@@ -486,7 +489,7 @@ struct SourceFile {
 
 ```toml
 [source]
-include = ["**/*.md"]
+include = ["**/*.md", "**/*.mdx"]
 exclude = [
   "node_modules/**",
   ".git/**",
@@ -549,6 +552,10 @@ Plugin System > Architecture > Runtime
 它将成为 citation 的重要定位信息。
 
 frontmatter 仅作为受限元数据处理，不得覆盖系统字段（`id`、`generated`、`schema_version`、citation 等）。解析器必须保留 ATX/Setext heading、重复 heading、代码块、HTML、链接和 source range，并为无标题文档、非法 frontmatter、不可解析 Unicode 和二进制伪 Markdown 提供确定性诊断。
+
+`.mdx` 在 Markdown 解析前必须经过确定性组件降级：内嵌 JSX 组件（如 `<Callout>`、`<Tabs>`）只保留其文本子节点和属性中的可读内容，frontmatter、代码块和常规 Markdown 语法不受影响。降级规则必须版本化并计入 parser version；无法识别的 JSX 构造不得静默丢弃，必须产生诊断并在 lint 中报告。降级只影响送入 analysis 的文本，不改写 Source。
+
+语言标注在解析阶段确定，优先级为：frontmatter 显式 `lang`/`language` 字段 > 文件名语言后缀（如 `.cn.md`、`.zh-CN.mdx`）> 内容 script 启发式。结果写入文档与 Wiki frontmatter 的 `language` 字段，作为 §20 TextAnalyzer 选择 analyzer 的依据；无法判定时标记 `und`、使用默认 analyzer 并产生诊断。
 
 ---
 
@@ -726,6 +733,8 @@ V0.1 使用两阶段：
 LLM 只能提出 merge candidate，核心系统执行并保存 resolution 结果。
 
 不要在 V0.1 追求自动完美实体消歧。
+
+中英平行语料（同一主题两种语言的成对文件）在 V0.1 建议按语言拆分 workspace 分别构建：两阶段 ER 的 deterministic normalization 只在语言内部有效，跨语言实体归并不做承诺；混合 ingest 会产生重复实体与重复页面。允许单一 workspace ingest 多语言文件（语言标注见 §9），此时平行文件预期各自成页；把平行主题归并为单一实体/页面及跨语言检索属于后续版本能力，启用前必须在 Eval 中验证。
 
 ---
 
@@ -1246,6 +1255,8 @@ Answer + citations
 
 未来 Agent 通常优先调用 `search/context`，而不是 `query`，避免 Wiki Engine 与 Agent 双重 reasoning。
 
+在 search/query API 交付之前，`wiki_dir` 中的编译产物本身就是可被任何外部 LLM 直接消费的 grounded 上下文；这不是本产品的问答能力承诺——产品化检索与问答分别自 V0.2（search）与 V0.5（query）交付，也正因如此 §37.4 要求把全文直塞基线纳入对比。
+
 ---
 
 ## 25. LLM Provider
@@ -1571,8 +1582,8 @@ wiki_dir = "./wiki" # canonical managed generations + current pointer
 
 [source]
 root = "./docs"
-include = ["**/*.md"]
-exclude = ["wiki/**", ".llm-wiki/**", ".git/**"]
+include = ["**/*.md", "**/*.mdx"]
+exclude = ["wiki/**", ".llm-wiki/**", ".git/**", "node_modules/**"]
 
 [llm]
 provider = "openai-compatible"
@@ -1753,7 +1764,7 @@ evals/
 
 首个 benchmark 使用真实风格 docs：
 
-- 30–100 Markdown。
+- 30–100 Markdown/MDX，其中至少含少量 `.mdx` 文件与一组中英平行文档。
 - 至少 4 层目录中的部分文件。
 - 存在跨文件知识。
 - 存在同义术语。
@@ -1792,7 +1803,7 @@ Wiki page 之间关系是否合理。
 
 ### 37.3 V0.1 可执行门槛
 
-Eval fixture 必须具有人工标注的 source facts、允许的 citation ranges、预期跨文档页面和至少 20 个检索问题；fixture 至少包含 30 个 Markdown 文档。CI 中使用 `FakeLlmProvider` 跑确定性评测，真实 LLM 评测只作为显式触发的补充。
+Eval fixture 必须具有人工标注的 source facts、允许的 citation ranges、预期跨文档页面和至少 20 个检索问题；fixture 至少包含 30 个 Markdown/MDX 文档。CI 中使用 `FakeLlmProvider` 跑确定性评测，真实 LLM 评测只作为显式触发的补充。
 
 V0.1 的 release gate：
 
@@ -1809,6 +1820,8 @@ V0.1 的 release gate：
 产品成功标准中“明显优于 Raw Chunk RAG”必须有可复现实验，而非主观描述。Eval 必须提供一个固定的 baseline：同一 source snapshot、同一问题集、相同模型、相同最大上下文 token 和明确版本化的 chunking/retrieval 参数。Wiki 与 baseline 均输出其实际 context 和 citations，供人工审计。
 
 在跨文档问题集上，Wiki 的 relevant-context recall@K 和跨文档综合得分均必须比 baseline 高至少 10 个百分点；answer-level citation correctness 不得低于 baseline，hallucination rate 不得更高。未达到时不得宣称完成 Knowledge Compiler 假设验证。不能自动判定的事实支持度使用双人盲审并记录分歧处理规则。
+
+基线必须覆盖适用于该语料规模的全部低成本方案，而不是只选弱基线：语料超出模型上下文时使用 chunk + BM25/vector RAG；语料可整体装入模型上下文时，必须额外加入全文直塞基线（带文件分隔标记的完整语料直接作为上下文、不检索；文档站已发布的 `llms.txt`/全文 dump 可直接作为其输入）。对全文直塞基线不比较 recall@K（恒为全量），而比较同问题集上的 answer correctness、hallucination rate、citation 正确性与实际 context token 消耗：Wiki 的 answer correctness 不得显著低于全文直塞（容差在 evals 中定义并版本化），且必须在 citation 精确性与 token 效率上显著优于它；否则说明该语料规模下直接使用原文更划算，不得宣称 Knowledge Compiler 假设在该规模成立。
 
 ---
 
@@ -2226,7 +2239,7 @@ llm-wiki build ./test-data/docs
 
 必须满足：
 
-1. 自动发现全部合法 Markdown。
+1. 自动发现全部合法 Markdown/MDX，`.mdx` 组件降级不丢失正文文本。
 2. 不读取 exclude 文件。
 3. 永不读取 `.llm-wiki/**` 或 `wiki_dir/**`，且 source root 与 `wiki_dir` 重叠时拒绝执行。
 4. 建立 source manifest。
@@ -2281,6 +2294,7 @@ changed source = 1
 - hash。
 - manifest diff。
 - Markdown section extraction。
+- MDX 组件降级与语言标注。
 - stable ID。
 - dependency calculation。
 - citation validation。
