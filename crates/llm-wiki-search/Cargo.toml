@@ -1,0 +1,10 @@
+[package]
+name = "llm-wiki-search"
+description = "Search layer placeholder — FTS/rank fusion land in V0.2+ (PRD §20, §50)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+llm-wiki-core = { workspace = true }

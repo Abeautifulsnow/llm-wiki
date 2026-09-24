@@ -1,0 +1,183 @@
+//! OpenAI-compatible chat-completions adapter (PRD §25, §32).
+//!
+//! Works against any `/v1/chat/completions` endpoint (vLLM, OpenRouter, …).
+//! The API key is read from the env var *named* by the config — it never
+//! lives in project config. Retry is bounded exponential backoff on
+//! 429/5xx/network errors; other statuses fail fast.
+
+use std::time::Duration;
+
+use async_trait::async_trait;
+use serde_json::json;
+
+use crate::{LlmError, LlmProvider, LlmRequest, LlmResponse};
+
+pub struct OpenAiCompatibleProvider {
+    base_url: String,
+    model: String,
+    api_key: Option<String>,
+    timeout: Duration,
+    max_retries: u32,
+    client: reqwest::Client,
+}
+
+impl OpenAiCompatibleProvider {
+    /// Builds a provider. `api_key_env` is the config-declared env var name;
+    /// a missing env var is only an error once a request actually needs it
+    /// (some local endpoints run without keys).
+    pub fn new(
+        base_url: &str,
+        model: &str,
+        api_key_env: &str,
+        timeout_seconds: u64,
+        max_retries: u32,
+    ) -> Result<Self, LlmError> {
+        let api_key = match std::env::var(api_key_env) {
+            Ok(key) if !key.trim().is_empty() => Some(key.trim().to_owned()),
+            Ok(_) => None,
+            Err(std::env::VarError::NotPresent) => None,
+            Err(e) => return Err(LlmError::MissingApiKey(format!("{api_key_env}: {e}"))),
+        };
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(timeout_seconds))
+            .build()
+            .map_err(|e| LlmError::Http(format!("client build: {e}")))?;
+        Ok(Self {
+            base_url: base_url.trim_end_matches('/').to_owned(),
+            model: model.to_owned(),
+            api_key,
+            timeout: Duration::from_secs(timeout_seconds),
+            max_retries,
+            client,
+        })
+    }
+
+    async fn send(&self, body: serde_json::Value) -> Result<reqwest::Response, LlmError> {
+        let url = format!("{}/chat/completions", self.base_url);
+        let mut attempt = 0u32;
+        loop {
+            let mut request = self.client.post(&url).json(&body);
+            if let Some(key) = &self.api_key {
+                request = request.bearer_auth(key);
+            }
+            let result = request.send().await;
+
+            match result {
+                Ok(response) => {
+                    let status = response.status();
+                    if status.is_success() {
+                        return Ok(response);
+                    }
+                    let retryable = status.as_u16() == 429 || status.is_server_error();
+                    if !retryable || attempt >= self.max_retries {
+                        let message = response.text().await.unwrap_or_default();
+                        return Err(LlmError::Api {
+                            code: status.as_u16(),
+                            message,
+                        });
+                    }
+                    let retry_after = response
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<u64>().ok());
+                    if let Some(seconds) = retry_after {
+                        tokio::time::sleep(Duration::from_secs(seconds.min(30))).await;
+                    } else {
+                        backoff(attempt).await;
+                    }
+                }
+                Err(err) => {
+                    let is_timeout = err.is_timeout();
+                    if attempt >= self.max_retries {
+                        return Err(if is_timeout {
+                            LlmError::Timeout {
+                                timeout_seconds: self.timeout.as_secs(),
+                            }
+                        } else {
+                            LlmError::Http(err.to_string())
+                        });
+                    }
+                    backoff(attempt).await;
+                }
+            }
+            attempt += 1;
+        }
+    }
+}
+
+async fn backoff(attempt: u32) {
+    let millis = 500u64 * (1u64 << attempt.min(4));
+    tokio::time::sleep(Duration::from_millis(millis)).await;
+}
+
+#[async_trait]
+impl LlmProvider for OpenAiCompatibleProvider {
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn provider_name(&self) -> &str {
+        "openai-compatible"
+    }
+
+    async fn generate(&self, request: LlmRequest) -> Result<LlmResponse, LlmError> {
+        let mut messages = Vec::new();
+        if let Some(system) = &request.system {
+            messages.push(json!({ "role": "system", "content": system }));
+        }
+        messages.push(json!({ "role": "user", "content": request.prompt }));
+
+        let mut body = json!({
+            "model": self.model,
+            "messages": messages,
+            "temperature": request.temperature,
+            "max_tokens": request.max_output_tokens,
+        });
+        if request.json_mode {
+            body["response_format"] = json!({ "type": "json_object" });
+        }
+
+        let response = self.send(body).await?;
+        let payload: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| LlmError::InvalidResponse(format!("body is not JSON: {e}")))?;
+
+        let choice = payload
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .ok_or_else(|| LlmError::InvalidResponse("missing choices[0]".to_owned()))?;
+        let text = choice
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .ok_or_else(|| {
+                LlmError::InvalidResponse("missing choices[0].message.content".to_owned())
+            })?
+            .to_owned();
+        let finish_reason = choice
+            .get("finish_reason")
+            .and_then(|f| f.as_str())
+            .map(str::to_owned);
+        let (input_tokens, output_tokens) = payload
+            .get("usage")
+            .map(|u| {
+                (
+                    u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                    u.get("completion_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                )
+            })
+            .unwrap_or((0, 0));
+
+        Ok(LlmResponse {
+            text,
+            model: self.model.clone(),
+            input_tokens,
+            output_tokens,
+            finish_reason,
+        })
+    }
+}

@@ -1,0 +1,18 @@
+[package]
+name = "llm-wiki-source"
+description = "Source scanning, path normalization, hashing and manifests (PRD §8, §41, §43)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+llm-wiki-core = { workspace = true }
+globset = { workspace = true }
+walkdir = { workspace = true }
+sha2 = { workspace = true }
+unicode-normalization = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }

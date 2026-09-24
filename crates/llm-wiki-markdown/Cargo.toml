@@ -1,0 +1,13 @@
+[package]
+name = "llm-wiki-markdown"
+description = "Markdown/MDX structural parsing: sections, heading paths, ranges, MDX downgrade, language tagging (PRD §9)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+llm-wiki-core = { workspace = true }
+pulldown-cmark = { workspace = true }
+unicode-normalization = { workspace = true }
+serde = { workspace = true }

@@ -1,0 +1,17 @@
+[package]
+name = "llm-wiki-core"
+description = "Domain models, IDs, config and deterministic matching for LLM-Wiki"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+sha2 = { workspace = true }
+ulid = { workspace = true }
+unicode-normalization = { workspace = true }

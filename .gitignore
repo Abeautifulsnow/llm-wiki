@@ -4,3 +4,6 @@
 .claude/
 .codex/
 .mimosa/
+/target
+.llm-wiki/
+.zcodeignore
