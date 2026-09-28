@@ -12,6 +12,7 @@ pub mod frontmatter;
 pub mod language;
 pub mod mdx;
 pub mod parser;
+pub mod segment;
 
 pub use frontmatter::Frontmatter;
 pub use language::detect_language;
@@ -19,3 +20,4 @@ pub use mdx::downgrade_jsx;
 pub use parser::{
     parse_document, LinkOutput, ParseDiagnostic, ParseDiagnosticKind, ParseOutput, SectionOutput,
 };
+pub use segment::{estimate_tokens, split_section, SectionSegment};

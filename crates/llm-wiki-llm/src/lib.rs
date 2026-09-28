@@ -8,6 +8,10 @@
 
 pub mod fake;
 pub mod openai;
+pub mod structured;
+
+pub use fake::FakeLlmProvider;
+pub use openai::OpenAiCompatibleProvider;
 
 use async_trait::async_trait;
 use thiserror::Error;

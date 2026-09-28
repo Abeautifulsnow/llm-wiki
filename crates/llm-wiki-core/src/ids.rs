@@ -117,6 +117,27 @@ opaque_id!(
     BuildId,
     "bld"
 );
+opaque_id!(
+    /// Stage-one analysis record identity (PRD §11).
+    AnalysisId,
+    "an"
+);
+opaque_id!(
+    /// Claim row identity; the claim's *knowledge* identity is the registry
+    /// `KnowledgeNodeId` it references (PRD §12.1.1).
+    ClaimRowId,
+    "cl"
+);
+opaque_id!(
+    /// Relation row identity.
+    RelationRowId,
+    "rel"
+);
+opaque_id!(
+    /// Auditable rejected-claim record identity (PRD §11.1).
+    RejectedClaimId,
+    "rj"
+);
 
 opaque_id!(
     /// Recomputable source locator: `hash(workspace + normalized relative path)`

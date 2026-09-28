@@ -220,6 +220,134 @@ pub fn get_or_create(
     Ok((id, rev, true))
 }
 
+/// One node to resolve-or-create in a [`get_or_create_batch`] call.
+#[derive(Debug, Clone)]
+pub struct NodeDraft {
+    pub kind: NodeKind,
+    pub canonical_key: String,
+    pub canonical_name: String,
+    /// Entity/concept detail; written for new nodes and refreshed on
+    /// existing ones (does not affect resolution, so no revision bump).
+    pub entity_type: Option<String>,
+    pub description: Option<String>,
+}
+
+/// Resolves or creates many nodes inside ONE transaction. The revision is
+/// bumped exactly once **per created node** (PRD §12.1.1: every committed
+/// node creation increments the revision once); lookups never bump.
+/// Returns one id per draft, in input order.
+pub fn get_or_create_batch(
+    conn: &mut Connection,
+    drafts: &[NodeDraft],
+    build_id: Option<&str>,
+) -> Result<Vec<KnowledgeNodeId>> {
+    let tx = conn
+        .transaction()
+        .map_err(|e| WikiError::Storage(format!("begin tx: {e}")))?;
+    let base_revision = current_revision(&tx)?;
+    let mut created_count = 0u64;
+    let mut ids = Vec::with_capacity(drafts.len());
+
+    {
+        let mut select_stmt = tx
+            .prepare(
+                "SELECT id, status, merged_into FROM knowledge_registry WHERE node_kind = ?1 AND canonical_key = ?2",
+            )
+            .map_err(db)?;
+        let mut insert_stmt = tx
+            .prepare(
+                "INSERT INTO knowledge_registry (id, node_kind, canonical_key, canonical_name, status, created_build_id, created_revision, entity_type, description)
+                 VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6, ?7, ?8)",
+            )
+            .map_err(db)?;
+        let mut update_detail_stmt = tx
+            .prepare(
+                "UPDATE knowledge_registry SET entity_type = COALESCE(?1, entity_type), description = COALESCE(?2, description) WHERE id = ?3",
+            )
+            .map_err(db)?;
+
+        for draft in drafts.iter() {
+            let existing: Option<(String, String, Option<String>)> = select_stmt
+                .query_row(params![draft.kind.as_str(), draft.canonical_key], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .ok();
+
+            let id = match existing {
+                Some((id, status, merged_into)) if status == "merged" => {
+                    // Follow the merge chain to the primary node (same tx).
+                    let mut current = merged_into.ok_or_else(|| {
+                        WikiError::Storage(format!(
+                            "node {id} is merged but has no merged_into target"
+                        ))
+                    })?;
+                    loop {
+                        let row: Option<(String, String, Option<String>)> = tx
+                            .query_row(
+                                "SELECT id, status, merged_into FROM knowledge_registry WHERE id = ?1",
+                                params![current],
+                                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                            )
+                            .ok();
+                        match row {
+                            Some((id, status, merged_into)) if status == "merged" => {
+                                current = merged_into.ok_or_else(|| {
+                                    WikiError::Storage(format!(
+                                        "node {id} is merged but has no merged_into target"
+                                    ))
+                                })?;
+                            }
+                            Some((id, _active, _)) => break KnowledgeNodeId::from_validated(id),
+                            None => {
+                                return Err(WikiError::Storage(format!(
+                                    "merged node points to missing target {current}"
+                                )))
+                            }
+                        }
+                    }
+                }
+                Some((id, _active, _)) => KnowledgeNodeId::from_validated(id),
+                None => {
+                    created_count += 1;
+                    let id = KnowledgeNodeId::generate();
+                    insert_stmt
+                        .execute(params![
+                            id.as_str(),
+                            draft.kind.as_str(),
+                            draft.canonical_key,
+                            draft.canonical_name,
+                            build_id,
+                            (base_revision + created_count) as i64,
+                            draft.entity_type,
+                            draft.description
+                        ])
+                        .map_err(db)?;
+                    id
+                }
+            };
+
+            if draft.entity_type.is_some() || draft.description.is_some() {
+                update_detail_stmt
+                    .execute(params![draft.entity_type, draft.description, id.as_str()])
+                    .map_err(db)?;
+            }
+            ids.push(id);
+        }
+    }
+
+    if created_count > 0 {
+        // One revision increment per created node, inside the same tx.
+        tx.execute(
+            "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + ?2 AS TEXT) WHERE key = ?1",
+            params![REVISION_KEY, created_count as i64],
+        )
+        .map_err(db)?;
+    }
+    tx.commit()
+        .map_err(|e| WikiError::Storage(format!("commit batch create: {e}")))?;
+    Ok(ids)
+}
+
 /// Executes an LLM-confirmed merge: the secondary node becomes `merged` with
 /// `merged_into = primary`; the primary keeps its identity and all existing
 /// references stay valid (PRD §12.1.1).

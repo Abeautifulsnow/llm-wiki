@@ -6,6 +6,7 @@ members = [
     "crates/llm-wiki-markdown",
     "crates/llm-wiki-llm",
     "crates/llm-wiki-storage",
+    "crates/llm-wiki-compiler",
     "crates/llm-wiki-search",
     "crates/llm-wiki-cli",
     "crates/llm-wiki-server",
@@ -23,6 +24,7 @@ llm-wiki-source = { path = "crates/llm-wiki-source" }
 llm-wiki-markdown = { path = "crates/llm-wiki-markdown" }
 llm-wiki-llm = { path = "crates/llm-wiki-llm" }
 llm-wiki-storage = { path = "crates/llm-wiki-storage" }
+llm-wiki-compiler = { path = "crates/llm-wiki-compiler" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
