@@ -17,6 +17,11 @@ pub struct BuildDraft {
     pub parser_version: Option<String>,
     pub schema_version: Option<String>,
     pub config_hash: Option<String>,
+    /// Canonical BuildFingerprint (PRD §18.1/§19.2): the planning-relevant
+    /// inputs this build was derived from. The incremental pipeline compares
+    /// it against the last COMPLETED build to detect drift (§19.2: any drift
+    /// in planning-relevant fields forces REPLAN_REQUIRED).
+    pub build_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -43,8 +48,8 @@ pub fn start_build(conn: &mut Connection, draft: &BuildDraft) -> Result<BuildId>
         .transaction()
         .map_err(|e| WikiError::Storage(format!("begin tx: {e}")))?;
     tx.execute(
-        "INSERT INTO builds (build_id, started_at, status, source_snapshot_hash, model, prompt_version, compiler_version, parser_version, schema_version, config_hash)
-         VALUES (?1, ?2, 'RUNNING', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO builds (build_id, started_at, status, source_snapshot_hash, model, prompt_version, compiler_version, parser_version, schema_version, config_hash, build_fingerprint)
+         VALUES (?1, ?2, 'RUNNING', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             build_id.as_str(),
             Utc::now().to_rfc3339(),
@@ -54,7 +59,8 @@ pub fn start_build(conn: &mut Connection, draft: &BuildDraft) -> Result<BuildId>
             draft.compiler_version,
             draft.parser_version,
             draft.schema_version,
-            draft.config_hash
+            draft.config_hash,
+            draft.build_fingerprint
         ],
     )
     .map_err(|e| WikiError::Storage(format!("insert build: {e}")))?;
@@ -166,6 +172,28 @@ pub fn latest_build(conn: &Connection) -> Result<Option<BuildRecord>> {
     }
 }
 
+/// The most recent COMPLETED build — the incremental pipeline (PRD §19.2)
+/// compares its BuildFingerprint against the current one and carries the
+/// generation this build published. FAILED/REPLAN_REQUIRED/INTERRUPTED builds
+/// never published and must not answer the comparison.
+pub fn latest_completed_build(conn: &Connection) -> Result<Option<BuildRecord>> {
+    let sql = format!(
+        "SELECT {SELECT_COLS} FROM builds WHERE status = 'COMPLETED'
+         ORDER BY started_at DESC LIMIT 1"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| WikiError::Storage(format!("prepare latest_completed_build: {e}")))?;
+    let mut rows = stmt
+        .query([])
+        .map_err(|e| WikiError::Storage(format!("latest_completed_build: {e}")))?;
+    match rows.next() {
+        Ok(Some(row)) => Ok(Some(row_to_record(row)?)),
+        Ok(None) => Ok(None),
+        Err(e) => Err(WikiError::Storage(format!("latest_completed_build: {e}"))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,6 +210,7 @@ mod tests {
             parser_version: Some("parser0".into()),
             schema_version: Some("1".into()),
             config_hash: Some("cfg".into()),
+            build_fingerprint: None,
         };
         let id = start_build(&mut conn, &draft).unwrap();
         assert!(latest_build(&conn).unwrap().unwrap().status == "RUNNING");
@@ -208,5 +237,37 @@ mod tests {
             Some("snap-1".to_owned())
         );
         assert!(set_build_snapshot_hash(&mut conn, &BuildId::generate(), "x").is_err());
+    }
+
+    #[test]
+    fn latest_completed_build_skips_terminal_non_completed_states() {
+        let mut conn = open_in_memory().unwrap();
+        assert!(latest_completed_build(&conn).unwrap().is_none());
+
+        let first = start_build(&mut conn, &BuildDraft::default()).unwrap();
+        finish_build(&mut conn, &first, "COMPLETED", Some("fp-1"), Some(1)).unwrap();
+        assert_eq!(
+            latest_completed_build(&conn).unwrap().unwrap().build_id,
+            first
+        );
+
+        // A later FAILED build and an even later REPLAN_REQUIRED build must
+        // not shadow the last COMPLETED one (§19: the previous generation of
+        // the last completed build is the carry-over baseline).
+        let failed = start_build(&mut conn, &BuildDraft::default()).unwrap();
+        finish_build(&mut conn, &failed, "FAILED", None, None).unwrap();
+        let replan = start_build(
+            &mut conn,
+            &BuildDraft {
+                build_fingerprint: Some("fp-2".into()),
+                ..BuildDraft::default()
+            },
+        )
+        .unwrap();
+        finish_build(&mut conn, &replan, "REPLAN_REQUIRED", None, None).unwrap();
+
+        let completed = latest_completed_build(&conn).unwrap().unwrap();
+        assert_eq!(completed.build_id, first);
+        assert_eq!(completed.build_fingerprint.as_deref(), Some("fp-1"));
     }
 }

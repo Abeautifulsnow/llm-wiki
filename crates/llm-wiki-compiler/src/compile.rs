@@ -96,6 +96,22 @@ impl WikiCompiler {
         base: &KnowledgeBase,
         build_id: &BuildId,
     ) -> Result<CompiledGeneration> {
+        let all: BTreeSet<WikiPageId> = plan.pages.iter().map(|page| page.id.clone()).collect();
+        self.compile_plan_subset(plan, base, build_id, &all).await
+    }
+
+    /// Compiles ONLY the pages in `page_ids` — the incremental pipeline
+    /// (PRD §19.2) recompiles the affected set and carries every other page
+    /// over verbatim. `plan` must still contain ALL surviving pages:
+    /// WikiLink/Related resolution needs the full title map of the
+    /// generation, while only the subset consumes LLM requests.
+    pub async fn compile_plan_subset(
+        &self,
+        plan: &WikiPlan,
+        base: &KnowledgeBase,
+        build_id: &BuildId,
+        page_ids: &BTreeSet<WikiPageId>,
+    ) -> Result<CompiledGeneration> {
         let mut title_to_id: BTreeMap<String, WikiPageId> = BTreeMap::new();
         for page in &plan.pages {
             let folded = page.title.trim().to_lowercase();
@@ -113,6 +129,9 @@ impl WikiCompiler {
         let mut pages = Vec::new();
         let mut llm_request_count = 0u32;
         for page in &plan.pages {
+            if !page_ids.contains(&page.id) {
+                continue; // carried over verbatim by the caller (PRD §19)
+            }
             let (record, requests) = self
                 .compile_page(page, plan, base, build_id, &title_to_id)
                 .await?;

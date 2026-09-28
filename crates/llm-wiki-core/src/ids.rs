@@ -145,6 +145,13 @@ opaque_id!(
 );
 
 opaque_id!(
+    /// Incremental-build decision record identity (PRD §19.2): one row per
+    /// mapping/replan judgment, written to `plan_decisions` (migration 0006).
+    DecisionId,
+    "dec"
+);
+
+opaque_id!(
     /// Recomputable source locator: `hash(workspace + normalized relative path)`
     /// (PRD §8.2). Not an identity — the Source Registry maps it to a
     /// [`SourceId`].

@@ -10,8 +10,199 @@ use llm_wiki_core::error::{Result, WikiError};
 use llm_wiki_core::ids::{BuildId, ClaimRowId, KnowledgeNodeId, SectionId, SourceId};
 use llm_wiki_core::model::SourceRange;
 
+use crate::registry::bump_revision;
+
 fn db(e: rusqlite::Error) -> WikiError {
     WikiError::Storage(e.to_string())
+}
+
+/// One knowledge node this source currently supports, with the section that
+/// anchors it (claims: the claim's section; relations: the relation's
+/// section). The incremental pipeline (PRD §19.2) uses these to map new
+/// nodes onto the pages that previously owned the source's sections.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceNodeSection {
+    pub node_id: KnowledgeNodeId,
+    pub section_id: Option<SectionId>,
+}
+
+/// Distinct knowledge nodes (+ anchoring sections) this source currently
+/// supports through its ACTIVE claims and relations, ordered by node id.
+pub fn list_source_active_node_sections(
+    conn: &Connection,
+    source_id: &SourceId,
+) -> Result<Vec<SourceNodeSection>> {
+    let mut out: std::collections::BTreeMap<KnowledgeNodeId, Option<SectionId>> =
+        std::collections::BTreeMap::new();
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT node_id, section_id FROM claims
+                 WHERE source_id = ?1 AND status = 'active' ORDER BY node_id",
+            )
+            .map_err(|e| WikiError::Storage(format!("prepare source claim nodes: {e}")))?;
+        let rows = stmt
+            .query_map(params![source_id.as_str()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .map_err(|e| WikiError::Storage(format!("source claim nodes: {e}")))?;
+        for row in rows {
+            let (node_id, section_id) = row.map_err(db)?;
+            out.entry(KnowledgeNodeId::from_validated(node_id))
+                .or_insert(section_id.map(SectionId::from_validated));
+        }
+    }
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT r.source_node_id, r.section_id FROM relations r
+                 JOIN document_analyses a ON a.analysis_id = r.analysis_id
+                 WHERE a.source_id = ?1 AND r.status = 'active'
+                 UNION
+                 SELECT r.target_node_id, r.section_id FROM relations r
+                 JOIN document_analyses a ON a.analysis_id = r.analysis_id
+                 WHERE a.source_id = ?1 AND r.status = 'active'",
+            )
+            .map_err(|e| WikiError::Storage(format!("prepare source relation nodes: {e}")))?;
+        let rows = stmt
+            .query_map(params![source_id.as_str()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .map_err(|e| WikiError::Storage(format!("source relation nodes: {e}")))?;
+        for row in rows {
+            let (node_id, section_id) = row.map_err(db)?;
+            out.entry(KnowledgeNodeId::from_validated(node_id))
+                .or_insert(section_id.map(SectionId::from_validated));
+        }
+    }
+    Ok(out
+        .into_iter()
+        .map(|(node_id, section_id)| SourceNodeSection {
+            node_id,
+            section_id,
+        })
+        .collect())
+}
+
+/// What [`retire_source_knowledge`] retired for one removed source.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetiredSourceKnowledge {
+    pub retired_claims: u64,
+    pub retired_relations: u64,
+    /// Distinct nodes the source supported (its claims + relation endpoints).
+    pub affected_nodes: Vec<KnowledgeNodeId>,
+    /// Registry nodes that lost ALL support and were retired (no ghost
+    /// knowledge may survive a deletion, PRD §19.3).
+    pub retired_registry_nodes: Vec<KnowledgeNodeId>,
+}
+
+/// Retires the active claims and relations of a REMOVED source without
+/// replacement (PRD §19.3: deletion must leave no ghost knowledge). Registry
+/// nodes that lose all supporting claims AND touching relations are retired
+/// too (one revision bump per transaction). Read
+/// [`list_source_active_node_sections`] BEFORE calling this if the affected
+/// nodes' section anchors are still needed.
+pub fn retire_source_knowledge(
+    conn: &mut Connection,
+    source_id: &SourceId,
+    build_id: Option<&str>,
+) -> Result<RetiredSourceKnowledge> {
+    let tx = conn
+        .transaction()
+        .map_err(|e| WikiError::Storage(format!("begin tx: {e}")))?;
+
+    let mut affected: std::collections::BTreeSet<KnowledgeNodeId> =
+        std::collections::BTreeSet::new();
+    {
+        let mut stmt = tx
+            .prepare(
+                "SELECT DISTINCT node_id FROM claims
+                 WHERE source_id = ?1 AND status = 'active'",
+            )
+            .map_err(db)?;
+        let rows = stmt
+            .query_map(params![source_id.as_str()], |row| row.get::<_, String>(0))
+            .map_err(db)?;
+        for row in rows {
+            affected.insert(KnowledgeNodeId::from_validated(row.map_err(db)?));
+        }
+    }
+    for column in ["r.source_node_id", "r.target_node_id"] {
+        // Column names are compile-time constants, never user input.
+        let sql = format!(
+            "SELECT DISTINCT {column} FROM relations r
+             JOIN document_analyses a ON a.analysis_id = r.analysis_id
+             WHERE a.source_id = ?1 AND r.status = 'active'"
+        );
+        let mut stmt = tx.prepare(&sql).map_err(db)?;
+        let rows = stmt
+            .query_map(params![source_id.as_str()], |row| row.get::<_, String>(0))
+            .map_err(db)?;
+        for row in rows {
+            affected.insert(KnowledgeNodeId::from_validated(row.map_err(db)?));
+        }
+    }
+
+    let retired_claims = tx
+        .execute(
+            "UPDATE claims SET status = 'retired', retired_build_id = ?2
+             WHERE source_id = ?1 AND status = 'active'",
+            params![source_id.as_str(), build_id],
+        )
+        .map_err(db)?;
+    let retired_relations = tx
+        .execute(
+            "UPDATE relations SET status = 'retired', retired_build_id = ?2
+             WHERE status = 'active' AND analysis_id IN
+             (SELECT analysis_id FROM document_analyses WHERE source_id = ?1)",
+            params![source_id.as_str(), build_id],
+        )
+        .map_err(db)?;
+
+    // Nodes left without any active claim and without any touching relation
+    // are knowledge only this source supported: retire them (PRD §19.3.2).
+    let mut retired_registry_nodes = Vec::new();
+    for node_id in &affected {
+        let active_claims: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM claims WHERE node_id = ?1 AND status = 'active'",
+                params![node_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(db)?;
+        let active_relations: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM relations
+                 WHERE status = 'active' AND (source_node_id = ?1 OR target_node_id = ?1)",
+                params![node_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(db)?;
+        if active_claims == 0 && active_relations == 0 {
+            let changed = tx
+                .execute(
+                    "UPDATE knowledge_registry SET status = 'retired', retired_build_id = ?2
+                     WHERE id = ?1 AND status = 'active'",
+                    params![node_id.as_str(), build_id],
+                )
+                .map_err(db)?;
+            if changed > 0 {
+                retired_registry_nodes.push(node_id.clone());
+            }
+        }
+    }
+    if !retired_registry_nodes.is_empty() {
+        bump_revision(&tx)?;
+    }
+
+    tx.commit()
+        .map_err(|e| WikiError::Storage(format!("commit retire source knowledge: {e}")))?;
+    Ok(RetiredSourceKnowledge {
+        retired_claims: retired_claims as u64,
+        retired_relations: retired_relations as u64,
+        affected_nodes: affected.into_iter().collect(),
+        retired_registry_nodes,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -112,7 +303,49 @@ pub fn persist_analysis(
     .map_err(db)?;
 
     let retired_build = persistence.record.build_id.as_ref().map(|b| b.as_str());
+    // Claim nodes AND relation endpoints this source supported BEFORE the
+    // replacement: those that end up with no active claim and no touching
+    // relation are ghost knowledge (PRD §19.3) — a later build must not plan
+    // an anchor-less claim or an orphaned entity — and are retired below,
+    // after the new claims and relations exist.
+    let mut replaced_nodes: Vec<KnowledgeNodeId> = Vec::new();
     if persistence.replace_source {
+        {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT DISTINCT node_id FROM claims
+                     WHERE source_id = ?1 AND status = 'active'",
+                )
+                .map_err(db)?;
+            let rows = stmt
+                .query_map(params![persistence.record.source_id.as_str()], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(db)?;
+            for row in rows {
+                replaced_nodes.push(KnowledgeNodeId::from_validated(row.map_err(db)?));
+            }
+        }
+        for column in ["r.source_node_id", "r.target_node_id"] {
+            // Column names are compile-time constants, never user input.
+            let sql = format!(
+                "SELECT DISTINCT {column} FROM relations r
+                 JOIN document_analyses a ON a.analysis_id = r.analysis_id
+                 WHERE a.source_id = ?1 AND r.status = 'active'"
+            );
+            let mut stmt = tx.prepare(&sql).map_err(db)?;
+            let rows = stmt
+                .query_map(params![persistence.record.source_id.as_str()], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(db)?;
+            for row in rows {
+                let node_id = KnowledgeNodeId::from_validated(row.map_err(db)?);
+                if !replaced_nodes.contains(&node_id) {
+                    replaced_nodes.push(node_id);
+                }
+            }
+        }
         tx.execute(
             "UPDATE claims SET status = 'retired', retired_build_id = ?2 WHERE source_id = ?1 AND status = 'active'",
             params![persistence.record.source_id.as_str(), retired_build],
@@ -253,6 +486,52 @@ pub fn persist_analysis(
     )
     .map_err(db)?;
 
+    // Ghost-knowledge sweep (PRD §19.3): with the NEW claims and relations
+    // already inserted, retire replaced knowledge nodes (claims AND relation
+    // endpoints) that neither carry an active claim anymore nor touch an
+    // active relation. One revision bump for the whole batch. Re-analysis of
+    // unchanged content re-inserts the same identities (the registry
+    // re-activates a retired node under its stable id on resolution), so
+    // identical rebuilds retire nothing and the registry revision stays
+    // stable (§37.3 determinism).
+    if persistence.replace_source && !replaced_nodes.is_empty() {
+        let mut retired_registry_nodes = 0u64;
+        for node_id in &replaced_nodes {
+            let active_claims: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM claims WHERE node_id = ?1 AND status = 'active'",
+                    params![node_id.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(db)?;
+            let active_relations: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM relations
+                     WHERE status = 'active' AND (source_node_id = ?1 OR target_node_id = ?1)",
+                    params![node_id.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(db)?;
+            if active_claims == 0 && active_relations == 0 {
+                retired_registry_nodes += tx
+                    .execute(
+                        "UPDATE knowledge_registry SET status = 'retired', retired_build_id = ?2
+                         WHERE id = ?1 AND status = 'active'",
+                        params![node_id.as_str(), retired_build],
+                    )
+                    .map_err(db)? as u64;
+            }
+        }
+        if retired_registry_nodes > 0 {
+            bump_revision(&tx)?;
+            tracing::info!(
+                source = %persistence.record.source_id,
+                nodes = retired_registry_nodes,
+                "retired unsupported knowledge nodes after re-analysis"
+            );
+        }
+    }
+
     tx.commit()
         .map_err(|e| WikiError::Storage(format!("commit analysis: {e}")))?;
     Ok(PersistedAnalysis {
@@ -377,5 +656,395 @@ mod tests {
             )
             .unwrap();
         assert_eq!((active, retired), (1, 1));
+    }
+
+    #[test]
+    fn source_node_sections_cover_claims_and_relation_endpoints() {
+        let (mut conn, source_id, section_id) = setup();
+        let drafts = vec![
+            NodeDraft {
+                kind: NodeKind::Entity,
+                canonical_key: "runtime".into(),
+                canonical_name: "Runtime".into(),
+                entity_type: None,
+                description: None,
+            },
+            NodeDraft {
+                kind: NodeKind::Claim,
+                canonical_key: "claim-key".to_owned(),
+                canonical_name: "claim".into(),
+                entity_type: None,
+                description: None,
+            },
+        ];
+        let ids = get_or_create_batch(&mut conn, &drafts, None).unwrap();
+        conn.execute(
+            "INSERT INTO document_analyses (analysis_id, source_id, status, created_at)
+             VALUES ('an_01ARZ3NDEKTSV4RRFFQ69G5FAV', ?1, 'completed', '2026-01-01')",
+            params![source_id.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO claims (claim_id, node_id, source_id, section_id, analysis_id, statement, evidence_digest, status)
+             VALUES ('cl_01ARZ3NDEKTSV4RRFFQ69G5FAV', ?1, ?2, ?3, 'an_01ARZ3NDEKTSV4RRFFQ69G5FAV', 's', 'd', 'active')",
+            params![ids[1].as_str(), source_id.as_str(), section_id.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO relations (relation_id, analysis_id, source_node_id, relation_type, target_node_id, section_id, status)
+             VALUES ('rel_01ARZ3NDEKTSV4RRFFQ69G5FAV', 'an_01ARZ3NDEKTSV4RRFFQ69G5FAV', ?1, 'uses', ?2, ?3, 'active')",
+            params![ids[0].as_str(), ids[1].as_str(), section_id.as_str()],
+        )
+        .unwrap();
+
+        let sections = list_source_active_node_sections(&conn, &source_id).unwrap();
+        assert_eq!(sections.len(), 2, "entity + claim node");
+        assert!(sections
+            .iter()
+            .all(|ns| ns.section_id == Some(section_id.clone())));
+    }
+
+    #[test]
+    fn retire_source_knowledge_leaves_no_ghost_claims_or_unsupported_nodes() {
+        let (mut conn, source_id, section_id) = setup();
+        // A second source that independently supports a shared node.
+        let (other_id, _) = upsert_source(
+            &mut conn,
+            &llm_wiki_core::ids::SourceLocatorKey::compute("ws", "b.md"),
+            "b.md",
+            "hash-2",
+            10,
+            None,
+        )
+        .unwrap();
+
+        let drafts = vec![
+            NodeDraft {
+                kind: NodeKind::Claim,
+                canonical_key: "only-from-a".into(),
+                canonical_name: "only".into(),
+                entity_type: None,
+                description: None,
+            },
+            NodeDraft {
+                kind: NodeKind::Claim,
+                canonical_key: "shared".into(),
+                canonical_name: "shared".into(),
+                entity_type: None,
+                description: None,
+            },
+        ];
+        let ids = get_or_create_batch(&mut conn, &drafts, None).unwrap();
+        let only_node = ids[0].clone();
+        let shared_node = ids[1].clone();
+
+        conn.execute(
+            "INSERT INTO document_analyses (analysis_id, source_id, status, created_at)
+             VALUES ('an_01ARZ3NDEKTSV4RRFFQ69G5FAV', ?1, 'completed', '2026-01-01')",
+            params![source_id.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO document_analyses (analysis_id, source_id, status, created_at)
+             VALUES ('an_01BX5ZZKBKACTAV9WEVGEMMVRZ', ?1, 'completed', '2026-01-01')",
+            params![other_id.as_str()],
+        )
+        .unwrap();
+        for (claim_id, node, src, analysis) in [
+            (
+                "cl_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                &only_node,
+                &source_id,
+                "an_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            ),
+            (
+                "cl_01BX5ZZKBKACTAV9WEVGEMMVRZ",
+                &shared_node,
+                &source_id,
+                "an_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            ),
+            (
+                "cl_01CZZZZZZZZZZZZZZZZZZZZZZZ",
+                &shared_node,
+                &other_id,
+                "an_01BX5ZZKBKACTAV9WEVGEMMVRZ",
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO claims (claim_id, node_id, source_id, section_id, analysis_id, statement, evidence_digest, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 's', 'd', 'active')",
+                params![claim_id, node.as_str(), src.as_str(), section_id.as_str(), analysis],
+            )
+            .unwrap();
+        }
+
+        let retired = retire_source_knowledge(&mut conn, &source_id, Some("bld_del")).unwrap();
+        assert_eq!(retired.retired_claims, 2);
+        assert_eq!(retired.retired_relations, 0);
+        assert_eq!(
+            retired.affected_nodes,
+            vec![only_node.clone(), shared_node.clone()]
+        );
+        // The node only this source supported is retired from the registry;
+        // the shared node stays (the other source still claims it).
+        assert_eq!(retired.retired_registry_nodes, vec![only_node.clone()]);
+
+        let active_from_deleted: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM claims WHERE source_id = ?1 AND status = 'active'",
+                params![source_id.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_from_deleted, 0, "no ghost claims (PRD §19.3)");
+        let registry_status = |id: &KnowledgeNodeId| -> String {
+            conn.query_row(
+                "SELECT status FROM knowledge_registry WHERE id = ?1",
+                params![id.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(registry_status(&only_node), "retired");
+        assert_eq!(registry_status(&shared_node), "active");
+        // One revision bump for the registry retirement batch.
+        assert_eq!(crate::registry::current_revision(&conn).unwrap(), 3);
+
+        // Retiring an already-clean source is a no-op that does not bump.
+        let again = retire_source_knowledge(&mut conn, &source_id, None).unwrap();
+        assert_eq!(again.retired_claims, 0);
+        assert!(again.retired_registry_nodes.is_empty());
+        assert_eq!(crate::registry::current_revision(&conn).unwrap(), 3);
+    }
+
+    #[test]
+    fn reanalysis_retires_claim_nodes_that_lost_all_support() {
+        let (mut conn, source_id, section_id) = setup();
+
+        fn analysis_with(
+            source_id: &SourceId,
+            section_id: &SectionId,
+            node_id: KnowledgeNodeId,
+        ) -> AnalysisPersistence {
+            AnalysisPersistence {
+                record: AnalysisRecord {
+                    source_id: source_id.clone(),
+                    build_id: None,
+                    model: Some("fake".into()),
+                    prompt_version: Some("document-analysis@1".into()),
+                    unit_count: 1,
+                    llm_request_count: 1,
+                    status: "completed".into(),
+                },
+                replace_source: true,
+                claims: vec![PersistedClaim {
+                    node_id,
+                    section_id: Some(section_id.clone()),
+                    statement: "statement".into(),
+                    confidence: Some(0.9),
+                    evidence_ranges: vec![EvidenceRange {
+                        range: SourceRange::new(0, 10),
+                        evidence_digest: "digest".into(),
+                    }],
+                }],
+                relations: vec![],
+                rejected_claims: vec![],
+                heading_paths: vec![(section_id.clone(), vec!["Doc".into()])],
+                source_hash: "hash-1".into(),
+            }
+        }
+        fn node_of(conn: &mut Connection, key: &str) -> KnowledgeNodeId {
+            let drafts = vec![NodeDraft {
+                kind: NodeKind::Claim,
+                canonical_key: key.to_owned(),
+                canonical_name: key.to_owned(),
+                entity_type: None,
+                description: None,
+            }];
+            let mut ids = get_or_create_batch(conn, &drafts, None).unwrap();
+            ids.remove(0)
+        }
+        fn registry_status(conn: &Connection, id: &KnowledgeNodeId) -> String {
+            conn.query_row(
+                "SELECT status FROM knowledge_registry WHERE id = ?1",
+                params![id.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap()
+        }
+
+        let old_node = node_of(&mut conn, "old-claim-text");
+        persist_analysis(
+            &mut conn,
+            &analysis_with(&source_id, &section_id, old_node.clone()),
+        )
+        .unwrap();
+        assert_eq!(registry_status(&conn, &old_node), "active");
+
+        // Re-analysis replaces the source's knowledge with a DIFFERENT claim:
+        // the old claim node has no support left and must retire (PRD §19.3).
+        let new_node = node_of(&mut conn, "new-claim-text");
+        persist_analysis(
+            &mut conn,
+            &analysis_with(&source_id, &section_id, new_node.clone()),
+        )
+        .unwrap();
+        assert_eq!(registry_status(&conn, &old_node), "retired");
+        assert_eq!(registry_status(&conn, &new_node), "active");
+
+        let active_claims: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM claims WHERE status = 'active'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_claims, 1, "only the new claim stays active");
+
+        // Re-analyzing UNCHANGED content re-inserts the same identity and
+        // must NOT retire or bump (§37.3 determinism: stable revision).
+        let revision_before = crate::registry::current_revision(&conn).unwrap();
+        persist_analysis(
+            &mut conn,
+            &analysis_with(&source_id, &section_id, new_node.clone()),
+        )
+        .unwrap();
+        assert_eq!(registry_status(&conn, &new_node), "active");
+        assert_eq!(
+            crate::registry::current_revision(&conn).unwrap(),
+            revision_before
+        );
+    }
+
+    #[test]
+    fn reanalysis_sweep_covers_relation_endpoints_without_touching_shared_nodes() {
+        // A relation-only entity whose relation vanishes during replacement
+        // must retire (ghost knowledge, PRD §19.3) — the sweep is not limited
+        // to claim nodes. A node another source still supports stays.
+        let (mut conn, source_id, section_id) = setup();
+        let (other_id, _) = upsert_source(
+            &mut conn,
+            &llm_wiki_core::ids::SourceLocatorKey::compute("ws", "b.md"),
+            "b.md",
+            "hash-2",
+            10,
+            None,
+        )
+        .unwrap();
+
+        let drafts = vec![
+            NodeDraft {
+                kind: NodeKind::Entity,
+                canonical_key: "solo-entity".into(),
+                canonical_name: "Solo".into(),
+                entity_type: None,
+                description: None,
+            },
+            NodeDraft {
+                kind: NodeKind::Entity,
+                canonical_key: "shared-entity".into(),
+                canonical_name: "Shared".into(),
+                entity_type: None,
+                description: None,
+            },
+        ];
+        let ids = get_or_create_batch(&mut conn, &drafts, None).unwrap();
+        let (solo, shared) = (ids[0].clone(), ids[1].clone());
+
+        let registry_status = |conn: &Connection, id: &KnowledgeNodeId| -> String {
+            conn.query_row(
+                "SELECT status FROM knowledge_registry WHERE id = ?1",
+                params![id.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        fn analysis_row(conn: &mut Connection, source_id: &SourceId, analysis_id: &str) {
+            conn.execute(
+                "INSERT INTO document_analyses (analysis_id, source_id, status, created_at)
+                 VALUES (?1, ?2, 'completed', '2026-01-01')",
+                params![analysis_id, source_id.as_str()],
+            )
+            .unwrap();
+        }
+
+        // The source under test relates solo ↔ shared; another source keeps a
+        // second relation touching `shared` alive.
+        analysis_row(&mut conn, &source_id, "an_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        analysis_row(&mut conn, &other_id, "an_01BX5ZZKBKACTAV9WEVGEMMVRZ");
+        conn.execute(
+            "INSERT INTO relations (relation_id, analysis_id, source_node_id, relation_type, target_node_id, section_id, status)
+             VALUES ('rel_01ARZ3NDEKTSV4RRFFQ69G5FAV', 'an_01ARZ3NDEKTSV4RRFFQ69G5FAV', ?1, 'uses', ?2, ?3, 'active')",
+            params![solo.as_str(), shared.as_str(), section_id.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO relations (relation_id, analysis_id, source_node_id, relation_type, target_node_id, section_id, status)
+             VALUES ('rel_01BX5ZZKBKACTAV9WEVGEMMVRZ', 'an_01BX5ZZKBKACTAV9WEVGEMMVRZ', ?1, 'uses', ?2, ?3, 'active')",
+            params![shared.as_str(), shared.as_str(), section_id.as_str()],
+        )
+        .unwrap();
+
+        // Unchanged re-analysis: same relation re-inserted → nothing retires,
+        // the revision is stable (§37.3 determinism).
+        let revision_before = crate::registry::current_revision(&conn).unwrap();
+        persist_analysis(
+            &mut conn,
+            &AnalysisPersistence {
+                record: AnalysisRecord {
+                    source_id: source_id.clone(),
+                    build_id: None,
+                    model: None,
+                    prompt_version: None,
+                    unit_count: 1,
+                    llm_request_count: 0,
+                    status: "completed".into(),
+                },
+                replace_source: true,
+                claims: vec![],
+                relations: vec![PersistedRelation {
+                    source_node_id: solo.clone(),
+                    relation_type: "uses".into(),
+                    target_node_id: shared.clone(),
+                    section_id: Some(section_id.clone()),
+                    evidence: None,
+                }],
+                rejected_claims: vec![],
+                heading_paths: vec![],
+                source_hash: "hash-1".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(registry_status(&conn, &solo), "active");
+        assert_eq!(
+            crate::registry::current_revision(&conn).unwrap(),
+            revision_before
+        );
+
+        // Re-analysis WITHOUT the relation: `solo` loses all support and
+        // retires; `shared` stays (the other source still relates it).
+        persist_analysis(
+            &mut conn,
+            &AnalysisPersistence {
+                record: AnalysisRecord {
+                    source_id: source_id.clone(),
+                    build_id: None,
+                    model: None,
+                    prompt_version: None,
+                    unit_count: 1,
+                    llm_request_count: 0,
+                    status: "completed".into(),
+                },
+                replace_source: true,
+                claims: vec![],
+                relations: vec![],
+                rejected_claims: vec![],
+                heading_paths: vec![],
+                source_hash: "hash-2".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(registry_status(&conn, &solo), "retired");
+        assert_eq!(registry_status(&conn, &shared), "active");
     }
 }

@@ -90,7 +90,7 @@ pub fn current_revision(conn: &Connection) -> Result<u64> {
 
 /// Bumps the revision inside the given transaction. Callers must invoke this
 /// exactly once per committed mutating transaction.
-fn bump_revision(tx: &Transaction) -> Result<u64> {
+pub(crate) fn bump_revision(tx: &Transaction) -> Result<u64> {
     tx.execute(
         "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = ?1",
         params![REVISION_KEY],
@@ -188,8 +188,25 @@ pub fn resolve(conn: &Connection, kind: NodeKind, key: &str) -> Result<Option<Kn
     Ok(Some(KnowledgeNodeId::from_validated(id)))
 }
 
+/// Re-activates a retired registry node (stable-identity re-derivation, PRD
+/// §45): knowledge that was retired because no source supported it may be
+/// re-derived later (a removed source is restored, an edited source states a
+/// dropped claim again). The node KEEPS its id — bumping the revision exactly
+/// once per committed reactivation, never on an already-active node.
+fn reactivate_tx(tx: &Transaction, id: &KnowledgeNodeId) -> Result<bool> {
+    let changed = tx
+        .execute(
+            "UPDATE knowledge_registry SET status = 'active', retired_build_id = NULL
+             WHERE id = ?1 AND status = 'retired'",
+            params![id.as_str()],
+        )
+        .map_err(|e| WikiError::Storage(format!("reactivate node: {e}")))?;
+    Ok(changed > 0)
+}
+
 /// Looks up or creates a registry node. Bumps the revision exactly once when
-/// (and only when) a node was created; read-only hits never touch it.
+/// (and only when) a node was created or a retired node was re-activated;
+/// hits on active nodes never touch it.
 pub fn get_or_create(
     conn: &mut Connection,
     kind: NodeKind,
@@ -198,7 +215,17 @@ pub fn get_or_create(
     build_id: Option<&str>,
 ) -> Result<(KnowledgeNodeId, u64, bool)> {
     if let Some(id) = resolve(conn, kind, key)? {
-        let rev = current_revision(conn)?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| WikiError::Storage(format!("begin tx: {e}")))?;
+        let reactivated = reactivate_tx(&tx, &id)?;
+        let rev = if reactivated {
+            bump_revision(&tx)?
+        } else {
+            current_revision(&tx)?
+        };
+        tx.commit()
+            .map_err(|e| WikiError::Storage(format!("commit node lookup: {e}")))?;
         return Ok((id, rev, false));
     }
 
@@ -233,9 +260,10 @@ pub struct NodeDraft {
 }
 
 /// Resolves or creates many nodes inside ONE transaction. The revision is
-/// bumped exactly once **per created node** (PRD §12.1.1: every committed
-/// node creation increments the revision once); lookups never bump.
-/// Returns one id per draft, in input order.
+/// bumped once **per created node** and once **per re-activated retired node**
+/// (PRD §12.1.1: every committed registry mutation increments the revision);
+/// lookups of active nodes never bump. Returns one id per draft, in input
+/// order.
 pub fn get_or_create_batch(
     conn: &mut Connection,
     drafts: &[NodeDraft],
@@ -246,6 +274,7 @@ pub fn get_or_create_batch(
         .map_err(|e| WikiError::Storage(format!("begin tx: {e}")))?;
     let base_revision = current_revision(&tx)?;
     let mut created_count = 0u64;
+    let mut reactivated_count = 0u64;
     let mut ids = Vec::with_capacity(drafts.len());
 
     {
@@ -326,6 +355,14 @@ pub fn get_or_create_batch(
                 }
             };
 
+            // A resolution may land on a RETIRED node (the knowledge it
+            // represents is being re-derived). Reactivate it under the SAME
+            // id — otherwise the active claim/relation below would point at a
+            // node no planner can ever see again (PRD §45 identity stability).
+            if reactivate_tx(&tx, &id)? {
+                reactivated_count += 1;
+            }
+
             if draft.entity_type.is_some() || draft.description.is_some() {
                 update_detail_stmt
                     .execute(params![draft.entity_type, draft.description, id.as_str()])
@@ -335,11 +372,13 @@ pub fn get_or_create_batch(
         }
     }
 
-    if created_count > 0 {
-        // One revision increment per created node, inside the same tx.
+    let mutations = created_count + reactivated_count;
+    if mutations > 0 {
+        // One revision increment per created or re-activated node, in ONE
+        // update inside the same tx.
         tx.execute(
             "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + ?2 AS TEXT) WHERE key = ?1",
-            params![REVISION_KEY, created_count as i64],
+            params![REVISION_KEY, mutations as i64],
         )
         .map_err(db)?;
     }
@@ -499,5 +538,46 @@ mod tests {
         // Retiring again is a no-op without a revision bump.
         let rev2 = retire(&mut conn, &id, None).unwrap();
         assert_eq!(rev2, rev1);
+    }
+
+    #[test]
+    fn resolving_a_retired_node_reactivates_it_under_the_same_id() {
+        // PRD §45 identity stability + §19.3: knowledge retired by a source
+        // deletion must come back when the claim is re-derived — an active
+        // claim on a still-retired node would be invisible to the planner
+        // forever (load_knowledge_base filters by status = 'active').
+        let mut conn = open_in_memory().unwrap();
+        let (id, rev, _) =
+            get_or_create(&mut conn, NodeKind::Claim, "k-claim", "claim", None).unwrap();
+        assert_eq!(rev, 1);
+        retire(&mut conn, &id, None).unwrap();
+
+        // Resolution reactivates: same id, active again, exactly one bump
+        // (create → 1, retire → 2, reactivate → 3).
+        let (again, rev_after, created) =
+            get_or_create(&mut conn, NodeKind::Claim, "k-claim", "claim", None).unwrap();
+        assert_eq!(again, id);
+        assert!(!created, "reactivation is not a creation");
+        assert_eq!(rev_after, 3);
+        let entry = get_entry(&conn, &id).unwrap().unwrap();
+        assert_eq!(entry.status, "active");
+        assert_eq!(entry.retired_build_id, None);
+
+        // The reactivated node is an ordinary active hit: no further bump.
+        let (_, rev_again, _) =
+            get_or_create(&mut conn, NodeKind::Claim, "k-claim", "claim", None).unwrap();
+        assert_eq!(rev_again, 3);
+
+        // Same semantics through the batch path (what persist_outcome uses).
+        let drafts = vec![NodeDraft {
+            kind: NodeKind::Claim,
+            canonical_key: "k-claim".into(),
+            canonical_name: "claim".into(),
+            entity_type: None,
+            description: None,
+        }];
+        let ids = get_or_create_batch(&mut conn, &drafts, None).unwrap();
+        assert_eq!(ids, vec![id]);
+        assert_eq!(current_revision(&conn).unwrap(), 3);
     }
 }

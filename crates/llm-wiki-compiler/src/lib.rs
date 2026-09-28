@@ -8,7 +8,9 @@
 pub mod analysis;
 pub mod build;
 pub mod cache;
+pub mod changeset;
 pub mod compile;
+pub mod incremental;
 pub mod lint;
 pub mod persist;
 pub mod plan;
@@ -18,9 +20,14 @@ pub mod publish;
 pub use analysis::{
     AnalysisOutcome, AnalysisSection, AnalyzedDocument, DocumentAnalyzer, VerifiedRelation,
 };
-pub use build::{run_build, BuildReport};
+pub use build::{run_build, BuildReport, IncrementalSummary};
 pub use cache::{CacheContext, CacheStats, LlmCache, StageCache};
+pub use changeset::{
+    diff_manifest, finalize_change_set, BuildFingerprint, ChangeSet, FileOutcome, RegisteredSource,
+    ScannedSource,
+};
 pub use compile::{CompiledGeneration, CompilerConfig, WikiCompiler};
+pub use incremental::{map_incremental_change, MappingDecision, MappingInput};
 pub use lint::{run_lint, LintCheck, LintFinding, LintReport, LintSeverity};
 pub use persist::{persist_outcome, PersistOptions};
 pub use plan::{PlanCacheKeys, PlanOutcome, PlannerConfig, WikiPlanner};

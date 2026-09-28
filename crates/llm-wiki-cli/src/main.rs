@@ -292,6 +292,19 @@ fn build(workspace: &Path, root_override: Option<&str>) -> Result<(), WikiError>
         "  llm cache: {} hit(s), {} miss(es)",
         report.cache.hits, report.cache.misses
     );
+    if let Some(incremental) = &report.incremental {
+        // §19 incremental summary: what changed and what the pipeline did.
+        println!(
+            "  incremental: {} changed, {} recompiled, {} carried, {} obsolete",
+            incremental.changed, incremental.recompiled, incremental.carried, incremental.obsolete
+        );
+        if incremental.deleted > 0 {
+            println!(
+                "  incremental: {} deleted source(s) retired",
+                incremental.deleted
+            );
+        }
+    }
     println!("  published: {}", report.published_path.display());
     if let Some(recovery) = &report.recovery {
         println!("  recovered publish: {recovery}");

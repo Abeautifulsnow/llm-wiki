@@ -9,6 +9,7 @@ pub mod analysis;
 pub mod builds;
 pub mod cache;
 pub mod connection;
+pub mod decisions;
 pub mod knowledge;
 pub mod migrations;
 pub mod registry;
@@ -18,14 +19,21 @@ pub mod state;
 pub mod wiki;
 
 pub use analysis::{
-    persist_analysis, AnalysisPersistence, AnalysisRecord, EvidenceRange, PersistedAnalysis,
-    PersistedClaim, PersistedRejectedClaim, PersistedRelation,
+    list_source_active_node_sections, persist_analysis, retire_source_knowledge,
+    AnalysisPersistence, AnalysisRecord, EvidenceRange, PersistedAnalysis, PersistedClaim,
+    PersistedRejectedClaim, PersistedRelation, RetiredSourceKnowledge, SourceNodeSection,
 };
 pub use builds::{
-    finish_build, latest_build, set_build_snapshot_hash, start_build, BuildDraft, BuildRecord,
+    finish_build, latest_build, latest_completed_build, set_build_snapshot_hash, start_build,
+    BuildDraft, BuildRecord,
 };
 pub use cache::{count_cache_entries, get_cached_response, put_cached_response, CacheRow};
 pub use connection::{open, open_in_memory, Connection};
+pub use decisions::{
+    insert_plan_decision, list_plan_decisions, PlanDecision, PlanDecisionRow, OUTCOME_FAST_PATH,
+    OUTCOME_LOCAL_UPDATE, OUTCOME_REPLAN_REQUIRED, TRIGGER_FINGERPRINT_CHANGED,
+    TRIGGER_PAGE_EMPTIED, TRIGGER_STRUCTURAL_CHANGE, TRIGGER_UNMAPPABLE_NODE,
+};
 pub use knowledge::{list_active_relation_pairs, load_knowledge_base, load_plan_input};
 pub use registry::{
     canonical_key, current_revision, get_entry, get_or_create, get_or_create_batch, merge, resolve,
