@@ -8,6 +8,8 @@ use llm_wiki_core::error::{Result, WikiError};
 use llm_wiki_markdown::frontmatter::strip_and_parse;
 
 const EMBEDDED_DOCUMENT_ANALYSIS: &str = include_str!("../../../prompts/document-analysis.md");
+const EMBEDDED_WIKI_PLANNING: &str = include_str!("../../../prompts/wiki-planning.md");
+const EMBEDDED_WIKI_COMPILATION: &str = include_str!("../../../prompts/wiki-compilation.md");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptDocument {
@@ -68,6 +70,8 @@ impl PromptDocument {
             }
             _ => match name {
                 "document-analysis" => Self::parse(EMBEDDED_DOCUMENT_ANALYSIS),
+                "wiki-planning" => Self::parse(EMBEDDED_WIKI_PLANNING),
+                "wiki-compilation" => Self::parse(EMBEDDED_WIKI_COMPILATION),
                 other => Err(WikiError::Config(format!(
                     "unknown prompt '{other}' and no file override provided"
                 ))),
@@ -87,6 +91,26 @@ impl PromptDocument {
     /// `name@version`, the BuildFingerprint `prompt_version` value.
     pub fn fingerprint_tag(&self) -> String {
         format!("{}@{}", self.name, self.version)
+    }
+
+    /// Extracts one `<!-- stage: name -->` block from a multi-stage prompt
+    /// body. Each block carries its full instructions plus the `{{VAR}}`
+    /// placeholders; text outside stage blocks is shared preamble (not sent).
+    pub fn stage_block(&self, stage: &str) -> Result<PromptDocument> {
+        let marker = format!("<!-- stage: {stage} -->");
+        let start = self.body.find(&marker).ok_or_else(|| {
+            WikiError::Config(format!("prompt '{}' has no stage '{stage}'", self.name))
+        })?;
+        let after_marker = start + marker.len();
+        let end = self.body[after_marker..]
+            .find("<!-- stage:")
+            .map(|next| after_marker + next)
+            .unwrap_or(self.body.len());
+        Ok(PromptDocument {
+            name: self.name.clone(),
+            version: self.version,
+            body: self.body[after_marker..end].trim().to_owned(),
+        })
     }
 }
 
@@ -127,5 +151,29 @@ mod tests {
         assert!(PromptDocument::parse("no header at all").is_err());
         assert!(PromptDocument::parse("---\nname: x\n---\nbody").is_err());
         assert!(PromptDocument::parse("---\nname: x\nversion: zero\n---\nbody").is_err());
+    }
+
+    #[test]
+    fn embedded_planning_prompt_has_three_stages() {
+        let prompt = load_prompt("wiki-planning", None).unwrap();
+        assert_eq!(prompt.fingerprint_tag(), "wiki-planning@1");
+        let summary = prompt.stage_block("cluster-summary").unwrap();
+        assert!(summary.body.contains("{{PAYLOAD}}"));
+        assert!(!summary.body.contains("stage:"));
+        let local = prompt.stage_block("local-plan").unwrap();
+        assert!(local.body.contains("knowledge_refs"));
+        let reconcile = prompt.stage_block("reconcile").unwrap();
+        assert!(reconcile.body.contains("merge_of"));
+        assert!(prompt.stage_block("missing").is_err());
+    }
+
+    #[test]
+    fn embedded_compilation_prompt_has_grounding_rule() {
+        let prompt = load_prompt("wiki-compilation", None).unwrap();
+        assert_eq!(prompt.fingerprint_tag(), "wiki-compilation@1");
+        assert!(prompt.body.contains("llm-wiki:cite claim="));
+        assert!(prompt.body.contains("{{KNOWLEDGE}}"));
+        assert!(prompt.body.contains("{{RELATED}}"));
+        assert!(prompt.body.contains("{{REPAIR_NOTES}}"));
     }
 }

@@ -1,0 +1,1050 @@
+//! Integration tests for the hierarchical planner and page compiler
+//! (PRD §14/§15/§16), driven by FakeLlmProvider — no real model in CI
+//! (PRD §54).
+//!
+//! Node ids are opaque registry-assigned ULIDs, so every scripted response
+//! references the ids returned by the registry in this run — never literals.
+
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+
+use rusqlite::{params, Connection};
+
+use llm_wiki_compiler::{load_prompt, CompilerConfig, PlannerConfig, WikiCompiler, WikiPlanner};
+use llm_wiki_core::ids::{BuildId, KnowledgeNodeId, SourceLocatorKey};
+use llm_wiki_core::model::WikiPagePlan;
+use llm_wiki_core::plan::KnowledgeBase;
+use llm_wiki_llm::{FakeLlmProvider, LlmError, LlmProvider, LlmRequest};
+use llm_wiki_storage::{
+    get_or_create_batch, load_knowledge_base, open_in_memory, persist_generation, upsert_source,
+    NodeDraft, NodeKind,
+};
+
+const SECTION_A: &str = "sec_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+const SECTION_B: &str = "sec_01BX5ZZKBKACTAV9WEVGEMMVRZ";
+
+/// Fake provider that replays scripted responses.
+struct ScriptedLlm {
+    inner: FakeLlmProvider,
+}
+
+impl ScriptedLlm {
+    fn new(responses: Vec<String>) -> Self {
+        let queue = Arc::new(Mutex::new(VecDeque::from(responses)));
+        let inner = FakeLlmProvider::new(
+            "fake-planner",
+            Arc::new(move |_request: &LlmRequest| {
+                queue
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .ok_or_else(|| LlmError::Api {
+                        code: 500,
+                        message: "script exhausted".into(),
+                    })
+            }),
+        );
+        Self { inner }
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for ScriptedLlm {
+    fn model(&self) -> &str {
+        self.inner.model()
+    }
+
+    fn provider_name(&self) -> &str {
+        self.inner.provider_name()
+    }
+
+    async fn generate(&self, request: LlmRequest) -> Result<llm_wiki_llm::LlmResponse, LlmError> {
+        self.inner.generate(request).await
+    }
+}
+
+/// Routes responses by prompt content instead of call order: cluster order
+/// depends on registry-assigned ULIDs, so planner tests must not depend on
+/// it. Each route is `(matcher, responses)`; the first matching route pops
+/// its next response (repairs pop from the same route).
+type Matcher = Box<dyn Fn(&LlmRequest) -> bool + Send + Sync>;
+
+struct RouterLlm {
+    inner: FakeLlmProvider,
+}
+
+fn router(routes: Vec<(Matcher, Vec<String>)>) -> RouterLlm {
+    let mut matchers = Vec::with_capacity(routes.len());
+    let mut queues = Vec::with_capacity(routes.len());
+    for (matcher, responses) in routes {
+        matchers.push(matcher);
+        queues.push(Mutex::new(VecDeque::from(responses)));
+    }
+    let state = Arc::new((matchers, queues));
+    let state_for_closure = state.clone();
+    let inner = FakeLlmProvider::new(
+        "fake-router",
+        Arc::new(move |request: &LlmRequest| {
+            let (matchers, queues) = &*state_for_closure;
+            for (matcher, queue) in matchers.iter().zip(queues.iter()) {
+                if matcher(request) {
+                    return queue
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .ok_or_else(|| LlmError::Api {
+                            code: 500,
+                            message: "route script exhausted".into(),
+                        });
+                }
+            }
+            Err(LlmError::Api {
+                code: 500,
+                message: "no route matched".into(),
+            })
+        }),
+    );
+    RouterLlm { inner }
+}
+
+fn route(marker: &'static str, ids: &[String], responses: Vec<String>) -> (Matcher, Vec<String>) {
+    let ids = ids.to_vec();
+    let matcher: Matcher = Box::new(move |request: &LlmRequest| {
+        request.prompt.contains(marker) && ids.iter().all(|id| request.prompt.contains(id.as_str()))
+    });
+    (matcher, responses)
+}
+
+const SUMMARY_MARK: &str = "Summarize the following cluster";
+const LOCAL_MARK: &str = "THIS cluster's knowledge";
+const RECONCILE_MARK: &str = "final global wiki plan";
+
+#[async_trait::async_trait]
+impl LlmProvider for RouterLlm {
+    fn model(&self) -> &str {
+        self.inner.model()
+    }
+
+    fn provider_name(&self) -> &str {
+        self.inner.provider_name()
+    }
+
+    async fn generate(&self, request: LlmRequest) -> Result<llm_wiki_llm::LlmResponse, LlmError> {
+        self.inner.generate(request).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fixture: two plugin sources, one relation, two grounded claims.
+// ---------------------------------------------------------------------------
+
+struct Seeded {
+    base: KnowledgeBase,
+    entity: String,
+    concept: String,
+    claim_a: String,
+    claim_b: String,
+}
+
+fn seed_knowledge(conn: &mut Connection) -> Seeded {
+    let (arch_id, _) = upsert_source(
+        conn,
+        &SourceLocatorKey::compute("ws", "plugin/architecture.md"),
+        "plugin/architecture.md",
+        "hash-arch",
+        10,
+        None,
+    )
+    .unwrap();
+    let (sec_id, _) = upsert_source(
+        conn,
+        &SourceLocatorKey::compute("ws", "plugin/security.md"),
+        "plugin/security.md",
+        "hash-sec",
+        10,
+        None,
+    )
+    .unwrap();
+    for (section_id, source, heading, range_end) in [
+        (
+            SECTION_A,
+            arch_id.clone(),
+            "Plugin Architecture > Lifecycle",
+            100,
+        ),
+        (
+            SECTION_B,
+            sec_id.clone(),
+            "Plugin Security > Permissions",
+            80,
+        ),
+    ] {
+        conn.execute(
+            "INSERT INTO source_sections (section_id, source_id, heading_path_json, heading_path_key, content_fingerprint, range_start, range_end, status)
+             VALUES (?1, ?2, ?3, ?3, 'fp', 0, ?4, 'active')",
+            params![section_id, source.as_str(), heading, range_end],
+        )
+        .unwrap();
+    }
+
+    let drafts = vec![
+        NodeDraft {
+            kind: NodeKind::Entity,
+            canonical_key: "plugin runtime".into(),
+            canonical_name: "Plugin Runtime".into(),
+            entity_type: Some("component".into()),
+            description: Some("hosts plugins".into()),
+        },
+        NodeDraft {
+            kind: NodeKind::Concept,
+            canonical_key: "at-least-once delivery".into(),
+            canonical_name: "At-Least-Once Delivery".into(),
+            entity_type: None,
+            description: Some("delivery guarantee".into()),
+        },
+        NodeDraft {
+            kind: NodeKind::Claim,
+            canonical_key: "stmt-runtime-retries".into(),
+            canonical_name: "claim runtime retries".into(),
+            entity_type: None,
+            description: None,
+        },
+        NodeDraft {
+            kind: NodeKind::Claim,
+            canonical_key: "stmt-bus-permissions".into(),
+            canonical_name: "claim bus permissions".into(),
+            entity_type: None,
+            description: None,
+        },
+    ];
+    let ids = get_or_create_batch(conn, &drafts, None).unwrap();
+    let entity = ids[0].as_str().to_owned();
+    let concept = ids[1].as_str().to_owned();
+    let claim_a = ids[2].as_str().to_owned();
+    let claim_b = ids[3].as_str().to_owned();
+
+    conn.execute(
+        "INSERT INTO document_analyses (analysis_id, source_id, status, created_at)
+         VALUES ('an_01ARZ3NDEKTSV4RRFFQ69G5FAV', ?1, 'completed', '2026-01-01'),
+                ('an_01BX5ZZKBKACTAV9WEVGEMMVRZ', ?2, 'completed', '2026-01-01')",
+        params![arch_id.as_str(), sec_id.as_str()],
+    )
+    .unwrap();
+    for (claim_row, node, source, section, statement) in [
+        (
+            "cl_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            claim_a.clone(),
+            arch_id.clone(),
+            SECTION_A,
+            "The runtime retries the transition up to three times.",
+        ),
+        (
+            "cl_01BX5ZZKBKACTAV9WEVGEMMVRZ",
+            claim_b.clone(),
+            sec_id.clone(),
+            SECTION_B,
+            "Permissions are enforced at the message bus boundary.",
+        ),
+    ] {
+        conn.execute(
+            "INSERT INTO claims (claim_id, node_id, source_id, section_id, analysis_id, statement, evidence_digest, status)
+             VALUES (?1, ?2, ?3, ?4, 'an_01ARZ3NDEKTSV4RRFFQ69G5FAV', ?5, 'digest-1', 'active')",
+            params![claim_row, node, source.as_str(), section, statement],
+        )
+        .unwrap();
+    }
+    for (citation_row, claim_row, source, section, range_end, heading) in [
+        (
+            "cit_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "cl_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            arch_id.clone(),
+            SECTION_A,
+            64i64,
+            "[\"Plugin Architecture\",\"Lifecycle\"]",
+        ),
+        (
+            "cit_01BX5ZZKBKACTAV9WEVGEMMVRZ",
+            "cl_01BX5ZZKBKACTAV9WEVGEMMVRZ",
+            sec_id.clone(),
+            SECTION_B,
+            55i64,
+            "[\"Plugin Security\",\"Permissions\"]",
+        ),
+    ] {
+        conn.execute(
+            "INSERT INTO citations (citation_id, owner_kind, owner_id, source_id, section_id, range_start, range_end, source_hash, evidence_digest, heading_path_json)
+             VALUES (?1, 'claim', ?2, ?3, ?4, 4, ?5, 'hash-arch', 'digest-1', ?6)",
+            params![citation_row, claim_row, source.as_str(), section, range_end, heading],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO relations (relation_id, analysis_id, source_node_id, relation_type, target_node_id, status)
+         VALUES ('rel_01ARZ3NDEKTSV4RRFFQ69G5FAV', 'an_01ARZ3NDEKTSV4RRFFQ69G5FAV', ?1, 'uses', ?2, 'active')",
+        params![entity, concept],
+    )
+    .unwrap();
+
+    let base = load_knowledge_base(conn).unwrap();
+    Seeded {
+        base,
+        entity,
+        concept,
+        claim_a,
+        claim_b,
+    }
+}
+
+fn summary_response(text: &str) -> String {
+    serde_json::json!({ "summary": text }).to_string()
+}
+
+fn plan_response(pages: Vec<serde_json::Value>) -> String {
+    serde_json::json!({ "pages": pages }).to_string()
+}
+
+fn proposal(title: &str, category: &str, refs: &[String]) -> serde_json::Value {
+    serde_json::json!({
+        "title": title,
+        "category": category,
+        "purpose": format!("cover {title}"),
+        "knowledge_refs": refs,
+    })
+}
+
+fn compile_response(markdown: &str) -> String {
+    serde_json::json!({ "markdown": markdown }).to_string()
+}
+
+fn make_planner(config: PlannerConfig, responses: Vec<String>) -> (WikiPlanner, Arc<ScriptedLlm>) {
+    let llm = Arc::new(ScriptedLlm::new(responses));
+    let prompt = load_prompt("wiki-planning", None).unwrap();
+    (WikiPlanner::new(llm.clone(), prompt, config), llm)
+}
+
+fn make_compiler(config: CompilerConfig, responses: Vec<String>) -> WikiCompiler {
+    let llm = Arc::new(ScriptedLlm::new(responses));
+    let prompt = load_prompt("wiki-compilation", None).unwrap();
+    WikiCompiler::new(llm.clone(), prompt, config)
+}
+
+fn planner_with(provider: Arc<dyn LlmProvider>, config: PlannerConfig) -> WikiPlanner {
+    let prompt = load_prompt("wiki-planning", None).unwrap();
+    WikiPlanner::new(provider, prompt, config)
+}
+
+// ---------------------------------------------------------------------------
+// Planner tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn planner_full_pipeline_produces_pages_with_cache_keys() {
+    let mut conn = open_in_memory().unwrap();
+    let seeded = seed_knowledge(&mut conn);
+
+    // Two clusters: [entity, concept] (relation) then [claim A, claim B]
+    // (shared `plugin/` source dir). Routes select responses by stage + node
+    // ids, so cluster iteration order (registry ULIDs) does not matter.
+    let relation_pair = vec![seeded.entity.clone(), seeded.concept.clone()];
+    let claims_pair = vec![seeded.claim_a.clone(), seeded.claim_b.clone()];
+    let responses = vec![
+        route(
+            SUMMARY_MARK,
+            &relation_pair,
+            vec![summary_response("runtime and delivery")],
+        ),
+        route(
+            SUMMARY_MARK,
+            &claims_pair,
+            vec![summary_response("guarantees and permissions")],
+        ),
+        route(
+            LOCAL_MARK,
+            &relation_pair,
+            vec![plan_response(vec![proposal(
+                "Plugin System",
+                "concepts",
+                &relation_pair,
+            )])],
+        ),
+        route(
+            LOCAL_MARK,
+            &claims_pair,
+            vec![plan_response(vec![proposal(
+                "Plugin Guarantees",
+                "concepts",
+                &claims_pair,
+            )])],
+        ),
+        route(
+            RECONCILE_MARK,
+            &[],
+            vec![plan_response(vec![
+                proposal("Plugin System", "concepts", &relation_pair),
+                proposal("Plugin Guarantees", "concepts", &claims_pair),
+            ])],
+        ),
+    ];
+    let wiki_planner = planner_with(Arc::new(router(responses)), PlannerConfig::default());
+    let outcome = wiki_planner.plan(&seeded.base, 4).await.unwrap();
+
+    assert_eq!(outcome.llm_request_count, 5);
+    assert_eq!(outcome.plan.pages.len(), 2);
+    assert!(!outcome.flat_mode);
+    for page in &outcome.plan.pages {
+        assert!(page.id.as_str().starts_with("wp_"));
+        assert!(!page.slug.is_empty());
+        assert!(!page.purpose.is_empty());
+    }
+    let page_one = &outcome.plan.pages[0];
+    assert_eq!(page_one.title, "Plugin System");
+    assert_eq!(page_one.knowledge_refs.len(), 2);
+    assert_eq!(
+        page_one.source_refs.len(),
+        0,
+        "pure concept pages carry no claim anchors; sources come from claims"
+    );
+    assert_eq!(
+        outcome.plan.pages[1].source_refs.len(),
+        2,
+        "claim page cites both plugin sources"
+    );
+    // Disjoint pages are not related.
+    assert!(page_one.related_pages.is_empty());
+    assert_eq!(outcome.plan.pages[1].title, "Plugin Guarantees");
+
+    assert_eq!(outcome.cache.cluster_summary_keys.len(), 2);
+    assert_eq!(outcome.cache.local_plan_keys.len(), 2);
+    assert!(!outcome.cache.reconciliation_key.is_empty());
+
+    // Determinism: identical inputs yield identical cache keys.
+    let responses_again = vec![
+        route(
+            SUMMARY_MARK,
+            &relation_pair,
+            vec![summary_response("runtime and delivery")],
+        ),
+        route(
+            SUMMARY_MARK,
+            &claims_pair,
+            vec![summary_response("guarantees and permissions")],
+        ),
+        route(
+            LOCAL_MARK,
+            &relation_pair,
+            vec![plan_response(vec![proposal(
+                "Plugin System",
+                "concepts",
+                &relation_pair,
+            )])],
+        ),
+        route(
+            LOCAL_MARK,
+            &claims_pair,
+            vec![plan_response(vec![proposal(
+                "Plugin Guarantees",
+                "concepts",
+                &claims_pair,
+            )])],
+        ),
+        route(
+            RECONCILE_MARK,
+            &[],
+            vec![plan_response(vec![
+                proposal("Plugin System", "concepts", &relation_pair),
+                proposal("Plugin Guarantees", "concepts", &claims_pair),
+            ])],
+        ),
+    ];
+    let again_planner = planner_with(Arc::new(router(responses_again)), PlannerConfig::default());
+    let again = again_planner.plan(&seeded.base, 4).await.unwrap();
+    assert_eq!(
+        again.cache.cluster_summary_keys,
+        outcome.cache.cluster_summary_keys
+    );
+    assert_eq!(again.cache.local_plan_keys, outcome.cache.local_plan_keys);
+    assert_eq!(
+        again.cache.reconciliation_key,
+        outcome.cache.reconciliation_key
+    );
+}
+
+#[tokio::test]
+async fn planner_repairs_unknown_node_ref_once() {
+    let mut conn = open_in_memory().unwrap();
+    let seeded = seed_knowledge(&mut conn);
+
+    let relation_pair = vec![seeded.entity.clone(), seeded.concept.clone()];
+    let claims_pair = vec![seeded.claim_a.clone(), seeded.claim_b.clone()];
+    let responses = vec![
+        route(
+            SUMMARY_MARK,
+            &relation_pair,
+            vec![summary_response("runtime and delivery")],
+        ),
+        route(
+            SUMMARY_MARK,
+            &claims_pair,
+            vec![summary_response("guarantees")],
+        ),
+        // First local plan hallucinates a node id; the repair pops the same
+        // route and must fix the referential issue.
+        route(
+            LOCAL_MARK,
+            &relation_pair,
+            vec![
+                plan_response(vec![serde_json::json!({
+                    "title": "Plugin System",
+                    "category": "concepts",
+                    "purpose": "cover",
+                    "knowledge_refs": ["kn_UNKNOWNNODE000000000000000"],
+                })]),
+                plan_response(vec![proposal("Plugin System", "concepts", &relation_pair)]),
+            ],
+        ),
+        route(
+            LOCAL_MARK,
+            &claims_pair,
+            vec![plan_response(vec![proposal(
+                "Plugin Guarantees",
+                "concepts",
+                &claims_pair,
+            )])],
+        ),
+        route(
+            RECONCILE_MARK,
+            &[],
+            vec![plan_response(vec![
+                proposal("Plugin System", "concepts", &relation_pair),
+                proposal("Plugin Guarantees", "concepts", &claims_pair),
+            ])],
+        ),
+    ];
+    let wiki_planner = planner_with(Arc::new(router(responses)), PlannerConfig::default());
+    let outcome = wiki_planner.plan(&seeded.base, 4).await.unwrap();
+    assert_eq!(outcome.llm_request_count, 6, "one extra repair request");
+    assert_eq!(outcome.plan.pages.len(), 2);
+}
+
+#[tokio::test]
+async fn planner_subdivides_clusters_over_node_budget() {
+    let mut conn = open_in_memory().unwrap();
+    let seeded = seed_knowledge(&mut conn);
+    // max_cluster_nodes = 1 splits the 2-node relation cluster and the
+    // 2-claim dir group into four singletons: 4 summaries + 4 locals + 1
+    // reconcile merging everything into one page.
+    let merge_all = plan_response(vec![proposal(
+        "Plugin Platform",
+        "concepts",
+        &[
+            seeded.entity.clone(),
+            seeded.concept.clone(),
+            seeded.claim_a.clone(),
+            seeded.claim_b.clone(),
+        ],
+    )]);
+    let singleton = |id: &str, page: &str| {
+        route(
+            LOCAL_MARK,
+            std::slice::from_ref(&id.to_owned()),
+            vec![plan_response(vec![proposal(
+                page,
+                "concepts",
+                &[id.to_owned()],
+            )])],
+        )
+    };
+    let responses = vec![
+        route(
+            SUMMARY_MARK,
+            std::slice::from_ref(&seeded.entity),
+            vec![summary_response("s1")],
+        ),
+        singleton(&seeded.entity, "Page A"),
+        route(
+            SUMMARY_MARK,
+            std::slice::from_ref(&seeded.concept),
+            vec![summary_response("s2")],
+        ),
+        singleton(&seeded.concept, "Page B"),
+        route(
+            SUMMARY_MARK,
+            std::slice::from_ref(&seeded.claim_a),
+            vec![summary_response("s3")],
+        ),
+        singleton(&seeded.claim_a, "Page C"),
+        route(
+            SUMMARY_MARK,
+            std::slice::from_ref(&seeded.claim_b),
+            vec![summary_response("s4")],
+        ),
+        singleton(&seeded.claim_b, "Page D"),
+        route(RECONCILE_MARK, &[], vec![merge_all]),
+    ];
+    let config = PlannerConfig {
+        max_cluster_nodes: 1,
+        ..PlannerConfig::default()
+    };
+    let wiki_planner = planner_with(Arc::new(router(responses)), config);
+    let outcome = wiki_planner.plan(&seeded.base, 4).await.unwrap();
+    assert_eq!(outcome.cache.cluster_summary_keys.len(), 4, "subdivided");
+    assert_eq!(outcome.plan.pages.len(), 1);
+    assert_eq!(
+        outcome.plan.pages[0].knowledge_refs.len(),
+        4,
+        "no knowledge dropped"
+    );
+    assert_eq!(outcome.llm_request_count, 9);
+}
+
+#[tokio::test]
+async fn flat_mode_fails_with_actionable_error_over_budget() {
+    let mut conn = open_in_memory().unwrap();
+    let seeded = seed_knowledge(&mut conn);
+    let config = PlannerConfig {
+        hierarchical: false,
+        max_plan_input_tokens: 5,
+        ..PlannerConfig::default()
+    };
+    let (wiki_planner, _llm) = make_planner(config, vec![]);
+    let error = wiki_planner.plan(&seeded.base, 4).await.unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("hierarchical"),
+        "actionable message: {message}"
+    );
+    assert!(message.contains("max_plan_input_tokens"));
+}
+
+#[tokio::test]
+async fn reconcile_repair_fails_closed_after_second_bad_response() {
+    let mut conn = open_in_memory().unwrap();
+    let seeded = seed_knowledge(&mut conn);
+    let relation_pair = vec![seeded.entity.clone(), seeded.concept.clone()];
+    let claims_pair = vec![seeded.claim_a.clone(), seeded.claim_b.clone()];
+    let hallucinated = plan_response(vec![proposal(
+        "X",
+        "concepts",
+        &["kn_NOPE0000000000000000000000".to_owned()],
+    )]);
+    let responses = vec![
+        route(SUMMARY_MARK, &relation_pair, vec![summary_response("s1")]),
+        route(SUMMARY_MARK, &claims_pair, vec![summary_response("s2")]),
+        route(
+            LOCAL_MARK,
+            &relation_pair,
+            vec![plan_response(vec![proposal(
+                "Plugin System",
+                "concepts",
+                &relation_pair,
+            )])],
+        ),
+        route(
+            LOCAL_MARK,
+            &claims_pair,
+            vec![plan_response(vec![proposal(
+                "Plugin Guarantees",
+                "concepts",
+                &claims_pair,
+            )])],
+        ),
+        // Reconciliation hallucinates a node id twice → the build fails.
+        route(
+            RECONCILE_MARK,
+            &[],
+            vec![hallucinated.clone(), hallucinated],
+        ),
+    ];
+    let wiki_planner = planner_with(Arc::new(router(responses)), PlannerConfig::default());
+    let error = wiki_planner.plan(&seeded.base, 4).await.unwrap_err();
+    assert!(error.to_string().contains("UNKNOWN_NODE_REF"));
+}
+
+// ---------------------------------------------------------------------------
+// Compiler tests
+// ---------------------------------------------------------------------------
+
+fn two_page_plan(seeded: &Seeded) -> llm_wiki_core::model::WikiPlan {
+    use llm_wiki_core::ids::{SourceId, WikiPageId};
+    let mut page_one = WikiPagePlan {
+        id: WikiPageId::generate(),
+        slug: "plugin-system".into(),
+        title: "Plugin System".into(),
+        category: "concepts".into(),
+        purpose: "overview".into(),
+        knowledge_refs: vec![
+            KnowledgeNodeId::parse(seeded.entity.clone()).unwrap(),
+            KnowledgeNodeId::parse(seeded.concept.clone()).unwrap(),
+            KnowledgeNodeId::parse(seeded.claim_a.clone()).unwrap(),
+        ],
+        source_refs: vec![SourceId::generate()],
+        related_pages: vec![],
+    };
+    let page_two = WikiPagePlan {
+        id: WikiPageId::generate(),
+        slug: "plugin-guarantees".into(),
+        title: "Plugin Guarantees".into(),
+        category: "concepts".into(),
+        purpose: "guarantees".into(),
+        knowledge_refs: vec![KnowledgeNodeId::parse(seeded.claim_b.clone()).unwrap()],
+        source_refs: vec![],
+        related_pages: vec![page_one.id.clone()],
+    };
+    page_one.related_pages = vec![page_two.id.clone()];
+    llm_wiki_core::model::WikiPlan {
+        pages: vec![page_one, page_two],
+    }
+}
+
+#[tokio::test]
+async fn compiler_expands_citations_resolves_links_and_persists() {
+    let mut conn = open_in_memory().unwrap();
+    let seeded = seed_knowledge(&mut conn);
+    let plan = two_page_plan(&seeded);
+
+    let body_one = format!(
+        "## Overview\n\nThe runtime hosts plugins and retries transitions. <!-- llm-wiki:cite claim=\"{}\" -->\n\nGuarantees live in [[Plugin Guarantees]].",
+        seeded.claim_a
+    );
+    let body_two = format!(
+        "## Guarantees\n\nDelivery is at-least-once. <!-- llm-wiki:cite claim=\"{}\" -->",
+        seeded.claim_b
+    );
+    let responses = vec![compile_response(&body_one), compile_response(&body_two)];
+    let compiler = make_compiler(
+        CompilerConfig {
+            language_tag: "en".into(),
+            ..CompilerConfig::default()
+        },
+        responses,
+    );
+
+    let build_id = BuildId::generate();
+    let generation = compiler
+        .compile_plan(&plan, &seeded.base, &build_id)
+        .await
+        .unwrap();
+    assert_eq!(generation.llm_request_count, 2);
+    assert_eq!(generation.pages.len(), 2);
+
+    let page_one = &generation.pages[0];
+    assert!(page_one.content.contains("generated: true"));
+    assert!(page_one.content.contains("schema_version: 1"));
+    assert!(page_one.content.contains("language: en"));
+    assert!(page_one.content.starts_with("---\n"));
+    assert!(page_one
+        .content
+        .contains(&format!("id: {}", page_one.page_id.as_str())));
+    assert!(page_one.content.contains("  - plugin/architecture.md"));
+    // Citation expanded from stored anchors: path, heading path, range, digest.
+    assert!(page_one
+        .content
+        .contains("source=\"plugin/architecture.md\" section=\"Plugin Architecture > Lifecycle\""));
+    assert!(page_one.content.contains("range=\"4-64\""));
+    assert!(page_one.content.contains("digest=\"digest-1\""));
+    assert!(page_one.content.contains("## Related"));
+    assert!(page_one.content.contains("- [[Plugin Guarantees]]"));
+    assert!(!page_one.body_hash.is_empty());
+    assert_eq!(page_one.citations.len(), 1);
+    assert_eq!(page_one.links.len(), 1);
+    assert_eq!(page_one.links[0].target_title, "Plugin Guarantees");
+    // The app-generated Related link on page two resolves as well.
+    assert_eq!(generation.pages[1].links.len(), 1);
+    assert_eq!(
+        generation.pages[1].links[0].to_page_id,
+        generation.pages[0].page_id
+    );
+
+    // Persisted machine state (PRD §16: Markdown + DB mapping).
+    let stats = persist_generation(&mut conn, &build_id, &generation.pages).unwrap();
+    assert_eq!(
+        stats,
+        llm_wiki_storage::GenerationStats {
+            pages: 2,
+            citations: 2,
+            links: 2
+        }
+    );
+}
+
+#[tokio::test]
+async fn compiler_repairs_hallucinated_claim_once() {
+    let mut conn = open_in_memory().unwrap();
+    let seeded = seed_knowledge(&mut conn);
+    let plan = two_page_plan(&seeded);
+
+    let bad = compile_response(
+        "## Overview\n\nText. <!-- llm-wiki:cite claim=\"kn_HALLUCINATED000000000000000\" -->",
+    );
+    let good = compile_response(&format!(
+        "## Overview\n\nText. <!-- llm-wiki:cite claim=\"{}\" -->",
+        seeded.claim_a
+    ));
+    let page_two_ok = compile_response(&format!(
+        "## Guarantees\n\nFine. <!-- llm-wiki:cite claim=\"{}\" -->",
+        seeded.claim_b
+    ));
+    let responses = vec![bad, good, page_two_ok];
+    let compiler = make_compiler(CompilerConfig::default(), responses);
+
+    let generation = compiler
+        .compile_plan(&plan, &seeded.base, &BuildId::generate())
+        .await
+        .unwrap();
+    assert_eq!(
+        generation.llm_request_count, 3,
+        "page 1: repair; page 2: one"
+    );
+    assert_eq!(generation.pages[0].citations.len(), 1);
+}
+
+#[tokio::test]
+async fn compiler_fails_closed_when_repair_still_hallucinates() {
+    let mut conn = open_in_memory().unwrap();
+    let seeded = seed_knowledge(&mut conn);
+    let plan = two_page_plan(&seeded);
+
+    let bad = compile_response(
+        "## Overview\n\nText. <!-- llm-wiki:cite claim=\"kn_HALLUCINATED000000000000000\" -->",
+    );
+    let compiler = make_compiler(CompilerConfig::default(), vec![bad.clone(), bad]);
+
+    let error = compiler
+        .compile_plan(&plan, &seeded.base, &BuildId::generate())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("UNKNOWN_CLAIM_REF"));
+}
+
+#[tokio::test]
+async fn compiler_ungrounded_body_triggers_single_repair() {
+    let mut conn = open_in_memory().unwrap();
+    let seeded = seed_knowledge(&mut conn);
+    let plan = two_page_plan(&seeded);
+
+    // Page 1 has claim knowledge but cites nothing → UNGROUNDED_BODY.
+    let ungrounded = compile_response("## Overview\n\nNo citations here at all.");
+    let good = compile_response(&format!(
+        "## Overview\n\nCited text. <!-- llm-wiki:cite claim=\"{}\" -->",
+        seeded.claim_a
+    ));
+    let page_two_ok = compile_response(&format!(
+        "## Guarantees\n\nFine. <!-- llm-wiki:cite claim=\"{}\" -->",
+        seeded.claim_b
+    ));
+    let responses = vec![ungrounded, good, page_two_ok];
+    let compiler = make_compiler(CompilerConfig::default(), responses);
+
+    let generation = compiler
+        .compile_plan(&plan, &seeded.base, &BuildId::generate())
+        .await
+        .unwrap();
+    assert_eq!(generation.llm_request_count, 3);
+}
+
+// ---------------------------------------------------------------------------
+// Review-fix regression tests (#I01–#I04)
+// ---------------------------------------------------------------------------
+
+/// Inserts an active claim with NO citation rows (no anchors), so citing it
+/// can never expand (review #I04).
+fn seed_unanchored_claim(conn: &mut Connection) -> String {
+    let drafts = vec![NodeDraft {
+        kind: NodeKind::Claim,
+        canonical_key: "stmt-orphan".into(),
+        canonical_name: "claim orphan".into(),
+        entity_type: None,
+        description: None,
+    }];
+    let ids = get_or_create_batch(conn, &drafts, None).unwrap();
+    let node = ids[0].as_str().to_owned();
+    conn.execute(
+        "INSERT INTO claims (claim_id, node_id, source_id, section_id, analysis_id, statement, evidence_digest, status)
+         VALUES ('cl_01CZZZZZZZZZZZZZZZZZZZZZZA', ?1,
+                 (SELECT source_id FROM sources ORDER BY source_id LIMIT 1),
+                 NULL, 'an_01ARZ3NDEKTSV4RRFFQ69G5FAV', 'Orphan statement with no stored anchor.', 'digest-orphan', 'active')",
+        params![node],
+    )
+    .unwrap();
+    node
+}
+
+#[tokio::test]
+async fn planner_shape_repair_with_hallucinated_refs_fails_closed() {
+    let mut conn = open_in_memory().unwrap();
+    let seeded = seed_knowledge(&mut conn);
+    // Review #I01: the FIRST local-plan response is unparseable, the repair
+    // parses but hallucinates a node id. The repaired response must still go
+    // through validation and fail the stage closed.
+    let relation_pair = vec![seeded.entity.clone(), seeded.concept.clone()];
+    let claims_pair = vec![seeded.claim_a.clone(), seeded.claim_b.clone()];
+    let responses = vec![
+        route(SUMMARY_MARK, &relation_pair, vec![summary_response("s1")]),
+        route(SUMMARY_MARK, &claims_pair, vec![summary_response("s2")]),
+        route(
+            LOCAL_MARK,
+            &relation_pair,
+            vec![
+                "this is not json at all".to_owned(),
+                plan_response(vec![proposal(
+                    "Bad",
+                    "concepts",
+                    &["kn_NOPE0000000000000000000000".to_owned()],
+                )]),
+            ],
+        ),
+        route(
+            LOCAL_MARK,
+            &claims_pair,
+            vec![plan_response(vec![proposal(
+                "Plugin Guarantees",
+                "concepts",
+                &claims_pair,
+            )])],
+        ),
+    ];
+    let wiki_planner = planner_with(Arc::new(router(responses)), PlannerConfig::default());
+    let error = wiki_planner.plan(&seeded.base, 4).await.unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("UNKNOWN_NODE_REF") && message.contains("after repair"),
+        "repaired response must be validated: {message}"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_missing_coverage_fails_closed() {
+    let mut conn = open_in_memory().unwrap();
+    let seeded = seed_knowledge(&mut conn);
+    // Review #I02: reconciliation drops the claims cluster → coverage check
+    // must reject the plan instead of silently losing knowledge.
+    let relation_pair = vec![seeded.entity.clone(), seeded.concept.clone()];
+    let claims_pair = vec![seeded.claim_a.clone(), seeded.claim_b.clone()];
+    let responses = vec![
+        route(SUMMARY_MARK, &relation_pair, vec![summary_response("s1")]),
+        route(SUMMARY_MARK, &claims_pair, vec![summary_response("s2")]),
+        route(
+            LOCAL_MARK,
+            &relation_pair,
+            vec![plan_response(vec![proposal(
+                "Plugin System",
+                "concepts",
+                &relation_pair,
+            )])],
+        ),
+        route(
+            LOCAL_MARK,
+            &claims_pair,
+            vec![plan_response(vec![proposal(
+                "Plugin Guarantees",
+                "concepts",
+                &claims_pair,
+            )])],
+        ),
+        route(
+            RECONCILE_MARK,
+            &[],
+            // Both the first response and its repair drop the claims cluster:
+            // after the single repair the plan must fail closed.
+            vec![
+                plan_response(vec![proposal("Plugin System", "concepts", &relation_pair)]),
+                plan_response(vec![proposal("Plugin System", "concepts", &relation_pair)]),
+            ],
+        ),
+    ];
+    let wiki_planner = planner_with(Arc::new(router(responses)), PlannerConfig::default());
+    let error = wiki_planner.plan(&seeded.base, 4).await.unwrap_err();
+    assert!(
+        error.to_string().contains("MISSING_NODE_COVERAGE"),
+        "dropped knowledge must fail reconciliation: {error}"
+    );
+}
+
+#[tokio::test]
+async fn compiler_fails_closed_when_page_input_exceeds_budget() {
+    let mut conn = open_in_memory().unwrap();
+    let seeded = seed_knowledge(&mut conn);
+    let plan = two_page_plan(&seeded);
+    // Review #I03: an over-budget page payload must fail before any request.
+    let compiler = make_compiler(
+        CompilerConfig {
+            max_input_tokens: 10,
+            ..CompilerConfig::default()
+        },
+        vec![],
+    );
+    let error = compiler
+        .compile_plan(&plan, &seeded.base, &BuildId::generate())
+        .await
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("max_input_tokens") && message.contains("split"),
+        "actionable budget failure expected: {message}"
+    );
+}
+
+#[tokio::test]
+async fn compiler_repairs_unanchored_claim_citation() {
+    let mut conn = open_in_memory().unwrap();
+    let mut seeded = seed_knowledge(&mut conn);
+    let orphan = seed_unanchored_claim(&mut conn);
+    seeded.base = load_knowledge_base(&conn).unwrap();
+    let mut plan = two_page_plan(&seeded);
+    plan.pages[0]
+        .knowledge_refs
+        .push(KnowledgeNodeId::parse(orphan.clone()).unwrap());
+
+    // Page 1 cites the anchor-less claim → UNANCHORED_CLAIM; the repair must
+    // fall back to the anchored claim.
+    let bad = compile_response(&format!(
+        "## Overview\n\nText. <!-- llm-wiki:cite claim=\"{orphan}\" -->"
+    ));
+    let good = compile_response(&format!(
+        "## Overview\n\nText. <!-- llm-wiki:cite claim=\"{}\" -->",
+        seeded.claim_a
+    ));
+    let page_two_ok = compile_response(&format!(
+        "## Guarantees\n\nFine. <!-- llm-wiki:cite claim=\"{}\" -->",
+        seeded.claim_b
+    ));
+    let compiler = make_compiler(CompilerConfig::default(), vec![bad, good, page_two_ok]);
+
+    let generation = compiler
+        .compile_plan(&plan, &seeded.base, &BuildId::generate())
+        .await
+        .unwrap();
+    assert_eq!(generation.llm_request_count, 3, "page 1 repairs once");
+    assert_eq!(generation.pages[0].citations.len(), 1);
+    assert!(generation.pages[0].content.contains("digest=\"digest-1\""));
+    assert!(
+        !generation.pages[0].content.contains(&orphan),
+        "the unexpandable citation must not survive"
+    );
+}
+
+#[tokio::test]
+async fn compiler_fails_closed_when_repair_still_cites_unanchored() {
+    let mut conn = open_in_memory().unwrap();
+    let mut seeded = seed_knowledge(&mut conn);
+    let orphan = seed_unanchored_claim(&mut conn);
+    seeded.base = load_knowledge_base(&conn).unwrap();
+    let mut plan = two_page_plan(&seeded);
+    plan.pages[0]
+        .knowledge_refs
+        .push(KnowledgeNodeId::parse(orphan.clone()).unwrap());
+
+    let bad = compile_response(&format!(
+        "## Overview\n\nText. <!-- llm-wiki:cite claim=\"{orphan}\" -->"
+    ));
+    let compiler = make_compiler(CompilerConfig::default(), vec![bad.clone(), bad]);
+
+    let error = compiler
+        .compile_plan(&plan, &seeded.base, &BuildId::generate())
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("UNANCHORED_CLAIM"),
+        "persistent unanchored citations must fail the build: {error}"
+    );
+}

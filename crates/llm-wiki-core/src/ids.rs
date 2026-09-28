@@ -134,6 +134,11 @@ opaque_id!(
     "rel"
 );
 opaque_id!(
+    /// Wiki page link row identity (resolved WikiLink, PRD §15.2).
+    LinkRowId,
+    "lnk"
+);
+opaque_id!(
     /// Auditable rejected-claim record identity (PRD §11.1).
     RejectedClaimId,
     "rj"

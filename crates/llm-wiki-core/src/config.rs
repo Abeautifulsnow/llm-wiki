@@ -21,6 +21,8 @@ pub struct Config {
     #[serde(default)]
     pub analysis: AnalysisConfig,
     #[serde(default)]
+    pub planning: PlanningConfig,
+    #[serde(default)]
     pub search: SearchConfig,
     #[serde(default)]
     pub build: BuildConfig,
@@ -75,6 +77,18 @@ pub struct AnalysisConfig {
     pub max_plan_input_tokens: u32,
     #[serde(default = "default_max_rejected_claim_ratio")]
     pub max_rejected_claim_ratio: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanningConfig {
+    /// Hierarchical planning (PRD §14). When disabled, planning must fail
+    /// with an actionable error instead of executing an incomplete global
+    /// plan if the estimated input exceeds `max_plan_input_tokens`.
+    #[serde(default = "default_true")]
+    pub hierarchical: bool,
+    /// Subdivide clusters beyond this node count (never truncate).
+    #[serde(default = "default_max_cluster_nodes")]
+    pub max_cluster_nodes: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,6 +168,9 @@ fn default_max_plan_input_tokens() -> u32 {
 fn default_max_rejected_claim_ratio() -> f32 {
     0.10
 }
+fn default_max_cluster_nodes() -> u32 {
+    24
+}
 fn default_true() -> bool {
     true
 }
@@ -203,6 +220,15 @@ impl Default for AnalysisConfig {
             section_target_tokens: default_section_target_tokens(),
             max_plan_input_tokens: default_max_plan_input_tokens(),
             max_rejected_claim_ratio: default_max_rejected_claim_ratio(),
+        }
+    }
+}
+
+impl Default for PlanningConfig {
+    fn default() -> Self {
+        PlanningConfig {
+            hierarchical: true,
+            max_cluster_nodes: default_max_cluster_nodes(),
         }
     }
 }
@@ -277,6 +303,11 @@ impl Config {
                 "analysis token budgets must be > 0".into(),
             ));
         }
+        if self.planning.max_cluster_nodes < 2 {
+            return Err(WikiError::Config(
+                "planning.max_cluster_nodes must be >= 2".into(),
+            ));
+        }
 
         let root = lexical_absolute(Path::new(""), &self.source.root);
         let wiki = lexical_absolute(Path::new(""), &self.project.wiki_dir);
@@ -294,7 +325,7 @@ impl Config {
     /// construction: config only stores env-var names (PRD §32).
     pub fn effective_summary(&self) -> String {
         format!(
-            "project.name = {}\nproject.wiki_dir = {}\nsource.root = {}\nsource.include = {:?}\nsource.exclude = {:?}\nllm.provider = {}\nllm.base_url = {}\nllm.model = {}\nllm.api_key_env = <env name: redacted>\nllm.max_concurrency = {}\nanalysis.max_input_tokens = {}\nanalysis.max_plan_input_tokens = {}\nanalysis.max_rejected_claim_ratio = {}\nbuild.incremental = {}\nserver.bind = {}\nserver.remote_enabled = {}",
+            "project.name = {}\nproject.wiki_dir = {}\nsource.root = {}\nsource.include = {:?}\nsource.exclude = {:?}\nllm.provider = {}\nllm.base_url = {}\nllm.model = {}\nllm.api_key_env = <env name: redacted>\nllm.max_concurrency = {}\nanalysis.max_input_tokens = {}\nanalysis.max_plan_input_tokens = {}\nanalysis.max_rejected_claim_ratio = {}\nplanning.hierarchical = {}\nplanning.max_cluster_nodes = {}\nbuild.incremental = {}\nserver.bind = {}\nserver.remote_enabled = {}",
             self.project.name,
             self.project.wiki_dir.display(),
             self.source.root.display(),
@@ -307,6 +338,8 @@ impl Config {
             self.analysis.max_input_tokens,
             self.analysis.max_plan_input_tokens,
             self.analysis.max_rejected_claim_ratio,
+            self.planning.hierarchical,
+            self.planning.max_cluster_nodes,
             self.build.incremental,
             self.server.bind,
             self.server.remote_enabled,
@@ -372,6 +405,16 @@ fn overlap(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn planning_config_defaults_and_bounds() {
+        let cfg = Config::default();
+        assert!(cfg.planning.hierarchical);
+        assert_eq!(cfg.planning.max_cluster_nodes, 24);
+        let mut bad = Config::default();
+        bad.planning.max_cluster_nodes = 1;
+        assert!(bad.validate().is_err());
+    }
 
     #[test]
     fn defaults_validate_cleanly() {
