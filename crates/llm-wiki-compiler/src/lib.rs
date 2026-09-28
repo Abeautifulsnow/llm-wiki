@@ -7,7 +7,9 @@
 
 pub mod analysis;
 pub mod build;
+pub mod cache;
 pub mod compile;
+pub mod lint;
 pub mod persist;
 pub mod plan;
 pub mod prompt;
@@ -17,7 +19,9 @@ pub use analysis::{
     AnalysisOutcome, AnalysisSection, AnalyzedDocument, DocumentAnalyzer, VerifiedRelation,
 };
 pub use build::{run_build, BuildReport};
+pub use cache::{CacheContext, CacheStats, LlmCache, StageCache};
 pub use compile::{CompiledGeneration, CompilerConfig, WikiCompiler};
+pub use lint::{run_lint, LintCheck, LintFinding, LintReport, LintSeverity};
 pub use persist::{persist_outcome, PersistOptions};
 pub use plan::{PlanCacheKeys, PlanOutcome, PlannerConfig, WikiPlanner};
 pub use prompt::{load_prompt, PromptDocument};

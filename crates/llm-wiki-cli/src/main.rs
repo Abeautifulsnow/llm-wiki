@@ -41,6 +41,9 @@ enum Command {
     Status,
     /// Check configuration, filesystem layout, state db and provider env.
     Doctor,
+    /// Lint the currently published generation (PRD §36): citation integrity,
+    /// links, orphans, unsupported sections, duplicates, hand edits.
+    Lint,
 }
 
 fn main() {
@@ -71,6 +74,7 @@ fn run(command: Command) -> Result<(), WikiError> {
         Command::Build { root } => build(&workspace, root.as_deref()),
         Command::Status => status(&workspace),
         Command::Doctor => doctor(&workspace),
+        Command::Lint => lint(&workspace),
     }
 }
 
@@ -284,6 +288,10 @@ fn build(workspace: &Path, root_override: Option<&str>) -> Result<(), WikiError>
         report.pages, report.citations, report.links
     );
     println!("  llm requests: {}", report.llm_request_count);
+    println!(
+        "  llm cache: {} hit(s), {} miss(es)",
+        report.cache.hits, report.cache.misses
+    );
     println!("  published: {}", report.published_path.display());
     if let Some(recovery) = &report.recovery {
         println!("  recovered publish: {recovery}");
@@ -296,6 +304,41 @@ fn warn_diagnostic(diagnostic: &ScanDiagnostic) {
         "  ! {} {:?}: {}",
         diagnostic.rel_path, diagnostic.kind, diagnostic.message
     );
+}
+
+/// `llm-wiki lint` (PRD §29/§36): thin transport over
+/// `llm_wiki_compiler::run_lint`. Findings print grouped by check in
+/// deterministic order; any Error-severity finding exits with the dedicated
+/// lint code (11), warnings alone exit 0. A never-built workspace is not an
+/// error.
+fn lint(workspace: &Path) -> Result<(), WikiError> {
+    let config = load_config(workspace)?;
+    let Some(report) = llm_wiki_compiler::run_lint(workspace, &config)? else {
+        println!("nothing published — nothing to lint");
+        return Ok(());
+    };
+
+    let mut current: Option<llm_wiki_compiler::LintCheck> = None;
+    for finding in &report.findings {
+        if current != Some(finding.check) {
+            println!("{}:", finding.check.label());
+            current = Some(finding.check);
+        }
+        println!(
+            "  [{}] {}: {}",
+            finding.severity.label(),
+            finding.page_slug,
+            finding.message
+        );
+    }
+
+    let (errors, warnings) = (report.errors(), report.warnings());
+    println!("{errors} error(s), {warnings} warning(s)");
+    if errors > 0 {
+        Err(WikiError::Lint { errors, warnings })
+    } else {
+        Ok(())
+    }
 }
 
 fn status(workspace: &Path) -> Result<(), WikiError> {

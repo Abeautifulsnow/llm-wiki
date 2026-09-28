@@ -49,11 +49,33 @@ fn migrate(conn: &Connection) -> Result<()> {
     let current: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|e| WikiError::Storage(format!("cannot read user_version: {e}")))?;
-    for (idx, script) in MIGRATIONS.iter().enumerate() {
+    if current as usize >= MIGRATIONS.len() {
+        return Ok(());
+    }
+    // Schema migrations follow the documented SQLite table-rebuild procedure:
+    // foreign-key enforcement is disabled around the whole run (PRAGMA
+    // foreign_keys is a no-op inside a transaction, so it cannot be toggled
+    // from within a script) and re-enabled with a foreign_key_check after.
+    // The old generation tables are therefore not implicitly deleted when
+    // dropped and FK targets need not exist mid-rebuild.
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")
+        .map_err(|e| WikiError::Storage(format!("cannot disable foreign_keys: {e}")))?;
+    let migrate_result = migrate_versions(conn, current);
+    let re_enabled = conn.execute_batch("PRAGMA foreign_keys=ON;");
+    let violations = foreign_key_violations(conn)?;
+    migrate_result?;
+    re_enabled.map_err(|e| WikiError::Storage(format!("cannot re-enable foreign_keys: {e}")))?;
+    if violations > 0 {
+        return Err(WikiError::Storage(format!(
+            "migration left {violations} foreign-key violation(s) in the state db"
+        )));
+    }
+    Ok(())
+}
+
+fn migrate_versions(conn: &Connection, current: i64) -> Result<()> {
+    for (idx, script) in MIGRATIONS.iter().enumerate().skip(current as usize) {
         let version = (idx + 1) as i64;
-        if version <= current {
-            continue;
-        }
         conn.execute_batch("BEGIN;")
             .map_err(|e| WikiError::Storage(format!("migration {version} begin: {e}")))?;
         if let Err(e) = conn
@@ -70,6 +92,25 @@ fn migrate(conn: &Connection) -> Result<()> {
         tracing::info!(version, "applied migration");
     }
     Ok(())
+}
+
+/// Counts rows that violate an enabled foreign key (`PRAGMA foreign_key_check`).
+fn foreign_key_violations(conn: &Connection) -> Result<u64> {
+    let mut stmt = conn
+        .prepare("PRAGMA foreign_key_check")
+        .map_err(|e| WikiError::Storage(format!("prepare foreign_key_check: {e}")))?;
+    let mut count = 0u64;
+    let mut rows = stmt
+        .query([])
+        .map_err(|e| WikiError::Storage(format!("foreign_key_check: {e}")))?;
+    while rows
+        .next()
+        .map_err(|e| WikiError::Storage(format!("foreign_key_check: {e}")))?
+        .is_some()
+    {
+        count += 1;
+    }
+    Ok(count)
 }
 
 #[cfg(test)]

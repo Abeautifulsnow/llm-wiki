@@ -26,12 +26,16 @@ use llm_wiki_storage::{
 };
 
 use crate::analysis::{AnalyzedDocument, DocumentAnalyzer};
+use crate::cache::{plan_cache_identity, CacheContext, CacheStats, LlmCache, StageCache};
 use crate::compile::{CompilerConfig, WikiCompiler};
 use crate::persist::persist_outcome;
 use crate::persist::PersistOptions;
 use crate::plan::{PlannerConfig, WikiPlanner};
 use crate::prompt::load_prompt;
 use crate::publish::{publish, recover_if_needed, PublishPaths};
+
+/// Response schema version recorded on builds and cache rows (§28).
+const SCHEMA_VERSION: &str = "1";
 
 /// Successful end of a build; the CLI prints this.
 #[derive(Debug, Clone)]
@@ -41,8 +45,11 @@ pub struct BuildReport {
     pub pages: usize,
     pub citations: usize,
     pub links: usize,
-    /// All LLM requests spent by analysis, planning and compilation.
+    /// All NEW LLM requests spent by analysis, planning and compilation
+    /// (§28 cache hits are not counted, PRD §37.3).
     pub llm_request_count: u32,
+    /// §28 cache behavior of this build.
+    pub cache: CacheStats,
     pub published_path: PathBuf,
     /// Human-readable summary of publish recovery performed before this build
     /// started, if any (PRD §35: recovery must be reported).
@@ -89,14 +96,43 @@ pub async fn run_build(
         name = analysis_prompt.name,
         version = analysis_prompt.version
     );
+
+    // §28 LLM cache: its own connection to the same state db (WAL + busy
+    // timeout keep the two safe). The key material covers model, per-task
+    // prompt versions, schema/parser versions and the effective config hash —
+    // any change invalidates (§28: cross-version reuse is impossible).
+    let cache = Arc::new(LlmCache::open(
+        &state_dir.join("state.db"),
+        CacheContext {
+            model: provider.model().to_owned(),
+            prompt_versions: BTreeMap::from([
+                (
+                    analysis_prompt.name.clone(),
+                    analysis_prompt.fingerprint_tag(),
+                ),
+                (
+                    planning_prompt.name.clone(),
+                    planning_prompt.fingerprint_tag(),
+                ),
+                (
+                    compilation_prompt.name.clone(),
+                    compilation_prompt.fingerprint_tag(),
+                ),
+            ]),
+            schema_version: SCHEMA_VERSION.to_owned(),
+            parser_version: llm_wiki_markdown::PARSER_VERSION.to_owned(),
+            config_hash: config_hash.clone(),
+        },
+    )?);
+
     let build_id = start_build(
         &mut conn,
         &BuildDraft {
             model: Some(provider.model().to_owned()),
             prompt_version: Some(prompt_version.clone()),
             compiler_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
-            schema_version: Some("1".to_owned()),
-            config_hash: Some(config_hash),
+            schema_version: Some(SCHEMA_VERSION.to_owned()),
+            config_hash: Some(config_hash.clone()),
             ..BuildDraft::default()
         },
     )?;
@@ -110,6 +146,8 @@ pub async fn run_build(
         &build_id,
         config,
         provider,
+        &cache,
+        &config_hash,
         &analysis_prompt,
         &planning_prompt,
         &compilation_prompt,
@@ -127,6 +165,7 @@ pub async fn run_build(
                 citations: stats.citations,
                 links: stats.links,
                 llm_request_count,
+                cache: cache.stats(),
                 published_path,
                 recovery: recovery_note,
             })
@@ -160,6 +199,8 @@ async fn build_inner(
     build_id: &BuildId,
     config: &Config,
     provider: Arc<dyn LlmProvider>,
+    cache: &Arc<LlmCache>,
+    config_hash: &str,
     analysis_prompt: &crate::prompt::PromptDocument,
     planning_prompt: &crate::prompt::PromptDocument,
     compilation_prompt: &crate::prompt::PromptDocument,
@@ -179,6 +220,9 @@ async fn build_inner(
     }
     let manifest = SourceManifest::from_scanned(&output.files);
     llm_wiki_storage::set_build_snapshot_hash(conn, build_id, &manifest.snapshot_hash())?;
+    // Cache rows record the source snapshot hash so cross-snapshot reuse is
+    // impossible (PRD §28).
+    cache.set_source_snapshot_hash(&manifest.snapshot_hash());
 
     let batch: Vec<SourceUpsert> = output
         .files
@@ -220,12 +264,16 @@ async fn build_inner(
 
     // ---- Analyze (§10/§11) + persist the knowledge outcome. ----
     update_build_status(conn, build_id, "ANALYZING")?;
+    // §28 stage cache: shared by analysis, planning and compilation; each
+    // stage writes a response only after its own validation accepted it.
+    let stage_cache: Arc<dyn StageCache> = cache.clone();
     let analyzer = DocumentAnalyzer::new(
         provider.clone(),
         analysis_prompt.clone(),
         config.analysis.section_target_tokens,
         config.analysis.max_rejected_claim_ratio,
-    );
+    )
+    .with_cache(stage_cache.clone());
     let mut llm_request_count = 0u32;
     for (file, source_id, parsed_doc) in &parsed {
         let sections = register_sections(conn, source_id, &parsed_doc.sections, build_id)?;
@@ -260,7 +308,11 @@ async fn build_inner(
         max_plan_input_tokens: config.analysis.max_plan_input_tokens as u64,
         ..PlannerConfig::default()
     };
-    let planner = WikiPlanner::new(provider.clone(), planning_prompt.clone(), planner_config);
+    let planner = WikiPlanner::new(provider.clone(), planning_prompt.clone(), planner_config)
+        .with_plan_cache(
+            stage_cache.clone(),
+            plan_cache_identity(config_hash, provider.model(), SCHEMA_VERSION),
+        );
     let plan_outcome = planner.plan(&base, registry_revision).await?;
     llm_request_count += plan_outcome.llm_request_count;
 
@@ -274,7 +326,8 @@ async fn build_inner(
         provider.clone(),
         compilation_prompt.clone(),
         compiler_config,
-    );
+    )
+    .with_cache(stage_cache);
     let generation = compiler
         .compile_plan(&plan_outcome.plan, &base, build_id)
         .await?;

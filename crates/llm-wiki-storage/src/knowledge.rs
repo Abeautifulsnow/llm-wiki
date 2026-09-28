@@ -158,6 +158,34 @@ pub fn load_plan_input(conn: &Connection) -> Result<(KnowledgeBase, u64)> {
     Ok((base, revision))
 }
 
+/// Endpoint pairs of every active relation (PRD §36 lint consumes them for
+/// the orphan-page check: a page with no inbound link and no relation
+/// touching its knowledge nodes is an orphan).
+pub fn list_active_relation_pairs(
+    conn: &Connection,
+) -> Result<Vec<(KnowledgeNodeId, KnowledgeNodeId)>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT source_node_id, target_node_id FROM relations
+             WHERE status = 'active' ORDER BY source_node_id, target_node_id",
+        )
+        .map_err(|e| WikiError::Storage(format!("prepare relation pairs: {e}")))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| WikiError::Storage(format!("relation pairs: {e}")))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (source, target) = row.map_err(db)?;
+        out.push((
+            KnowledgeNodeId::from_validated(source),
+            KnowledgeNodeId::from_validated(target),
+        ));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

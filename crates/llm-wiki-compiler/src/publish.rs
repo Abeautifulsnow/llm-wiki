@@ -275,8 +275,9 @@ pub fn clear_journal(paths: &PublishPaths) -> Result<()> {
 
 /// Filesystem-safe file name for one page. Planner slugs are lowercase
 /// alphanumeric + dashes, but pages compiled from other sources must never be
-/// able to escape the generation directory.
-fn page_file_name(slug: &str, page_id: &str) -> String {
+/// able to escape the generation directory. Public so lint (§36) maps page
+/// rows back onto their generation files with the exact same rule.
+pub fn page_file_name(slug: &str, page_id: &str) -> String {
     let safe: String = slug
         .chars()
         .map(|ch| {
@@ -689,6 +690,7 @@ mod tests {
             language: "en".into(),
             body_hash: sha256_hex(content.as_bytes()),
             content: content.to_owned(),
+            knowledge_refs: Vec::new(),
             citations: Vec::new(),
             links: Vec::new(),
         }

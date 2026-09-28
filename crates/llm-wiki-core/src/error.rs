@@ -48,6 +48,11 @@ pub enum WikiError {
     )]
     PublishRecovery(String),
 
+    /// `llm-wiki lint` found at least one Error-severity finding (PRD §34/§36).
+    /// Carries the counts so the CLI can report them; warnings alone exit 0.
+    #[error("lint found {errors} error(s) and {warnings} warning(s)")]
+    Lint { errors: u32, warnings: u32 },
+
     #[error("config error: {0}")]
     Config(String),
 
@@ -70,6 +75,7 @@ impl WikiError {
             WikiError::Compilation(_) | WikiError::Index(_) => 8,
             WikiError::BudgetExceeded(_) => 9,
             WikiError::PublishRecovery(_) => 10,
+            WikiError::Lint { .. } => 11,
         }
     }
 }

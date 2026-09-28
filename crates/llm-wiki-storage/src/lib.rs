@@ -7,6 +7,7 @@
 
 pub mod analysis;
 pub mod builds;
+pub mod cache;
 pub mod connection;
 pub mod knowledge;
 pub mod migrations;
@@ -23,8 +24,9 @@ pub use analysis::{
 pub use builds::{
     finish_build, latest_build, set_build_snapshot_hash, start_build, BuildDraft, BuildRecord,
 };
+pub use cache::{count_cache_entries, get_cached_response, put_cached_response, CacheRow};
 pub use connection::{open, open_in_memory, Connection};
-pub use knowledge::{load_knowledge_base, load_plan_input};
+pub use knowledge::{list_active_relation_pairs, load_knowledge_base, load_plan_input};
 pub use registry::{
     canonical_key, current_revision, get_entry, get_or_create, get_or_create_batch, merge, resolve,
     retire, NodeDraft, NodeKind, RegistryEntry,
@@ -40,6 +42,6 @@ pub use state::{
     ACTIVE_BUILD_KEY, BUILD_STATUSES,
 };
 pub use wiki::{
-    load_generation_pages, persist_generation, GenerationStats, PageCitationRecord, PageLinkRecord,
-    WikiPageRecord,
+    load_generation_pages, load_generation_view, persist_generation, GenerationPageView,
+    GenerationStats, PageCitationRecord, PageLinkRecord, WikiPageRecord,
 };

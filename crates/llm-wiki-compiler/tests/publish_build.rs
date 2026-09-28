@@ -21,8 +21,8 @@ use llm_wiki_core::hash::sha256_hex;
 use llm_wiki_core::ids::BuildId;
 use llm_wiki_llm::{FakeLlmProvider, LlmError, LlmProvider, LlmRequest};
 use llm_wiki_storage::{
-    activate_build, get_active_build_id, open, open_in_memory, persist_generation, start_build,
-    WikiPageRecord,
+    activate_build, get_active_build_id, load_generation_view, open, open_in_memory,
+    persist_generation, start_build, WikiPageRecord,
 };
 
 // ---------------------------------------------------------------------------
@@ -48,6 +48,7 @@ fn page(slug: &str, content: &str) -> WikiPageRecord {
         language: "en".into(),
         body_hash: sha256_hex(content.as_bytes()),
         content: content.to_owned(),
+        knowledge_refs: Vec::new(),
         citations: Vec::new(),
         links: Vec::new(),
     }
@@ -620,4 +621,85 @@ fn replan_required_maps_to_the_replan_terminal_status() {
     assert_eq!(err.exit_code(), 7);
     assert!(err.to_string().contains("sources restructured"));
     assert!(err.to_string().contains("replan --dry-run"));
+}
+
+/// §37.3 Rebuild Determinism (V0.1 DoD #16): a second build over completely
+/// unchanged sources issues ZERO new LLM requests (the §28 cache absorbs
+/// analysis, planning and compilation) and produces an identical structured
+/// manifest — page IDs, knowledge refs, citation mapping and links (§45: page
+/// identity is persisted by the planner's plan-identity cache).
+#[tokio::test]
+async fn second_identical_build_consumes_zero_new_llm_requests_and_keeps_the_manifest() {
+    let workspace = fixture_workspace("determinism");
+    let config = llm_wiki_core::config::Config::load(&workspace).unwrap();
+    let db_path = workspace.join(".llm-wiki").join("state.db");
+
+    let first = llm_wiki_compiler::run_build(&workspace, &config, pipeline_llm())
+        .await
+        .unwrap();
+    assert!(
+        first.llm_request_count > 0,
+        "first build really calls the model"
+    );
+    assert!(first.cache.misses > 0, "first build populates the cache");
+
+    let second = llm_wiki_compiler::run_build(&workspace, &config, pipeline_llm())
+        .await
+        .unwrap();
+    assert_eq!(
+        second.llm_request_count, 0,
+        "every request must be answered from the §28 cache"
+    );
+    assert!(second.cache.hits > 0, "the cache must actually serve");
+    assert_eq!(second.cache.misses, 0, "nothing may recompute");
+    assert_eq!(
+        build_status(&conn_of(&db_path), &second.build_id),
+        "COMPLETED"
+    );
+
+    // Structured manifest identity across the two generations.
+    let conn = conn_of(&db_path);
+    let manifest_of = |build: &BuildId| -> Vec<String> {
+        let mut view = load_generation_view(&conn, build).unwrap();
+        view.sort_by(|a, b| a.slug.cmp(&b.slug));
+        view.into_iter()
+            .map(|page| {
+                let citations: Vec<String> = page
+                    .citations
+                    .iter()
+                    .map(|c| {
+                        format!(
+                            "{}/{}/{}/{}/{}",
+                            c.claim_node_id,
+                            c.source_id,
+                            c.range.start,
+                            c.range.end,
+                            c.evidence_digest
+                        )
+                    })
+                    .collect();
+                let links: Vec<String> = page
+                    .links
+                    .iter()
+                    .map(|l| format!("{}/{}", l.to_page_id, l.target_title))
+                    .collect();
+                // Note: page content legitimately differs between generations
+                // because §15.2 frontmatter carries the owning build id; the
+                // §37.3 manifest covers ids, refs, citations and links only.
+                format!(
+                    "{}|{}|{}|{:?}|{:?}|{:?}",
+                    page.page_id, page.slug, page.title, page.knowledge_refs, citations, links
+                )
+            })
+            .collect()
+    };
+    assert_eq!(
+        manifest_of(&first.build_id),
+        manifest_of(&second.build_id),
+        "page IDs, citation mapping and links must be identical"
+    );
+}
+
+fn conn_of(path: &Path) -> rusqlite::Connection {
+    open(path).unwrap()
 }

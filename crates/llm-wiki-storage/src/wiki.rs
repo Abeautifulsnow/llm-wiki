@@ -45,8 +45,30 @@ pub struct WikiPageRecord {
     pub language: String,
     pub body_hash: String,
     pub content: String,
+    /// Knowledge nodes the page was compiled from — persisted with the page
+    /// so lint (§36 orphan check) and search can use them without replaying
+    /// the plan (PRD §45: page identity is persisted).
+    pub knowledge_refs: Vec<KnowledgeNodeId>,
     pub citations: Vec<PageCitationRecord>,
     pub links: Vec<PageLinkRecord>,
+}
+
+/// One page of the currently published generation with its full machine
+/// mapping — the view `lint` (PRD §36) operates on.
+#[derive(Debug, Clone)]
+pub struct GenerationPageView {
+    pub page_id: WikiPageId,
+    pub slug: String,
+    pub title: String,
+    pub category: String,
+    pub body_hash: String,
+    pub content: String,
+    pub knowledge_refs: Vec<KnowledgeNodeId>,
+    pub citations: Vec<PageCitationRecord>,
+    /// Outbound resolved WikiLinks.
+    pub links: Vec<PageLinkRecord>,
+    /// Inbound WikiLinks from sibling pages of the same generation.
+    pub inbound_links: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,8 +94,8 @@ pub fn persist_generation(
     // transaction, so every page row must exist before link/citation rows.
     for page in pages {
         tx.execute(
-            "INSERT INTO wiki_pages (page_id, build_id, slug, title, category, language, body_hash, content, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO wiki_pages (page_id, build_id, slug, title, category, language, body_hash, content, knowledge_refs_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 page.page_id.as_str(),
                 build_id.as_str(),
@@ -83,6 +105,7 @@ pub fn persist_generation(
                 page.language,
                 page.body_hash,
                 page.content,
+                knowledge_refs_json(&page.knowledge_refs)?,
                 chrono::Utc::now().to_rfc3339()
             ],
         )
@@ -91,10 +114,11 @@ pub fn persist_generation(
     for page in pages {
         for citation in &page.citations {
             tx.execute(
-                "INSERT INTO page_citations (citation_id, page_id, claim_node_id, source_id, section_id, range_start, range_end, source_hash, evidence_digest, heading_path_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                "INSERT INTO page_citations (citation_id, build_id, page_id, claim_node_id, source_id, section_id, range_start, range_end, source_hash, evidence_digest, heading_path_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     CitationId::generate().as_str(),
+                    build_id.as_str(),
                     page.page_id.as_str(),
                     citation.claim_node_id.as_str(),
                     citation.source_id.as_str(),
@@ -113,10 +137,11 @@ pub fn persist_generation(
 
         for link in &page.links {
             tx.execute(
-                "INSERT INTO page_links (link_id, from_page_id, to_page_id, target_title)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO page_links (link_id, build_id, from_page_id, to_page_id, target_title)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     LinkRowId::generate().as_str(),
+                    build_id.as_str(),
                     page.page_id.as_str(),
                     link.to_page_id.as_str(),
                     link.target_title,
@@ -141,30 +166,198 @@ pub fn persist_generation(
 pub fn load_generation_pages(conn: &Connection, build_id: &BuildId) -> Result<Vec<WikiPageRecord>> {
     let mut stmt = conn
         .prepare(
-            "SELECT page_id, slug, title, category, language, body_hash, content
+            "SELECT page_id, slug, title, category, language, body_hash, content, knowledge_refs_json
              FROM wiki_pages WHERE build_id = ?1 ORDER BY slug",
         )
         .map_err(|e| WikiError::Storage(format!("prepare load_generation_pages: {e}")))?;
     let rows = stmt
         .query_map(params![build_id.as_str()], |row| {
-            Ok(WikiPageRecord {
-                page_id: WikiPageId::from_validated(row.get::<_, String>("page_id")?),
-                slug: row.get("slug")?,
-                title: row.get("title")?,
-                category: row.get("category")?,
-                language: row.get("language")?,
-                body_hash: row.get("body_hash")?,
-                content: row.get("content")?,
-                citations: Vec::new(),
-                links: Vec::new(),
-            })
+            Ok((
+                WikiPageId::from_validated(row.get::<_, String>("page_id")?),
+                row.get::<_, String>("slug")?,
+                row.get::<_, String>("title")?,
+                row.get::<_, String>("category")?,
+                row.get::<_, String>("language")?,
+                row.get::<_, String>("body_hash")?,
+                row.get::<_, String>("content")?,
+                row.get::<_, String>("knowledge_refs_json")?,
+            ))
         })
         .map_err(|e| WikiError::Storage(format!("load_generation_pages: {e}")))?;
     let mut out = Vec::new();
     for row in rows {
-        out.push(row.map_err(db)?);
+        let (page_id, slug, title, category, language, body_hash, content, refs_json) =
+            row.map_err(db)?;
+        out.push(WikiPageRecord {
+            page_id,
+            slug,
+            title,
+            category,
+            language,
+            body_hash,
+            content,
+            knowledge_refs: parse_knowledge_refs(&refs_json)?,
+            citations: Vec::new(),
+            links: Vec::new(),
+        });
     }
     Ok(out)
+}
+
+/// Loads the full lint view of one generation: pages with citations, links
+/// (outbound and inbound) and persisted knowledge refs (PRD §36).
+pub fn load_generation_view(
+    conn: &Connection,
+    build_id: &BuildId,
+) -> Result<Vec<GenerationPageView>> {
+    let mut pages: Vec<GenerationPageView> = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT page_id, slug, title, category, body_hash, content, knowledge_refs_json
+                 FROM wiki_pages WHERE build_id = ?1 ORDER BY slug",
+            )
+            .map_err(|e| WikiError::Storage(format!("prepare load_generation_view: {e}")))?;
+        let rows = stmt
+            .query_map(params![build_id.as_str()], |row| {
+                Ok((
+                    WikiPageId::from_validated(row.get::<_, String>("page_id")?),
+                    row.get::<_, String>("slug")?,
+                    row.get::<_, String>("title")?,
+                    row.get::<_, String>("category")?,
+                    row.get::<_, String>("body_hash")?,
+                    row.get::<_, String>("content")?,
+                    row.get::<_, String>("knowledge_refs_json")?,
+                ))
+            })
+            .map_err(|e| WikiError::Storage(format!("load_generation_view: {e}")))?;
+        for row in rows {
+            let (page_id, slug, title, category, body_hash, content, refs_json) =
+                row.map_err(db)?;
+            pages.push(GenerationPageView {
+                page_id,
+                slug,
+                title,
+                category,
+                body_hash,
+                content,
+                knowledge_refs: parse_knowledge_refs(&refs_json)?,
+                citations: Vec::new(),
+                links: Vec::new(),
+                inbound_links: 0,
+            });
+        }
+    }
+
+    let mut index_of: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for (idx, page) in pages.iter().enumerate() {
+        index_of.insert(page.page_id.as_str().to_owned(), idx);
+    }
+
+    {
+        // Page ids persist across builds (PRD §45), so every child-row lookup
+        // is scoped to THIS generation's build_id.
+        let mut stmt = conn
+            .prepare(
+                "SELECT page_id, claim_node_id, source_id, section_id, range_start, range_end, source_hash, evidence_digest, heading_path_json
+                 FROM page_citations WHERE build_id = ?1 AND page_id = ?2 ORDER BY rowid",
+            )
+            .map_err(|e| WikiError::Storage(format!("prepare view citations: {e}")))?;
+        for page in &mut pages {
+            let rows = stmt
+                .query_map(
+                    params![build_id.as_str(), page.page_id.as_str()],
+                    map_citation_row,
+                )
+                .map_err(|e| WikiError::Storage(format!("view citations: {e}")))?;
+            for row in rows {
+                page.citations.push(row.map_err(db)?);
+            }
+        }
+    }
+
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT from_page_id, to_page_id, target_title FROM page_links
+                 WHERE build_id = ?1 AND from_page_id = ?2 ORDER BY rowid",
+            )
+            .map_err(|e| WikiError::Storage(format!("prepare view links: {e}")))?;
+        for page in &mut pages {
+            let rows = stmt
+                .query_map(params![build_id.as_str(), page.page_id.as_str()], |row| {
+                    Ok(PageLinkRecord {
+                        to_page_id: WikiPageId::from_validated(row.get::<_, String>("to_page_id")?),
+                        target_title: row.get("target_title")?,
+                    })
+                })
+                .map_err(|e| WikiError::Storage(format!("view links: {e}")))?;
+            for row in rows {
+                page.links.push(row.map_err(db)?);
+            }
+        }
+    }
+
+    // Inbound counts: one query over all links of this generation.
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT to_page_id, COUNT(*) FROM page_links
+                 WHERE build_id = ?1 AND to_page_id IN (SELECT page_id FROM wiki_pages WHERE build_id = ?1)
+                 GROUP BY to_page_id",
+            )
+            .map_err(|e| WikiError::Storage(format!("prepare view inbound: {e}")))?;
+        let rows = stmt
+            .query_map(params![build_id.as_str()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|e| WikiError::Storage(format!("view inbound: {e}")))?;
+        for row in rows {
+            let (to_page_id, count) = row.map_err(db)?;
+            if let Some(idx) = index_of.get(&to_page_id) {
+                pages[*idx].inbound_links = count.max(0) as u64;
+            }
+        }
+    }
+
+    Ok(pages)
+}
+
+fn map_citation_row(row: &rusqlite::Row) -> rusqlite::Result<PageCitationRecord> {
+    let heading_path_json: String = row.get("heading_path_json")?;
+    let heading_path: Vec<String> = serde_json::from_str(&heading_path_json).unwrap_or_default();
+    let section_id: Option<String> = row.get("section_id")?;
+    Ok(PageCitationRecord {
+        claim_node_id: KnowledgeNodeId::from_validated(row.get::<_, String>("claim_node_id")?),
+        source_id: SourceId::from_validated(row.get::<_, String>("source_id")?),
+        section_id: section_id.map(SectionId::from_validated),
+        range: SourceRange::new(
+            row.get::<_, i64>("range_start")?.max(0) as usize,
+            row.get::<_, i64>("range_end")?.max(0) as usize,
+        ),
+        source_hash: row.get("source_hash")?,
+        evidence_digest: row.get("evidence_digest")?,
+        heading_path,
+    })
+}
+
+fn knowledge_refs_json(refs: &[KnowledgeNodeId]) -> Result<String> {
+    serde_json::to_string(
+        &refs
+            .iter()
+            .map(|id| id.as_str().to_owned())
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|e| WikiError::Storage(format!("serialize knowledge refs: {e}")))
+}
+
+fn parse_knowledge_refs(json: &str) -> Result<Vec<KnowledgeNodeId>> {
+    let raw: Vec<String> = serde_json::from_str(json)
+        .map_err(|e| WikiError::Storage(format!("parse knowledge refs: {e}")))?;
+    Ok(raw
+        .into_iter()
+        .map(KnowledgeNodeId::from_validated)
+        .collect())
 }
 
 #[cfg(test)]
@@ -220,6 +413,7 @@ mod tests {
                 language: "en".into(),
                 body_hash: "hash-a".into(),
                 content: "# Plugin System\n\ntext <!-- llm-wiki:cite ... -->".into(),
+                knowledge_refs: vec![claim_node.clone()],
                 citations: vec![PageCitationRecord {
                     claim_node_id: claim_node.clone(),
                     source_id: source_id.clone(),
@@ -242,6 +436,7 @@ mod tests {
                 language: "en".into(),
                 body_hash: "hash-b".into(),
                 content: "# Runtime".into(),
+                knowledge_refs: Vec::new(),
                 citations: vec![],
                 links: vec![],
             },
@@ -277,6 +472,7 @@ mod tests {
             language: "en".into(),
             body_hash: "hash-c".into(),
             content: "# Runtime copy".into(),
+            knowledge_refs: Vec::new(),
             citations: vec![],
             links: vec![],
         };
@@ -295,6 +491,7 @@ mod tests {
             language: "en".into(),
             body_hash: "hash-b".into(),
             content: "# Runtime".into(),
+            knowledge_refs: Vec::new(),
             citations: vec![],
             links: vec![],
         }];
@@ -309,5 +506,71 @@ mod tests {
 
         let other = BuildId::generate();
         assert!(load_generation_pages(&conn, &other).unwrap().is_empty());
+    }
+
+    #[test]
+    fn generation_view_loads_citations_links_and_inbound_counts() {
+        let (mut conn, source_id, claim_node) = seed();
+        let page_a = WikiPageId::generate();
+        let page_b = WikiPageId::generate();
+        let build_id = BuildId::generate();
+        let pages = vec![
+            WikiPageRecord {
+                page_id: page_a.clone(),
+                slug: "plugin-system".into(),
+                title: "Plugin System".into(),
+                category: "concepts".into(),
+                language: "en".into(),
+                body_hash: "hash-a".into(),
+                content: "# Plugin System".into(),
+                knowledge_refs: vec![claim_node.clone()],
+                citations: vec![PageCitationRecord {
+                    claim_node_id: claim_node.clone(),
+                    source_id: source_id.clone(),
+                    section_id: None,
+                    range: SourceRange::new(4, 20),
+                    source_hash: "hash-1".into(),
+                    evidence_digest: "digest".into(),
+                    heading_path: vec!["Doc".into()],
+                }],
+                links: vec![PageLinkRecord {
+                    to_page_id: page_b.clone(),
+                    target_title: "Runtime".into(),
+                }],
+            },
+            WikiPageRecord {
+                page_id: page_b.clone(),
+                slug: "runtime".into(),
+                title: "Runtime".into(),
+                category: "architecture".into(),
+                language: "en".into(),
+                body_hash: "hash-b".into(),
+                content: "# Runtime".into(),
+                knowledge_refs: Vec::new(),
+                citations: vec![],
+                links: vec![],
+            },
+        ];
+        persist_generation(&mut conn, &build_id, &pages).unwrap();
+
+        let view = load_generation_view(&conn, &build_id).unwrap();
+        assert_eq!(view.len(), 2);
+        let a = view
+            .iter()
+            .find(|p| p.page_id == page_a)
+            .expect("page a in view");
+        assert_eq!(a.knowledge_refs, vec![claim_node.clone()]);
+        assert_eq!(a.citations.len(), 1);
+        assert_eq!(a.citations[0].range, SourceRange::new(4, 20));
+        assert_eq!(a.links.len(), 1);
+        assert_eq!(a.inbound_links, 0);
+        let b = view
+            .iter()
+            .find(|p| p.page_id == page_b)
+            .expect("page b in view");
+        assert_eq!(b.inbound_links, 1, "runtime receives one inbound link");
+
+        let other = BuildId::generate();
+        assert!(load_generation_view(&conn, &other).unwrap().is_empty());
     }
 }

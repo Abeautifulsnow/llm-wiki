@@ -24,6 +24,9 @@ use llm_wiki_core::plan::{
 use llm_wiki_llm::structured;
 use llm_wiki_llm::{LlmProvider, LlmRequest};
 
+use crate::cache::{
+    generate_cached, plan_cache_key, remember_validated, repair_request, StageCache,
+};
 use crate::prompt::PromptDocument;
 
 #[derive(Debug, Clone)]
@@ -61,12 +64,20 @@ pub struct PlanOutcome {
     pub cache: PlanCacheKeys,
     pub llm_request_count: u32,
     pub flat_mode: bool,
+    /// True when the whole plan came from the §45 plan-identity cache (page
+    /// IDs preserved, zero LLM requests).
+    pub plan_cache_hit: bool,
 }
 
 pub struct WikiPlanner {
     provider: Arc<dyn LlmProvider>,
     prompt: PromptDocument,
     config: PlannerConfig,
+    /// §28 request-level cache for summary/local/reconcile responses.
+    cache: Option<Arc<dyn StageCache>>,
+    /// §45 plan-identity: `plan_cache_identity(...)` over config/model/schema;
+    /// `Some` enables plan persistence under the reconciliation key.
+    plan_identity: Option<String>,
 }
 
 impl WikiPlanner {
@@ -79,7 +90,18 @@ impl WikiPlanner {
             provider,
             prompt,
             config,
+            cache: None,
+            plan_identity: None,
         }
+    }
+
+    /// Wires the §28 stage cache and the §45 plan-identity cache. `identity`
+    /// is `plan_cache_identity(config_hash, model, schema_version)` — it must
+    /// change when model, schema or the effective config change.
+    pub fn with_plan_cache(mut self, cache: Arc<dyn StageCache>, identity: String) -> Self {
+        self.cache = Some(cache);
+        self.plan_identity = Some(identity);
+        self
     }
 
     pub async fn plan(&self, base: &KnowledgeBase, registry_revision: u64) -> Result<PlanOutcome> {
@@ -96,6 +118,7 @@ impl WikiPlanner {
                 },
                 llm_request_count: 0,
                 flat_mode: !self.config.hierarchical,
+                plan_cache_hit: false,
             });
         }
         if self.config.hierarchical {
@@ -122,15 +145,36 @@ impl WikiPlanner {
         let summary_stage = self.prompt.stage_block("cluster-summary")?;
         let local_stage = self.prompt.stage_block("local-plan")?;
 
-        let mut summary_keys = Vec::new();
-        let mut local_keys = Vec::new();
+        // Layer keys are LLM-free (PRD §14): computable BEFORE any request,
+        // which is what makes the plan-identity short-circuit possible.
+        let summary_keys: Vec<String> = clusters
+            .iter()
+            .map(|cluster| cluster_summary_key(base, cluster))
+            .collect();
+        let local_keys: Vec<String> = summary_keys
+            .iter()
+            .map(|summary_key| local_plan_key(summary_key, planner_version, config_tag))
+            .collect();
+        let reconcile_key = reconciliation_key(&local_keys, registry_revision, config_tag);
+
+        if let Some(plan) = self.cached_plan(&reconcile_key)? {
+            return Ok(PlanOutcome {
+                plan,
+                cache: PlanCacheKeys {
+                    cluster_summary_keys: summary_keys,
+                    local_plan_keys: local_keys,
+                    reconciliation_key: reconcile_key,
+                },
+                llm_request_count: 0,
+                flat_mode: false,
+                plan_cache_hit: true,
+            });
+        }
+
         let mut proposals: Vec<RawPage> = Vec::new();
         let mut llm_request_count = 0u32;
 
-        for cluster in &clusters {
-            let summary_key = cluster_summary_key(base, cluster);
-            summary_keys.push(summary_key.clone());
-
+        for (cluster, _summary_key) in clusters.iter().zip(summary_keys.iter()) {
             let payload = node_payload(base, &cluster.nodes);
             self.ensure_stage_budget(&payload, "cluster summary")?;
             let (raw_summary, requests) = self
@@ -151,7 +195,6 @@ impl WikiPlanner {
                 })
                 .await?;
             llm_request_count += requests;
-            local_keys.push(local_plan_key(&summary_key, planner_version, config_tag));
             proposals.extend(raw_local.pages);
         }
 
@@ -168,7 +211,7 @@ impl WikiPlanner {
         llm_request_count += requests;
 
         let plan = self.finalize(merged, base)?;
-        let reconcile_key = reconciliation_key(&local_keys, registry_revision, config_tag);
+        self.store_plan(&reconcile_key, &plan);
         Ok(PlanOutcome {
             plan,
             cache: PlanCacheKeys {
@@ -178,6 +221,7 @@ impl WikiPlanner {
             },
             llm_request_count,
             flat_mode: false,
+            plan_cache_hit: false,
         })
     }
 
@@ -201,6 +245,28 @@ impl WikiPlanner {
             )));
         }
         let local_stage = self.prompt.stage_block("local-plan")?;
+        let key = local_plan_key(
+            &llm_wiki_core::hash::sha256_hex(payload.as_bytes()),
+            planner_version,
+            config_tag,
+        );
+        let reconcile_key =
+            reconciliation_key(std::slice::from_ref(&key), registry_revision, config_tag);
+
+        if let Some(plan) = self.cached_plan(&reconcile_key)? {
+            return Ok(PlanOutcome {
+                plan,
+                cache: PlanCacheKeys {
+                    cluster_summary_keys: Vec::new(),
+                    local_plan_keys: vec![key],
+                    reconciliation_key: reconcile_key,
+                },
+                llm_request_count: 0,
+                flat_mode: true,
+                plan_cache_hit: true,
+            });
+        }
+
         let allowed: BTreeSet<String> = all
             .iter()
             .map(|node_id| node_id.as_str().to_owned())
@@ -210,26 +276,61 @@ impl WikiPlanner {
                 validate_proposals(&plan.pages, &allowed)
             })
             .await?;
-        let key = local_plan_key(
-            &llm_wiki_core::hash::sha256_hex(payload.as_bytes()),
-            planner_version,
-            config_tag,
-        );
         let plan = self.finalize(raw_local.pages, base)?;
+        self.store_plan(&reconcile_key, &plan);
         Ok(PlanOutcome {
             plan,
             cache: PlanCacheKeys {
                 cluster_summary_keys: Vec::new(),
-                local_plan_keys: vec![key.clone()],
-                reconciliation_key: reconciliation_key(
-                    std::slice::from_ref(&key),
-                    registry_revision,
-                    config_tag,
-                ),
+                local_plan_keys: vec![key],
+                reconciliation_key: reconcile_key,
             },
             llm_request_count: requests,
             flat_mode: true,
+            plan_cache_hit: false,
         })
+    }
+
+    // -- Plan identity persistence (PRD §45) --------------------------------
+
+    /// On a reconciliation-key hit, returns the stored validated plan — page
+    /// IDs included — so rebuilds reuse planner-assigned identity (§45) with
+    /// zero LLM requests.
+    fn cached_plan(&self, reconcile_key: &str) -> Result<Option<WikiPlan>> {
+        let (cache, identity) = match (&self.cache, &self.plan_identity) {
+            (Some(cache), Some(identity)) => (cache, identity),
+            _ => return Ok(None),
+        };
+        let key = plan_cache_key(reconcile_key, identity);
+        let Some(raw) = cache.lookup_raw(&key) else {
+            return Ok(None);
+        };
+        match serde_json::from_str::<WikiPlan>(&raw) {
+            Ok(plan) => {
+                tracing::info!(
+                    plan_pages = plan.pages.len(),
+                    "plan cache hit; skipping planning stages"
+                );
+                Ok(Some(plan))
+            }
+            Err(err) => {
+                // A corrupt entry is a miss, never a hard failure: the plan is
+                // recomputed deterministically.
+                tracing::warn!(error = %err, "stored plan is unreadable; recomputing");
+                Ok(None)
+            }
+        }
+    }
+
+    fn store_plan(&self, reconcile_key: &str, plan: &WikiPlan) {
+        let (Some(cache), Some(identity)) = (&self.cache, &self.plan_identity) else {
+            return;
+        };
+        let key = plan_cache_key(reconcile_key, identity);
+        match serde_json::to_string(plan) {
+            Ok(json) => cache.remember_raw(&key, &json),
+            Err(err) => tracing::warn!(error = %err, "could not serialize plan for the cache"),
+        }
     }
 
     /// Global reconciliation consumes sorted summary/local-plan keys and node
@@ -318,7 +419,8 @@ impl WikiPlanner {
     /// consumes the single repair budget; the repaired response is validated
     /// again and any residual issue fails the stage closed — a repaired
     /// response never skips validation (PRD §28: hallucinated refs are
-    /// rejected, never written into the plan).
+    /// rejected, never written into the plan). Only the response that finally
+    /// validates enters the §28 cache.
     async fn stage_round_validated<T, F>(
         &self,
         stage: &PromptDocument,
@@ -339,44 +441,60 @@ impl WikiPlanner {
             json_mode: true,
         };
 
-        let mut llm_request_count = 1u32;
-        let response = self
-            .provider
-            .generate(base_request.clone())
-            .await
-            .map_err(WikiError::from)?;
-        let (parsed, issues) = match structured::parse_json::<T>(&response.text) {
-            Ok(parsed) => {
-                let issues = validate(&parsed);
-                (parsed, issues)
-            }
+        let mut llm_request_count = 0u32;
+        let (first_response, added) =
+            generate_cached(&self.provider, self.cache.as_ref(), base_request.clone()).await?;
+        llm_request_count += added;
+
+        // Stage-1 shape check (one repair). `budget_spent` marks a response
+        // that already consumed the repair budget: any residual referential /
+        // semantic issue must then fail the stage closed — a repaired response
+        // never skips validation (PRD §28: hallucinated refs are rejected,
+        // never written into the plan).
+        let stage1 = structured::parse_json::<T>(&first_response.text);
+        let (parsed, cacheable, budget_spent) = match stage1 {
+            Ok(parsed) => (parsed, (base_request.clone(), first_response), false),
             Err(stage1) => {
                 tracing::warn!(reason = %stage1, "planning stage shape failure, repairing once");
-                let parsed = self
-                    .repaired_request::<T>(&base_request, &template, &[stage1.machine_reason()])
-                    .await?;
-                llm_request_count += 1;
-                // The repair budget is spent: validate here and fail closed.
-                let issues = validate(&parsed);
-                if !issues.is_empty() {
-                    return Err(WikiError::Planning(format!(
-                        "planning stage '{}' failed validation after repair: {}",
-                        self.prompt.name,
-                        issues.join("; ")
-                    )));
-                }
-                (parsed, issues)
+                let repair = repair_request(&base_request, &template, &[stage1.machine_reason()]);
+                let (repair_response, added) =
+                    generate_cached(&self.provider, self.cache.as_ref(), repair.clone()).await?;
+                llm_request_count += added;
+                let parsed =
+                    structured::parse_json::<T>(&repair_response.text).map_err(|shape| {
+                        WikiError::Planning(format!(
+                            "planning failed after repair: {}",
+                            shape.machine_reason()
+                        ))
+                    })?;
+                (parsed, (repair, repair_response), true)
             }
         };
 
+        let issues = validate(&parsed);
         if issues.is_empty() {
+            // Only the validated response is cached (PRD §28).
+            remember_validated(self.cache.as_ref(), &cacheable.0, &cacheable.1);
             return Ok((parsed, llm_request_count));
         }
+        if budget_spent {
+            return Err(WikiError::Planning(format!(
+                "planning stage '{}' failed validation after repair: {}",
+                self.prompt.name,
+                issues.join("; ")
+            )));
+        }
         tracing::warn!(issues = ?issues, "planning stage validation failed, repairing once");
-        let parsed = self
-            .repaired_request::<T>(&base_request, &template, &issues)
-            .await?;
-        llm_request_count += 1;
+        let repair = repair_request(&base_request, &template, &issues);
+        let (repair_response, added) =
+            generate_cached(&self.provider, self.cache.as_ref(), repair.clone()).await?;
+        llm_request_count += added;
+        let parsed = structured::parse_json::<T>(&repair_response.text).map_err(|shape| {
+            WikiError::Planning(format!(
+                "planning failed after repair: {}",
+                shape.machine_reason()
+            ))
+        })?;
         let issues = validate(&parsed);
         if !issues.is_empty() {
             return Err(WikiError::Planning(format!(
@@ -385,39 +503,8 @@ impl WikiPlanner {
                 issues.join("; ")
             )));
         }
+        remember_validated(self.cache.as_ref(), &repair, &repair_response);
         Ok((parsed, llm_request_count))
-    }
-
-    async fn repaired_request<T>(
-        &self,
-        base: &LlmRequest,
-        template: &str,
-        reasons: &[String],
-    ) -> Result<T>
-    where
-        T: for<'de> Deserialize<'de>,
-    {
-        let mut repair = base.clone();
-        let notes = format!(
-            "## Previous attempt rejected\nYour previous reply failed validation:\n{}\n\nFix every issue and resend the COMPLETE JSON object.",
-            reasons
-                .iter()
-                .map(|reason| format!("- {reason}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-        repair.prompt = template.replace("{{REPAIR_NOTES}}", &notes);
-        let response = self
-            .provider
-            .generate(repair)
-            .await
-            .map_err(WikiError::from)?;
-        structured::parse_json(&response.text).map_err(|stage1| {
-            WikiError::Planning(format!(
-                "planning failed after repair: {}",
-                stage1.machine_reason()
-            ))
-        })
     }
 }
 

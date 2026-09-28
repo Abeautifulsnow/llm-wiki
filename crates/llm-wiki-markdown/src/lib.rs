@@ -14,6 +14,11 @@ pub mod mdx;
 pub mod parser;
 pub mod segment;
 
+/// Version of the markdown/MDX parser and its deterministic normalizer
+/// (frontmatter strip + JSX downgrade). Part of the §28 cache key and the
+/// build fingerprint: a parser change must invalidate cached analysis.
+pub const PARSER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub use frontmatter::Frontmatter;
 pub use language::detect_language;
 pub use mdx::downgrade_jsx;

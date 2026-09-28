@@ -21,9 +21,10 @@ use llm_wiki_core::ids::{BuildId, KnowledgeNodeId, WikiPageId};
 use llm_wiki_core::model::WikiPlan;
 use llm_wiki_core::plan::{estimate_tokens, KnowledgeBase, PlanAnchor};
 use llm_wiki_llm::structured;
-use llm_wiki_llm::{LlmProvider, LlmRequest};
+use llm_wiki_llm::{LlmProvider, LlmRequest, LlmResponse};
 use llm_wiki_storage::{PageCitationRecord, PageLinkRecord, WikiPageRecord};
 
+use crate::cache::{generate_cached, remember_validated, repair_request, StageCache};
 use crate::prompt::PromptDocument;
 
 #[derive(Debug, Clone)]
@@ -61,6 +62,8 @@ pub struct WikiCompiler {
     provider: Arc<dyn LlmProvider>,
     prompt: PromptDocument,
     config: CompilerConfig,
+    /// §28 stage cache; only grounded, citation-valid responses are stored.
+    cache: Option<Arc<dyn StageCache>>,
 }
 
 impl WikiCompiler {
@@ -73,7 +76,16 @@ impl WikiCompiler {
             provider,
             prompt,
             config,
+            cache: None,
         }
+    }
+
+    /// Wires the §28 cache: lookups short-circuit identical page requests,
+    /// writes happen only after the body validated (grounded + citations
+    /// resolvable + links resolvable, PRD §15/§28).
+    pub fn with_cache(mut self, cache: Arc<dyn StageCache>) -> Self {
+        self.cache = Some(cache);
+        self
     }
 
     /// Compiles every page of the plan. Compilation failure aborts the whole
@@ -163,36 +175,50 @@ impl WikiCompiler {
 
         let bundle = self.build_page_request(page, base, &related)?;
 
-        let mut llm_request_count = 1u32;
-        let response = self
-            .provider
-            .generate(bundle.request.clone())
-            .await
-            .map_err(WikiError::from)?;
-        let raw: RawCompiledPage = match structured::parse_json::<RawCompiledPage>(&response.text) {
-            Ok(raw) => {
-                let issues = validate_body(&raw.markdown, &context);
-                if issues.is_empty() {
-                    raw
-                } else {
-                    tracing::warn!(issues = ?issues, page = %page.title, "compile validation failed, repairing once");
-                    llm_request_count += 1;
-                    self.repaired_request(&bundle.request, &bundle.template, &issues, &context)
-                        .await?
-                }
+        // ---- Stage 1 (+ one repair, PRD §11/§15/§28) ----
+        // Hits from the §28 cache consume no LLM request (§37.3).
+        let mut llm_request_count = 0u32;
+        let (first_response, added) =
+            generate_cached(&self.provider, self.cache.as_ref(), bundle.request.clone()).await?;
+        llm_request_count += added;
+
+        // Held until the body fully validates; only then enters the cache.
+        let first = structured::parse_json::<RawCompiledPage>(&first_response.text).map(|raw| {
+            let issues = validate_body(&raw.markdown, &context);
+            (raw, issues)
+        });
+        let (raw, validated) = match first {
+            Ok((raw, issues)) if issues.is_empty() => {
+                (raw, Some((bundle.request.clone(), first_response)))
+            }
+            Ok((_, issues)) => {
+                tracing::warn!(
+                    issues = ?issues,
+                    page = %page.title,
+                    "compile validation failed, repairing once"
+                );
+                let (raw, request, response, added) =
+                    self.repair_round(&bundle, &issues, &context).await?;
+                llm_request_count += added;
+                (raw, Some((request, response)))
             }
             Err(stage1) => {
-                tracing::warn!(reason = %stage1, page = %page.title, "compile stage-1 failed, repairing once");
-                llm_request_count += 1;
-                self.repaired_request(
-                    &bundle.request,
-                    &bundle.template,
-                    &[stage1.machine_reason()],
-                    &context,
-                )
-                .await?
+                tracing::warn!(
+                    reason = %stage1,
+                    page = %page.title,
+                    "compile stage-1 failed, repairing once"
+                );
+                let (raw, request, response, added) = self
+                    .repair_round(&bundle, &[stage1.machine_reason()], &context)
+                    .await?;
+                llm_request_count += added;
+                (raw, Some((request, response)))
             }
         };
+        // The body passed grounding/citation/link validation: cache it.
+        if let Some((request, response)) = validated {
+            remember_validated(self.cache.as_ref(), &request, &response);
+        }
 
         // ---- Citation expansion from DB-side anchors (PRD §16) ----
         let (body, citations, sources) = expand_citations(&raw.markdown, &anchors_by_claim);
@@ -296,33 +322,26 @@ impl WikiCompiler {
             language: self.config.language_tag.clone(),
             body_hash: sha256_hex(content.as_bytes()),
             content,
+            knowledge_refs: page.knowledge_refs.clone(),
             citations: render.citations,
             links,
         }
     }
 
-    async fn repaired_request(
+    /// One repair round (PRD §11/§15: exactly one): injects machine-readable
+    /// reasons into the untouched `{{REPAIR_NOTES}}` slot and validates the
+    /// result, failing closed on residual issues. Returns the parsed page plus
+    /// the (request, response) pair so the caller can cache the response that
+    /// finally validated (PRD §28).
+    async fn repair_round(
         &self,
-        base: &LlmRequest,
-        template: &str,
+        bundle: &PageRequestBundle,
         reasons: &[String],
         context: &CompileContext<'_>,
-    ) -> Result<RawCompiledPage> {
-        let mut repair = base.clone();
-        let notes = format!(
-            "## Previous attempt rejected\nYour previous reply failed validation:\n{}\n\nFix every issue and resend the COMPLETE JSON object.",
-            reasons
-                .iter()
-                .map(|reason| format!("- {reason}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-        repair.prompt = template.replace("{{REPAIR_NOTES}}", &notes);
-        let response = self
-            .provider
-            .generate(repair)
-            .await
-            .map_err(WikiError::from)?;
+    ) -> Result<(RawCompiledPage, LlmRequest, LlmResponse, u32)> {
+        let repair = repair_request(&bundle.request, &bundle.template, reasons);
+        let (response, added) =
+            generate_cached(&self.provider, self.cache.as_ref(), repair.clone()).await?;
         let raw: RawCompiledPage = structured::parse_json(&response.text).map_err(|stage1| {
             WikiError::Compilation(format!(
                 "compilation failed after repair: {}",
@@ -336,7 +355,7 @@ impl WikiCompiler {
                 issues.join("; ")
             )));
         }
-        Ok(raw)
+        Ok((raw, repair, response, added))
     }
 }
 
@@ -446,17 +465,17 @@ fn validate_body(markdown: &str, context: &CompileContext<'_>) -> Vec<String> {
     issues
 }
 
-struct ScannedCitation {
-    span: Range<usize>,
-    claim: Option<String>,
+pub(crate) struct ScannedCitation {
+    pub(crate) span: Range<usize>,
+    pub(crate) claim: Option<String>,
 }
 
-struct ScannedLink {
-    target: String,
+pub(crate) struct ScannedLink {
+    pub(crate) target: String,
 }
 
 /// Finds `<!-- llm-wiki:cite ... -->` comments with their `claim` attribute.
-fn scan_citations(body: &str) -> Vec<ScannedCitation> {
+pub(crate) fn scan_citations(body: &str) -> Vec<ScannedCitation> {
     scan_delimited(body, "<!--", "-->")
         .into_iter()
         .filter_map(|span| {
@@ -472,7 +491,7 @@ fn scan_citations(body: &str) -> Vec<ScannedCitation> {
 }
 
 /// Finds `[[Target]]` / `[[Target|display]]` links (PRD §15.2).
-fn scan_wikilinks(body: &str) -> Vec<ScannedLink> {
+pub(crate) fn scan_wikilinks(body: &str) -> Vec<ScannedLink> {
     scan_delimited(body, "[[", "]]")
         .into_iter()
         .map(|span| {
@@ -562,7 +581,7 @@ fn expand_citations(
 }
 
 /// Removes citation comments so body-length/section checks measure prose.
-fn strip_citations(body: &str) -> String {
+pub(crate) fn strip_citations(body: &str) -> String {
     let mut out = String::with_capacity(body.len());
     let mut cursor = 0;
     for cite in scan_citations(body) {

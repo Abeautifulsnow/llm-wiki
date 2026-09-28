@@ -27,9 +27,10 @@ use llm_wiki_core::hash::sha256_hex;
 use llm_wiki_core::ids::{BuildId, SectionId, SourceId};
 use llm_wiki_core::model::SourceRange;
 use llm_wiki_llm::structured;
-use llm_wiki_llm::{LlmProvider, LlmRequest};
+use llm_wiki_llm::{LlmProvider, LlmRequest, LlmResponse};
 use llm_wiki_markdown::{estimate_tokens, split_section};
 
+use crate::cache::{generate_cached, remember_validated, repair_request, StageCache};
 use crate::prompt::PromptDocument;
 
 /// One section handed to analysis; `range` is absolute in the analyzed text.
@@ -74,6 +75,8 @@ pub struct DocumentAnalyzer {
     prompt: PromptDocument,
     section_target_tokens: u32,
     max_rejected_claim_ratio: f32,
+    /// §28 stage cache; only validated unit responses are stored.
+    cache: Option<Arc<dyn StageCache>>,
 }
 
 impl DocumentAnalyzer {
@@ -88,7 +91,15 @@ impl DocumentAnalyzer {
             prompt,
             section_target_tokens,
             max_rejected_claim_ratio,
+            cache: None,
         }
+    }
+
+    /// Wires the §28 cache: lookups short-circuit identical units, writes
+    /// happen only after the unit's schema+evidence validation succeeded.
+    pub fn with_cache(mut self, cache: Arc<dyn StageCache>) -> Self {
+        self.cache = Some(cache);
+        self
     }
 
     /// Analyzes one document. A unit exceeding the rejected-claim ratio fails
@@ -154,29 +165,30 @@ impl DocumentAnalyzer {
         };
 
         // ---- Stage 1 (+ one repair on shape failure, PRD §11) ----
-        let mut llm_request_count = 1u32;
-        let mut response = self
-            .provider
-            .generate(base_request.clone())
-            .await
-            .map_err(WikiError::from)?;
-        let raw: RawAnalysis = match structured::parse_json(&response.text) {
-            Ok(raw) => raw,
+        // Hits from the §28 cache consume no LLM request (§37.3).
+        let mut llm_request_count = 0u32;
+        let (first_response, added) =
+            generate_cached(&self.provider, self.cache.as_ref(), base_request.clone()).await?;
+        llm_request_count += added;
+        // Held until the unit fully validates; only then enters the cache.
+        let stage1 = structured::parse_json::<RawAnalysis>(&first_response.text);
+        let (raw, validated): (RawAnalysis, (LlmRequest, LlmResponse)) = match stage1 {
+            Ok(raw) => (raw, (base_request.clone(), first_response)),
             Err(stage1) => {
                 tracing::warn!(reason = %stage1, "analysis stage-1 failed, repairing once");
                 let repair = repair_request(&base_request, &template, &[stage1.machine_reason()]);
-                llm_request_count += 1;
-                response = self
-                    .provider
-                    .generate(repair)
-                    .await
-                    .map_err(WikiError::from)?;
-                structured::parse_json(&response.text).map_err(|stage1_repair| {
-                    WikiError::SchemaValidation(format!(
-                        "schema validation failed after repair: {}",
-                        stage1_repair.machine_reason()
-                    ))
-                })?
+                let (repair_response, added) =
+                    generate_cached(&self.provider, self.cache.as_ref(), repair.clone()).await?;
+                llm_request_count += added;
+                let parsed = structured::parse_json::<RawAnalysis>(&repair_response.text).map_err(
+                    |stage1_repair| {
+                        WikiError::SchemaValidation(format!(
+                            "schema validation failed after repair: {}",
+                            stage1_repair.machine_reason()
+                        ))
+                    },
+                )?;
+                (parsed, (repair, repair_response))
             }
         };
 
@@ -189,6 +201,7 @@ impl DocumentAnalyzer {
         if total_claims > 0 {
             let ratio = rejected_claims.len() as f32 / total_claims as f32;
             if ratio > self.max_rejected_claim_ratio {
+                // The unit fails: its response is NOT cached (PRD §28).
                 return Err(WikiError::EvidenceValidation(format!(
                     "analysis unit rejected {}/{} claims ({:.0}% > {:.0}% threshold); the unit fails and must not produce knowledge",
                     rejected_claims.len(),
@@ -198,6 +211,9 @@ impl DocumentAnalyzer {
                 )));
             }
         }
+
+        // The unit passed schema + evidence validation: cache it (PRD §28).
+        remember_validated(self.cache.as_ref(), &validated.0, &validated.1);
 
         Ok(UnitOutcome {
             summary: raw.summary,
@@ -418,20 +434,6 @@ struct RawRelation {
     section_id: String,
     #[serde(default)]
     evidence_text: String,
-}
-
-fn repair_request(base: &LlmRequest, template: &str, reasons: &[String]) -> LlmRequest {
-    let mut repair = base.clone();
-    let notes = format!(
-        "## Previous attempt rejected\nYour previous reply failed validation:\n{}\n\nFix every issue and resend the COMPLETE JSON object.",
-        reasons
-            .iter()
-            .map(|reason| format!("- {reason}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
-    repair.prompt = template.replace("{{REPAIR_NOTES}}", &notes);
-    repair
 }
 
 // ---------------------------------------------------------------------------
