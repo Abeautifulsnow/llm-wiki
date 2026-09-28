@@ -1,0 +1,18 @@
+---
+title: Delivery Guarantees
+description: What Nimbus promises when messages are delivered.
+---
+
+<Admonition type="note">
+This page is part of the Nimbus evaluation fixture corpus.
+</Admonition>
+
+# Delivery Guarantees
+
+## Semantics
+
+Nimbus provides at-least-once delivery for topics and queues.
+
+Exactly-once processing requires an idempotent consumer with a deduplication window.
+
+Design consumers to tolerate duplicate deliveries even when the deduplication window is enabled.

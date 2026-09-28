@@ -7,3 +7,7 @@
 /target
 .llm-wiki/
 .zcodeignore
+
+# Python bytecode
+evals/__pycache__/
+__pycache__/

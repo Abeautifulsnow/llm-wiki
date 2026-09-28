@@ -1,0 +1,110 @@
+# Retrieval questions (fixture-only in V0.1; scoring lands with V0.2 search).
+# Each question names the corpus docs that MUST provide the supporting facts.
+version: 1
+questions:
+  - id: Q-001
+    question: "How long do access tokens issued by Nimbus last?"
+    expected_sources:
+      - auth/authentication.md
+  - id: Q-002
+    question: "Which OAuth 2.0 flows does Nimbus support?"
+    expected_sources:
+      - auth/authentication.md
+  - id: Q-003
+    question: "How often must service account keys be rotated?"
+    expected_sources:
+      - auth/service-accounts.md
+  - id: Q-004
+    question: "Which single sign-on protocols can enterprises use with Nimbus?"
+    expected_sources:
+      - auth/sso.cn.md
+  - id: Q-005
+    question: "How long are audit log entries retained on the Enterprise plan?"
+    expected_sources:
+      - auth/audit-logging.md
+  - id: Q-006
+    question: "How many messages per second can a project publish to topics?"
+    expected_sources:
+      - messaging/topics.md
+  - id: Q-007
+    question: "What is the default acknowledgment timeout for a queue message?"
+    expected_sources:
+      - messaging/queues.md
+  - id: Q-008
+    question: "What happens to a message after 100 failed delivery attempts?"
+    expected_sources:
+      - messaging/retries.md
+      - guide/glossary.md
+  - id: Q-009
+    question: "Does Nimbus provide at-least-once or exactly-once delivery?"
+    expected_sources:
+      - messaging/delivery-guarantees.mdx
+  - id: Q-010
+    question: "How are webhook payloads protected against replay attacks?"
+    expected_sources:
+      - messaging/webhooks.mdx
+  - id: Q-011
+    question: "Does a stream preserve ordering across partitions?"
+    expected_sources:
+      - streams/streaming.md
+  - id: Q-012
+    question: "What is the difference between tumbling and sliding windows?"
+    expected_sources:
+      - streams/windowing.md
+  - id: Q-013
+    question: "流任务失败后从哪里恢复处理？"
+    expected_sources:
+      - streams/checkpoints.cn.md
+  - id: Q-014
+    question: "How many buckets can one project create?"
+    expected_sources:
+      - storage/buckets.md
+  - id: Q-015
+    question: "How are objects in a bucket encrypted at rest?"
+    expected_sources:
+      - storage/encryption.md
+  - id: Q-016
+    question: "Can a customer supply their own encryption keys?"
+    expected_sources:
+      - storage/encryption.md
+  - id: Q-017
+    question: "How long can a single function invocation run?"
+    expected_sources:
+      - compute/functions.md
+  - id: Q-018
+    question: "When does autoscaling add new instances?"
+    expected_sources:
+      - compute/scaling.md
+  - id: Q-019
+    question: "How often are platform metrics collected?"
+    expected_sources:
+      - observability/metrics.md
+  - id: Q-020
+    question: "Which trace propagation standard does Nimbus use?"
+    expected_sources:
+      - observability/tracing.md
+  - id: Q-021
+    question: "What does `nimbus deploy` do after uploading the project?"
+    expected_sources:
+      - cli/cli-reference.md
+  - id: Q-022
+    question: "What HTTP status do clients get when they exceed the API rate limit?"
+    expected_sources:
+      - api/api-rate-limits.md
+  - id: Q-023
+    question: "How many items can one page of a list endpoint return?"
+    expected_sources:
+      - api/api-pagination.md
+  - id: Q-024
+    question: "How can traffic stay inside a private network when calling Nimbus?"
+    expected_sources:
+      - network/private-networking.md
+      - network/endpoints.md
+  - id: Q-025
+    question: "In how many regions is Nimbus available?"
+    expected_sources:
+      - quotas/quotas-and-regions.md
+  - id: Q-026
+    question: "Which building blocks make up the Nimbus platform?"
+    expected_sources:
+      - guide/overview.md

@@ -1,0 +1,50 @@
+# Required subset of the compiled wiki (NOT the full page inventory).
+# Gates assert that each page below exists in the plan and cites at least
+# `min_sources_merged` distinct sources from the list (PRD §37.3
+# Cross-document Synthesis gate).
+version: 1
+pages:
+  - title: "Security & Compliance"
+    min_sources_merged: 4
+    sources:
+      - auth/authentication.md
+      - storage/encryption.md
+      - auth/audit-logging.md
+      - api/api-auth.md
+  - title: "Reliable Message Delivery"
+    min_sources_merged: 4
+    sources:
+      - messaging/queues.md
+      - messaging/retries.md
+      - messaging/delivery-guarantees.mdx
+      - messaging/webhooks.mdx
+  - title: "Streaming Processing"
+    min_sources_merged: 3
+    sources:
+      - streams/streaming.md
+      - streams/windowing.md
+      - streams/checkpoints.cn.md
+  - title: "Storage Management"
+    min_sources_merged: 3
+    sources:
+      - storage/buckets.md
+      - storage/storage-lifecycle.mdx
+      - storage/encryption.md
+  - title: "API Access"
+    min_sources_merged: 3
+    sources:
+      - api/api-auth.md
+      - api/api-rate-limits.md
+      - api/api-pagination.md
+  - title: "Compute Workloads"
+    min_sources_merged: 3
+    sources:
+      - compute/functions.md
+      - compute/schedules.md
+      - compute/scaling.md
+  - title: "Access Management"
+    min_sources_merged: 3
+    sources:
+      - auth/authentication.md
+      - auth/service-accounts.md
+      - auth/sso.cn.md

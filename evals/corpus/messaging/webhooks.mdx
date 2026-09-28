@@ -1,0 +1,22 @@
+---
+title: Webhooks
+description: HTTP callbacks for platform events.
+---
+
+<Admonition type="note">
+This page is part of the Nimbus evaluation fixture corpus.
+</Admonition>
+
+# Webhooks
+
+## Delivery
+
+Webhook endpoints must respond within 10 seconds or the delivery is retried.
+
+Slow endpoints should acknowledge quickly and process the payload asynchronously.
+
+## Signatures
+
+Webhook signatures use HMAC-SHA256 and include a timestamp to prevent replay attacks.
+
+Verify the signature before parsing the payload.

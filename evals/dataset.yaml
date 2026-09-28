@@ -1,0 +1,360 @@
+# Eval fixture annotations (PRD §37.3).
+# `span` values are quoted VERBATIM from the corpus document — the read-only
+# validator evals/check_fixtures.py asserts every span appears in its doc.
+# `importance: high` facts form the Source Coverage gate denominator.
+version: 1
+docs:
+  - path: guide/overview.md
+    language: en
+    facts:
+      - id: F-GUI-001
+        span: "Nimbus is a managed platform for publishing, streaming, and storing event data."
+        importance: high
+      - id: F-GUI-002
+        span: "Every Nimbus project runs in exactly one region, and data never leaves that region unless replication is enabled."
+        importance: high
+      - id: F-GUI-003
+        span: "The four core building blocks of Nimbus are topics, queues, streams, and buckets."
+        importance: high
+      - id: F-GUI-004
+        span: "Nimbus exposes all building blocks through a REST API, a command-line interface, and managed SDKs."
+        importance: normal
+  - path: guide/quickstart.md
+    language: en
+    facts:
+      - id: F-GUI-005
+        span: "A new Nimbus project can be created with `nimbus init my-project`."
+        importance: high
+      - id: F-GUI-006
+        span: "The quickstart deployment finishes in under five minutes for projects with fewer than fifty resources."
+        importance: normal
+      - id: F-GUI-007
+        span: "Every quickstart example is written in Python 3."
+        importance: normal
+  - path: guide/architecture.md
+    language: en
+    facts:
+      - id: F-GUI-008
+        span: "The Nimbus control plane stores metadata in a replicated SQL cluster."
+        importance: high
+      - id: F-GUI-009
+        span: "Data plane nodes are stateless and scale horizontally."
+        importance: high
+      - id: F-GUI-010
+        span: "Control plane and data plane communicate over mutual TLS."
+        importance: high
+  - path: guide/glossary.md
+    language: en
+    facts:
+      - id: F-GUI-011
+        span: "A consumer group is a named set of subscribers that splits topic traffic evenly among its members."
+        importance: high
+      - id: F-GUI-012
+        span: "A dead-letter queue holds messages that exhausted their delivery attempts."
+        importance: normal
+  - path: auth/authentication.md
+    language: en
+    facts:
+      - id: F-AUT-001
+        span: "Access tokens issued by Nimbus expire after 24 hours."
+        importance: high
+      - id: F-AUT-002
+        span: "Refresh tokens are single-use and expire after 30 days of inactivity."
+        importance: high
+      - id: F-AUT-003
+        span: "Nimbus accepts OAuth 2.0 client credentials and PKCE authorization code flows."
+        importance: high
+      - id: F-AUT-004
+        span: "Token revocation propagates to all data plane nodes within sixty seconds."
+        importance: normal
+  - path: auth/service-accounts.md
+    language: en
+    facts:
+      - id: F-AUT-005
+        span: "Each service account can hold at most one hundred access policies."
+        importance: high
+      - id: F-AUT-006
+        span: "Service account keys must be rotated at least every ninety days."
+        importance: high
+      - id: F-AUT-007
+        span: "A disabled service account stops authenticating within five seconds."
+        importance: normal
+  - path: auth/sso.cn.md
+    language: zh-CN
+    facts:
+      - id: F-AUT-008
+        span: "Nimbus 支持基于 SAML 2.0 和 OIDC 的单点登录。"
+        importance: high
+      - id: F-AUT-009
+        span: "单点登录会话的最长空闲时间为 8 小时。"
+        importance: high
+      - id: F-AUT-010
+        span: "企业管理员可以在控制台中强制所有成员重新登录。"
+        importance: normal
+  - path: auth/audit-logging.md
+    language: en
+    facts:
+      - id: F-AUT-011
+        span: "Every administrative action is written to the audit log within ten seconds."
+        importance: high
+      - id: F-AUT-012
+        span: "Audit log entries are retained for 400 days on the Enterprise plan."
+        importance: high
+      - id: F-AUT-013
+        span: "Audit logs can be exported to the customer's own bucket every hour."
+        importance: normal
+  - path: messaging/topics.md
+    language: en
+    facts:
+      - id: F-MES-001
+        span: "A topic stores published messages for up to seven days by default."
+        importance: high
+      - id: F-MES-002
+        span: "Topics support at most 10,000 published messages per second per project."
+        importance: high
+      - id: F-MES-003
+        span: "Message payloads can be up to 10 MiB."
+        importance: high
+  - path: messaging/queues.md
+    language: en
+    facts:
+      - id: F-MES-004
+        span: "Queues deliver each message to exactly one consumer in a consumer group."
+        importance: high
+      - id: F-MES-005
+        span: "The default acknowledgment timeout for a queue message is 30 seconds."
+        importance: high
+      - id: F-MES-006
+        span: "A queue can hold up to one million in-flight messages."
+        importance: normal
+  - path: messaging/retries.md
+    language: en
+    facts:
+      - id: F-MES-007
+        span: "Failed deliveries are retried with exponential backoff starting at one second."
+        importance: high
+      - id: F-MES-008
+        span: "The maximum number of delivery attempts is 100 before a message is dead-lettered."
+        importance: high
+      - id: F-MES-009
+        span: "Dead-lettered messages are kept for 30 days."
+        importance: normal
+  - path: messaging/delivery-guarantees.mdx
+    language: en
+    facts:
+      - id: F-MES-010
+        span: "Nimbus provides at-least-once delivery for topics and queues."
+        importance: high
+      - id: F-MES-011
+        span: "Exactly-once processing requires an idempotent consumer with a deduplication window."
+        importance: high
+  - path: messaging/webhooks.mdx
+    language: en
+    facts:
+      - id: F-MES-012
+        span: "Webhook endpoints must respond within 10 seconds or the delivery is retried."
+        importance: high
+      - id: F-MES-013
+        span: "Webhook signatures use HMAC-SHA256 and include a timestamp to prevent replay attacks."
+        importance: high
+  - path: streams/streaming.md
+    language: en
+    facts:
+      - id: F-STR-001
+        span: "Streams partition data by key and preserve order within each partition."
+        importance: high
+      - id: F-STR-002
+        span: "A stream retains data for up to 365 days."
+        importance: high
+  - path: streams/windowing.md
+    language: en
+    facts:
+      - id: F-STR-003
+        span: "Tumbling windows do not overlap and fire exactly once per window period."
+        importance: high
+      - id: F-STR-004
+        span: "Sliding windows can overlap and require a window size and a slide interval."
+        importance: high
+      - id: F-STR-005
+        span: "The minimum supported window size is one second."
+        importance: normal
+  - path: streams/checkpoints.cn.md
+    language: zh-CN
+    facts:
+      - id: F-STR-006
+        span: "检查点默认每 30 秒持久化一次。"
+        importance: high
+      - id: F-STR-007
+        span: "处理失败后，流任务会从最近一次成功的检查点恢复。"
+        importance: high
+      - id: F-STR-008
+        span: "检查点数据保存在项目所属区域的桶中。"
+        importance: normal
+  - path: storage/buckets.md
+    language: en
+    facts:
+      - id: F-STO-001
+        span: "Each project can create up to 100 buckets."
+        importance: high
+      - id: F-STO-002
+        span: "Objects in a bucket can be up to 5 TiB each."
+        importance: high
+      - id: F-STO-003
+        span: "Bucket names are immutable after creation."
+        importance: normal
+  - path: storage/storage-lifecycle.mdx
+    language: en
+    facts:
+      - id: F-STO-004
+        span: "Lifecycle rules can expire objects after a configurable number of days."
+        importance: high
+      - id: F-STO-005
+        span: "At most 50 lifecycle rules can be attached to one bucket."
+        importance: high
+  - path: storage/encryption.md
+    language: en
+    facts:
+      - id: F-STO-006
+        span: "All objects are encrypted at rest with AES-256 by default."
+        importance: high
+      - id: F-STO-007
+        span: "Customer-managed keys can be supplied through the platform KMS integration."
+        importance: high
+      - id: F-STO-008
+        span: "Enabling customer-managed keys applies only to objects written after the change."
+        importance: normal
+  - path: compute/functions.md
+    language: en
+    facts:
+      - id: F-COM-001
+        span: "Functions can run for at most 900 seconds per invocation."
+        importance: high
+      - id: F-COM-002
+        span: "A function instance has between 128 MiB and 10 GiB of memory."
+        importance: high
+  - path: compute/schedules.md
+    language: en
+    facts:
+      - id: F-COM-003
+        span: "Schedules use cron expressions in the project's local time zone."
+        importance: high
+      - id: F-COM-004
+        span: "The minimum schedule interval is one minute."
+        importance: normal
+  - path: compute/scaling.md
+    language: en
+    facts:
+      - id: F-COM-005
+        span: "Autoscaling adds instances when CPU utilization exceeds 70 percent."
+        importance: high
+      - id: F-COM-006
+        span: "A project can run at most 500 concurrent function instances."
+        importance: high
+  - path: observability/metrics.md
+    language: en
+    facts:
+      - id: F-OBS-001
+        span: "Platform metrics are collected every 60 seconds."
+        importance: high
+      - id: F-OBS-002
+        span: "Custom metrics are limited to 1,000 distinct series per project."
+        importance: high
+  - path: observability/tracing.md
+    language: en
+    facts:
+      - id: F-OBS-003
+        span: "Traces use W3C trace context propagation headers."
+        importance: high
+      - id: F-OBS-004
+        span: "Trace data is retained for 30 days."
+        importance: normal
+  - path: observability/alerts.mdx
+    language: en
+    facts:
+      - id: F-OBS-005
+        span: "An alert policy can have up to 10 notification channels."
+        importance: high
+      - id: F-OBS-006
+        span: "Alert evaluation runs every 60 seconds."
+        importance: normal
+  - path: cli/cli-install.md
+    language: en
+    facts:
+      - id: F-CLI-001
+        span: "The CLI is distributed as a single static binary for Windows, macOS, and Linux."
+        importance: high
+      - id: F-CLI-002
+        span: "The CLI requires Python 3.10 or newer when installed through the package manager."
+        importance: high
+      - id: F-CLI-003
+        span: "Run `nimbus doctor` to verify the local installation."
+        importance: normal
+  - path: cli/cli-reference.md
+    language: en
+    facts:
+      - id: F-CLI-004
+        span: "The `nimbus deploy` command uploads the project and waits for health checks."
+        importance: high
+      - id: F-CLI-005
+        span: "`nimbus logs --tail` streams log output until interrupted."
+        importance: normal
+      - id: F-CLI-006
+        span: "All CLI commands accept `--project` to override the current project."
+        importance: high
+  - path: api/api-auth.md
+    language: en
+    facts:
+      - id: F-API-001
+        span: "API requests authenticate with a bearer token in the Authorization header."
+        importance: high
+      - id: F-API-002
+        span: "Service account keys can be used as bearer tokens for machine-to-machine calls."
+        importance: high
+  - path: api/api-rate-limits.md
+    language: en
+    facts:
+      - id: F-API-003
+        span: "The REST API allows 1,000 requests per minute per project."
+        importance: high
+      - id: F-API-004
+        span: "Exceeded requests receive HTTP 429 with a Retry-After header."
+        importance: high
+  - path: api/api-pagination.md
+    language: en
+    facts:
+      - id: F-API-005
+        span: "List endpoints return at most 100 items per page."
+        importance: high
+      - id: F-API-006
+        span: "Pagination cursors are opaque strings valid for 24 hours."
+        importance: normal
+  - path: network/private-networking.md
+    language: en
+    facts:
+      - id: F-NET-001
+        span: "Private connectivity is available through VPC peering in supported regions."
+        importance: high
+      - id: F-NET-002
+        span: "VPC peering setup completes in about fifteen minutes."
+        importance: normal
+  - path: network/endpoints.md
+    language: en
+    facts:
+      - id: F-NET-003
+        span: "Each project gets a regional endpoint like `https://<project>.nimbus.example`."
+        importance: high
+      - id: F-NET-004
+        span: "Private endpoints resolve only inside the peered VPC."
+        importance: high
+  - path: quotas/quotas-and-regions.md
+    language: en
+    facts:
+      - id: F-QUO-001
+        span: "Nimbus is available in 14 regions across 4 continents."
+        importance: high
+      - id: F-QUO-002
+        span: "Default quotas can be raised by filing a support request."
+        importance: normal
+      - id: F-QUO-003
+        span: "Quota usage is visible in the console and through the `nimbus quota` command."
+        importance: normal
