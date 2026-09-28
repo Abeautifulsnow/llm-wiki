@@ -1,17 +1,19 @@
 # Required subset of the compiled wiki (NOT the full page inventory).
 # Gates assert that each page below exists in the plan and cites at least
 # `min_sources_merged` distinct sources from the list (PRD §37.3
-# Cross-document Synthesis gate).
+# Cross-document Synthesis gate). The doc lists form a PARTITION: the V0.1
+# planner forbids assigning one knowledge node to multiple pages, so each
+# corpus doc feeds exactly one expected page.
 version: 1
 pages:
-  - title: "Security & Compliance"
+  - title: "Identity & Access"
     min_sources_merged: 4
     sources:
       - auth/authentication.md
-      - storage/encryption.md
+      - auth/service-accounts.md
+      - auth/sso.cn.md
       - auth/audit-logging.md
-      - api/api-auth.md
-  - title: "Reliable Message Delivery"
+  - title: "Reliable Messaging"
     min_sources_merged: 4
     sources:
       - messaging/queues.md
@@ -24,13 +26,13 @@ pages:
       - streams/streaming.md
       - streams/windowing.md
       - streams/checkpoints.cn.md
-  - title: "Storage Management"
+  - title: "Storage & Encryption"
     min_sources_merged: 3
     sources:
       - storage/buckets.md
       - storage/storage-lifecycle.mdx
       - storage/encryption.md
-  - title: "API Access"
+  - title: "API Platform"
     min_sources_merged: 3
     sources:
       - api/api-auth.md
@@ -42,9 +44,10 @@ pages:
       - compute/functions.md
       - compute/schedules.md
       - compute/scaling.md
-  - title: "Access Management"
-    min_sources_merged: 3
+  - title: "Platform Operations"
+    min_sources_merged: 4
     sources:
-      - auth/authentication.md
-      - auth/service-accounts.md
-      - auth/sso.cn.md
+      - guide/overview.md
+      - guide/architecture.md
+      - observability/metrics.md
+      - observability/tracing.md

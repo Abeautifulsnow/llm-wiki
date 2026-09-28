@@ -798,6 +798,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "llm-wiki-evals"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "llm-wiki-compiler",
+ "llm-wiki-core",
+ "llm-wiki-llm",
+ "llm-wiki-storage",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "llm-wiki-llm"
 version = "0.1.0"
 dependencies = [

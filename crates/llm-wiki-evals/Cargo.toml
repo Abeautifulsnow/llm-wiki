@@ -1,0 +1,19 @@
+[package]
+name = "llm-wiki-evals"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+llm-wiki-core = { workspace = true }
+llm-wiki-llm = { workspace = true }
+llm-wiki-storage = { workspace = true }
+llm-wiki-compiler = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+chrono = { workspace = true }
