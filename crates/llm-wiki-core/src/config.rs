@@ -105,6 +105,11 @@ pub struct SearchConfig {
 pub struct BuildConfig {
     #[serde(default = "default_true")]
     pub incremental: bool,
+    /// How many recent generations cleanup retains after a successful publish
+    /// (PRD §35). The currently published generation is always kept on top of
+    /// this window.
+    #[serde(default = "default_keep_generations")]
+    pub keep_generations: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,6 +175,9 @@ fn default_max_rejected_claim_ratio() -> f32 {
 }
 fn default_max_cluster_nodes() -> u32 {
     24
+}
+fn default_keep_generations() -> u32 {
+    3
 }
 fn default_true() -> bool {
     true
@@ -245,7 +253,10 @@ impl Default for SearchConfig {
 
 impl Default for BuildConfig {
     fn default() -> Self {
-        BuildConfig { incremental: true }
+        BuildConfig {
+            incremental: true,
+            keep_generations: default_keep_generations(),
+        }
     }
 }
 
@@ -308,6 +319,12 @@ impl Config {
                 "planning.max_cluster_nodes must be >= 2".into(),
             ));
         }
+        if self.build.keep_generations < 1 {
+            return Err(WikiError::Config(
+                "build.keep_generations must be >= 1 (the current generation is always kept)"
+                    .into(),
+            ));
+        }
 
         let root = lexical_absolute(Path::new(""), &self.source.root);
         let wiki = lexical_absolute(Path::new(""), &self.project.wiki_dir);
@@ -325,7 +342,7 @@ impl Config {
     /// construction: config only stores env-var names (PRD §32).
     pub fn effective_summary(&self) -> String {
         format!(
-            "project.name = {}\nproject.wiki_dir = {}\nsource.root = {}\nsource.include = {:?}\nsource.exclude = {:?}\nllm.provider = {}\nllm.base_url = {}\nllm.model = {}\nllm.api_key_env = <env name: redacted>\nllm.max_concurrency = {}\nanalysis.max_input_tokens = {}\nanalysis.max_plan_input_tokens = {}\nanalysis.max_rejected_claim_ratio = {}\nplanning.hierarchical = {}\nplanning.max_cluster_nodes = {}\nbuild.incremental = {}\nserver.bind = {}\nserver.remote_enabled = {}",
+            "project.name = {}\nproject.wiki_dir = {}\nsource.root = {}\nsource.include = {:?}\nsource.exclude = {:?}\nllm.provider = {}\nllm.base_url = {}\nllm.model = {}\nllm.api_key_env = <env name: redacted>\nllm.max_concurrency = {}\nanalysis.max_input_tokens = {}\nanalysis.max_plan_input_tokens = {}\nanalysis.max_rejected_claim_ratio = {}\nplanning.hierarchical = {}\nplanning.max_cluster_nodes = {}\nbuild.incremental = {}\nbuild.keep_generations = {}\nserver.bind = {}\nserver.remote_enabled = {}",
             self.project.name,
             self.project.wiki_dir.display(),
             self.source.root.display(),
@@ -341,6 +358,7 @@ impl Config {
             self.planning.hierarchical,
             self.planning.max_cluster_nodes,
             self.build.incremental,
+            self.build.keep_generations,
             self.server.bind,
             self.server.remote_enabled,
         )
@@ -414,6 +432,18 @@ mod tests {
         let mut bad = Config::default();
         bad.planning.max_cluster_nodes = 1;
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn keep_generations_defaults_and_bounds() {
+        let cfg = Config::default();
+        assert_eq!(cfg.build.keep_generations, 3);
+        let mut bad = Config::default();
+        bad.build.keep_generations = 0;
+        assert!(bad.validate().is_err());
+        let mut minimal = Config::default();
+        minimal.build.keep_generations = 1;
+        minimal.validate().unwrap();
     }
 
     #[test]

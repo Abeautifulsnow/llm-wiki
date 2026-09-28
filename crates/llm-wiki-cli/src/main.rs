@@ -3,11 +3,13 @@
 //! application services; all logic lives in the library crates.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 
-use llm_wiki_core::config::Config;
+use llm_wiki_core::config::{lexical_absolute, Config, LlmConfig};
 use llm_wiki_core::error::WikiError;
+use llm_wiki_llm::OpenAiCompatibleProvider;
 use llm_wiki_source::{ScanDiagnostic, Scanner, SourceManifest};
 
 #[derive(Parser)]
@@ -27,6 +29,11 @@ enum Command {
     Init,
     /// Scan the source tree, build the manifest and persist the Source Registry.
     Scan {
+        /// Source root override (defaults to config `source.root`).
+        root: Option<String>,
+    },
+    /// Run the full pipeline: scan → analyze → plan → compile → publish (§35).
+    Build {
         /// Source root override (defaults to config `source.root`).
         root: Option<String>,
     },
@@ -61,6 +68,7 @@ fn run(command: Command) -> Result<(), WikiError> {
     match command {
         Command::Init => init(&workspace),
         Command::Scan { root } => scan(&workspace, root.as_deref()),
+        Command::Build { root } => build(&workspace, root.as_deref()),
         Command::Status => status(&workspace),
         Command::Doctor => doctor(&workspace),
     }
@@ -136,6 +144,7 @@ graph = true
 
 [build]
 incremental = true
+keep_generations = 3
 
 [server]
 bind = "127.0.0.1"
@@ -218,6 +227,70 @@ fn normalized_rel_of(root: &Path, workspace: &Path, wiki_dir: &Path) -> Option<S
     })
 }
 
+/// Builds the configured LLM provider. The API key is read from the env var
+/// *named* by the config (PRD §32) at first request.
+fn build_provider(llm: &LlmConfig) -> Result<Arc<dyn llm_wiki_llm::LlmProvider>, WikiError> {
+    if llm.model.trim().is_empty() {
+        return Err(WikiError::Config(
+            "llm.model must be set in .llm-wiki/config.toml before building".into(),
+        ));
+    }
+    match llm.provider.as_str() {
+        "openai-compatible" => {
+            let provider = OpenAiCompatibleProvider::new(
+                &llm.base_url,
+                &llm.model,
+                &llm.api_key_env,
+                llm.timeout_seconds,
+                2,
+            )
+            .map_err(|e| WikiError::Llm(e.to_string()))?;
+            Ok(Arc::new(provider))
+        }
+        other => Err(WikiError::Config(format!(
+            "unsupported llm.provider '{other}' (supported: openai-compatible)"
+        ))),
+    }
+}
+
+/// `llm-wiki build [root]` (PRD §29): thin transport over
+/// `llm_wiki_compiler::run_build`. `ReplanRequired` propagates with its exit
+/// code (7) and trigger reason — the CLI never auto-replans.
+fn build(workspace: &Path, root_override: Option<&str>) -> Result<(), WikiError> {
+    let mut config = load_config(workspace)?;
+    if let Some(root) = root_override {
+        config.source.root = PathBuf::from(root);
+    }
+    config.validate()?;
+    let provider = build_provider(&config.llm)?;
+
+    let wiki_abs = lexical_absolute(workspace, &config.project.wiki_dir);
+    println!(
+        "build: sources {} → wiki {}",
+        config.source.root.display(),
+        wiki_abs.display()
+    );
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| WikiError::Llm(format!("cannot start async runtime: {e}")))?;
+    let report = runtime.block_on(llm_wiki_compiler::run_build(workspace, &config, provider))?;
+
+    println!("build {} completed", report.build_id);
+    println!("  sources: {}", report.sources);
+    println!(
+        "  pages: {}  citations: {}  links: {}",
+        report.pages, report.citations, report.links
+    );
+    println!("  llm requests: {}", report.llm_request_count);
+    println!("  published: {}", report.published_path.display());
+    if let Some(recovery) = &report.recovery {
+        println!("  recovered publish: {recovery}");
+    }
+    Ok(())
+}
+
 fn warn_diagnostic(diagnostic: &ScanDiagnostic) {
     println!(
         "  ! {} {:?}: {}",
@@ -261,6 +334,43 @@ fn report(label: &str, result: Result<String, WikiError>) -> bool {
     }
 }
 
+/// Publish-integrity check for `doctor` (PRD §29/§35): un-recovered publish
+/// journal and `current.json` vs DB `active_build_id` consistency. Reports
+/// the finding; never repairs anything.
+fn check_publish_state(
+    conn: &llm_wiki_storage::Connection,
+    wiki_dir: &Path,
+) -> Result<String, WikiError> {
+    let paths = llm_wiki_compiler::PublishPaths::new(wiki_dir);
+    if llm_wiki_compiler::journal_exists(&paths) {
+        return Err(WikiError::PublishRecovery(format!(
+            "un-recovered publish journal at {} — run `llm-wiki build` to let recovery resolve it",
+            paths.journal_path().display()
+        )));
+    }
+    let pointer = llm_wiki_compiler::read_current_pointer(&paths)?;
+    let db_active = llm_wiki_storage::get_active_build_id(conn)?;
+    match (pointer, db_active) {
+        (None, None) => Ok("no wiki published yet".to_owned()),
+        (Some(pointer), Some(active)) if pointer.build_id == active.as_str() => {
+            Ok(format!("consistent (current generation {})", active))
+        }
+        (Some(pointer), Some(active)) => Err(WikiError::PublishRecovery(format!(
+            "current.json points at {} but the database active_build_id is {}; refusing to guess",
+            pointer.build_id, active
+        ))),
+        (Some(pointer), None) => Err(WikiError::PublishRecovery(format!(
+            "current.json points at {} but the database has no active_build_id; refusing to guess",
+            pointer.build_id
+        ))),
+        (None, Some(active)) => Err(WikiError::PublishRecovery(format!(
+            "the database active_build_id is {} but {} is missing; refusing to guess",
+            active,
+            paths.pointer_path().display()
+        ))),
+    }
+}
+
 fn doctor(workspace: &Path) -> Result<(), WikiError> {
     let config = load_config(workspace)?;
     let mut failures = 0usize;
@@ -288,13 +398,33 @@ fn doctor(workspace: &Path) -> Result<(), WikiError> {
 
     let db = std::fs::create_dir_all(state_dir(workspace))
         .map_err(|e| WikiError::Source(e.to_string()))
-        .and_then(|_| llm_wiki_storage::open(&state_db(workspace)))
-        .and_then(|conn| {
-            llm_wiki_storage::count_sources(&conn)
-                .map(|count| format!("open + migrated ({count} sources)"))
-        });
-    if !report("state db", db) {
-        failures += 1;
+        .and_then(|_| llm_wiki_storage::open(&state_db(workspace)));
+    let conn = match db {
+        Ok(conn) => {
+            let count = llm_wiki_storage::count_sources(&conn);
+            if !report(
+                "state db",
+                count.map(|count| format!("open + migrated ({count} sources)")),
+            ) {
+                failures += 1;
+            }
+            Some(conn)
+        }
+        Err(err) => {
+            report("state db", Err(err));
+            failures += 1;
+            None
+        }
+    };
+
+    // Publish integrity (PRD §35): report, never auto-fix. Failures here must
+    // be resolved by running a build (journal recovery) or manually.
+    if let Some(conn) = conn {
+        let wiki_abs = lexical_absolute(workspace, &config.project.wiki_dir);
+        let publish_state = check_publish_state(&conn, &wiki_abs);
+        if !report("publish state", publish_state) {
+            failures += 1;
+        }
     }
 
     let api_key = match std::env::var(&config.llm.api_key_env) {

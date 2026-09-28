@@ -753,9 +753,12 @@ name = "llm-wiki-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "llm-wiki-compiler",
  "llm-wiki-core",
+ "llm-wiki-llm",
  "llm-wiki-source",
  "llm-wiki-storage",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]
@@ -765,9 +768,11 @@ name = "llm-wiki-compiler"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "llm-wiki-core",
  "llm-wiki-llm",
  "llm-wiki-markdown",
+ "llm-wiki-source",
  "llm-wiki-storage",
  "rusqlite",
  "serde",

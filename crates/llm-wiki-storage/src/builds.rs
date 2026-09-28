@@ -96,6 +96,31 @@ pub fn finish_build(
     Ok(())
 }
 
+/// Records the scanned source snapshot hash once the scan stage produced it
+/// (the build row is created before scanning so §31 stage transitions can be
+/// persisted from the very start).
+pub fn set_build_snapshot_hash(
+    conn: &mut Connection,
+    build_id: &BuildId,
+    snapshot_hash: &str,
+) -> Result<()> {
+    let tx = conn
+        .transaction()
+        .map_err(|e| WikiError::Storage(format!("begin tx: {e}")))?;
+    let changed = tx
+        .execute(
+            "UPDATE builds SET source_snapshot_hash = ?1 WHERE build_id = ?2",
+            params![snapshot_hash, build_id.as_str()],
+        )
+        .map_err(|e| WikiError::Storage(format!("set snapshot hash: {e}")))?;
+    if changed == 0 {
+        return Err(WikiError::Storage(format!("unknown build {build_id}")));
+    }
+    tx.commit()
+        .map_err(|e| WikiError::Storage(format!("commit snapshot hash: {e}")))?;
+    Ok(())
+}
+
 fn db(e: rusqlite::Error) -> WikiError {
     WikiError::Storage(e.to_string())
 }
@@ -167,5 +192,21 @@ mod tests {
         assert_eq!(record.build_fingerprint.as_deref(), Some("fp"));
         assert_eq!(record.registry_revision, Some(7));
         assert!(record.finished_at.is_some());
+    }
+
+    #[test]
+    fn snapshot_hash_is_recorded_after_build_start() {
+        let mut conn = open_in_memory().unwrap();
+        let id = start_build(&mut conn, &BuildDraft::default()).unwrap();
+        assert_eq!(
+            latest_build(&conn).unwrap().unwrap().source_snapshot_hash,
+            None
+        );
+        set_build_snapshot_hash(&mut conn, &id, "snap-1").unwrap();
+        assert_eq!(
+            latest_build(&conn).unwrap().unwrap().source_snapshot_hash,
+            Some("snap-1".to_owned())
+        );
+        assert!(set_build_snapshot_hash(&mut conn, &BuildId::generate(), "x").is_err());
     }
 }

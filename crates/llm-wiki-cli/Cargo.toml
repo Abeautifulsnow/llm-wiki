@@ -1,6 +1,6 @@
 [package]
 name = "llm-wiki-cli"
-description = "CLI transport adapter: init / scan / status / doctor (PRD §7.7, §29)"
+description = "CLI transport adapter: init / scan / build / status / doctor (PRD §7.7, §29)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,8 +12,11 @@ path = "src/main.rs"
 
 [dependencies]
 llm-wiki-core = { workspace = true }
+llm-wiki-compiler = { workspace = true }
+llm-wiki-llm = { workspace = true }
 llm-wiki-source = { workspace = true }
 llm-wiki-storage = { workspace = true }
 clap = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

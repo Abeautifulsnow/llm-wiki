@@ -13,14 +13,17 @@ pub mod migrations;
 pub mod registry;
 pub mod sections;
 pub mod sources;
+pub mod state;
 pub mod wiki;
 
 pub use analysis::{
     persist_analysis, AnalysisPersistence, AnalysisRecord, EvidenceRange, PersistedAnalysis,
     PersistedClaim, PersistedRejectedClaim, PersistedRelation,
 };
-pub use builds::{finish_build, latest_build, start_build, BuildDraft, BuildRecord};
-pub use connection::{open, open_in_memory};
+pub use builds::{
+    finish_build, latest_build, set_build_snapshot_hash, start_build, BuildDraft, BuildRecord,
+};
+pub use connection::{open, open_in_memory, Connection};
 pub use knowledge::{load_knowledge_base, load_plan_input};
 pub use registry::{
     canonical_key, current_revision, get_entry, get_or_create, get_or_create_batch, merge, resolve,
@@ -31,6 +34,12 @@ pub use sources::{
     count_sources, get_by_locator, list_sources, mark_removed, upsert_source, upsert_sources_batch,
     SourceRecord, SourceUpsert,
 };
+pub use state::{
+    activate_build, get_active_build_id, get_state, list_generation_build_ids,
+    mark_stale_builds_interrupted, set_active_build, set_state, update_build_status,
+    ACTIVE_BUILD_KEY, BUILD_STATUSES,
+};
 pub use wiki::{
-    persist_generation, GenerationStats, PageCitationRecord, PageLinkRecord, WikiPageRecord,
+    load_generation_pages, persist_generation, GenerationStats, PageCitationRecord, PageLinkRecord,
+    WikiPageRecord,
 };

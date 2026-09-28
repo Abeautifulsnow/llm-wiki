@@ -135,6 +135,38 @@ pub fn persist_generation(
     })
 }
 
+/// Loads one generation's page rows back (publish-journal recovery uses these
+/// to re-verify the generation on disk against `body_hash`, PRD §35).
+/// Citation/link mappings are not needed for that check and come back empty.
+pub fn load_generation_pages(conn: &Connection, build_id: &BuildId) -> Result<Vec<WikiPageRecord>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT page_id, slug, title, category, language, body_hash, content
+             FROM wiki_pages WHERE build_id = ?1 ORDER BY slug",
+        )
+        .map_err(|e| WikiError::Storage(format!("prepare load_generation_pages: {e}")))?;
+    let rows = stmt
+        .query_map(params![build_id.as_str()], |row| {
+            Ok(WikiPageRecord {
+                page_id: WikiPageId::from_validated(row.get::<_, String>("page_id")?),
+                slug: row.get("slug")?,
+                title: row.get("title")?,
+                category: row.get("category")?,
+                language: row.get("language")?,
+                body_hash: row.get("body_hash")?,
+                content: row.get("content")?,
+                citations: Vec::new(),
+                links: Vec::new(),
+            })
+        })
+        .map_err(|e| WikiError::Storage(format!("load_generation_pages: {e}")))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(db)?);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,5 +281,33 @@ mod tests {
             links: vec![],
         };
         assert!(persist_generation(&mut conn, &build_id, &[duplicate]).is_err());
+    }
+
+    #[test]
+    fn generation_pages_roundtrip_for_recovery_validation() {
+        let (mut conn, _source_id, _claim) = seed();
+        let build_id = BuildId::generate();
+        let pages = vec![WikiPageRecord {
+            page_id: WikiPageId::generate(),
+            slug: "runtime".into(),
+            title: "Runtime".into(),
+            category: "architecture".into(),
+            language: "en".into(),
+            body_hash: "hash-b".into(),
+            content: "# Runtime".into(),
+            citations: vec![],
+            links: vec![],
+        }];
+        persist_generation(&mut conn, &build_id, &pages).unwrap();
+
+        let loaded = load_generation_pages(&conn, &build_id).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].slug, "runtime");
+        assert_eq!(loaded[0].body_hash, "hash-b");
+        assert_eq!(loaded[0].content, "# Runtime");
+        assert!(loaded[0].citations.is_empty());
+
+        let other = BuildId::generate();
+        assert!(load_generation_pages(&conn, &other).unwrap().is_empty());
     }
 }

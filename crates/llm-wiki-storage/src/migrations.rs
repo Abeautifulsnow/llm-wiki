@@ -5,4 +5,5 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_analysis.sql"),
     include_str!("../migrations/0003_wiki.sql"),
+    include_str!("../migrations/0004_publish.sql"),
 ];
