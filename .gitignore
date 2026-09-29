@@ -11,3 +11,9 @@
 # Python bytecode
 evals/__pycache__/
 __pycache__/
+
+# codegraph
+.codegraph/
+
+# si-octo
+outputs/

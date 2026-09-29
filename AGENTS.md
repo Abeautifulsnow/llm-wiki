@@ -19,3 +19,15 @@ If you're using Codex or another agent-capable tool, additional project-scoped h
 Managed by Trellis. Edits outside this block are preserved; edits inside may be overwritten by a future `trellis update`.
 
 <!-- TRELLIS:END -->
+
+# Agent Tool Call Rules
+
+## Codebase Analysis & Navigation (CodeGraph)
+
+This repository has been indexed using CodeGraph.
+
+When answering architecture questions, looking up symbol definitions, searching for callers/callees, or performing change impact analysis:
+
+1. **Always use the CodeGraph MCP tool first** (`mcp__codegraph__codegraph_explore`).
+2. **Do NOT crawl or scan files manually** using standard `grep`, `glob`, or sequential `read_file` unless you need to view exact line edits for a specific file.
+3. Trust the graph-backed context provided by CodeGraph to minimize unnecessary tool calls and context usage.
