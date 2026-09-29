@@ -75,6 +75,10 @@ pub struct DocumentAnalyzer {
     prompt: PromptDocument,
     section_target_tokens: u32,
     max_rejected_claim_ratio: f32,
+    /// Per-unit output ceiling (config `[llm] max_output_tokens`): thinking
+    /// models spend chain-of-thought from this same budget, so 4096 can be
+    /// exhausted before any visible JSON is emitted.
+    max_output_tokens: u32,
     /// §28 stage cache; only validated unit responses are stored.
     cache: Option<Arc<dyn StageCache>>,
 }
@@ -85,12 +89,14 @@ impl DocumentAnalyzer {
         prompt: PromptDocument,
         section_target_tokens: u32,
         max_rejected_claim_ratio: f32,
+        max_output_tokens: u32,
     ) -> Self {
         Self {
             provider,
             prompt,
             section_target_tokens,
             max_rejected_claim_ratio,
+            max_output_tokens,
             cache: None,
         }
     }
@@ -160,7 +166,7 @@ impl DocumentAnalyzer {
             system: None,
             prompt: template.replace("{{REPAIR_NOTES}}", ""),
             temperature: 0.0,
-            max_output_tokens: 4096,
+            max_output_tokens: self.max_output_tokens,
             json_mode: true,
         };
 

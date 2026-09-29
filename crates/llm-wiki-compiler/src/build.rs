@@ -490,6 +490,7 @@ async fn compile_and_publish_incremental(
         compilation_prompt.clone(),
         CompilerConfig {
             max_input_tokens: config.analysis.max_input_tokens as u64,
+            min_output_tokens: config.llm.max_output_tokens,
             ..CompilerConfig::default()
         },
     )
@@ -792,6 +793,7 @@ async fn build_full_pipeline(
         analysis_prompt.clone(),
         config.analysis.section_target_tokens,
         config.analysis.max_rejected_claim_ratio,
+        config.llm.max_output_tokens,
     )
     .with_cache(stage_cache.clone());
     let mut llm_request_count = 0u32;
@@ -826,6 +828,7 @@ async fn build_full_pipeline(
         hierarchical: config.planning.hierarchical,
         max_cluster_nodes: config.planning.max_cluster_nodes as usize,
         max_plan_input_tokens: config.analysis.max_plan_input_tokens as u64,
+        max_output_tokens: config.llm.max_output_tokens,
         ..PlannerConfig::default()
     };
     let planner = WikiPlanner::new(provider.clone(), planning_prompt.clone(), planner_config)
@@ -1117,6 +1120,7 @@ async fn analyze_changed_sources(
         analysis_prompt.clone(),
         config.analysis.section_target_tokens,
         config.analysis.max_rejected_claim_ratio,
+        config.llm.max_output_tokens,
     )
     .with_cache(stage_cache);
     let mut llm_request_count = 0u32;

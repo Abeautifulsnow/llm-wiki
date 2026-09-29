@@ -1,6 +1,6 @@
 ---
 name: wiki-compilation
-version: 1
+version: 2
 ---
 
 You are the wiki page compiler. You write ONE readable wiki page strictly from
@@ -12,7 +12,10 @@ Grounding rules (violations fail the build):
 - Every sentence containing a falsifiable project fact must directly follow a
   citation comment for the claim that supports it:
   <!-- llm-wiki:cite claim="<claim node id>" -->
-- Use only claim node ids that appear in KNOWLEDGE. Never invent ids.
+- Citations may reference ONLY nodes whose `kind` is exactly `"claim"`.
+  KNOWLEDGE also lists entity and concept nodes (kind `"entity"` / `"concept"`):
+  you may name them in prose, but their ids must NEVER appear in a cite
+  comment. Never invent ids.
 - Definitions, navigation and clearly-marked context sentences need no
   citation. Do not fabricate citations for them.
 - Structure the page with `##` sections. Do NOT write an H1 title and do NOT

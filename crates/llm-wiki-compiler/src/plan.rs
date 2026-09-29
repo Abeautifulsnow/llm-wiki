@@ -36,6 +36,9 @@ pub struct PlannerConfig {
     pub max_plan_input_tokens: u64,
     /// Instruction for output language; matches the analysis prompt contract.
     pub language: String,
+    /// Per-request output ceiling (config `[llm] max_output_tokens`): thinking
+    /// models spend chain-of-thought from this same budget.
+    pub max_output_tokens: u32,
 }
 
 impl Default for PlannerConfig {
@@ -45,6 +48,7 @@ impl Default for PlannerConfig {
             max_cluster_nodes: 24,
             max_plan_input_tokens: 32_000,
             language: "the sources' language".to_owned(),
+            max_output_tokens: 4096,
         }
     }
 }
@@ -459,7 +463,7 @@ impl WikiPlanner {
             system: None,
             prompt: template.replace("{{REPAIR_NOTES}}", ""),
             temperature: 0.0,
-            max_output_tokens: 4096,
+            max_output_tokens: self.config.max_output_tokens,
             json_mode: true,
         };
 

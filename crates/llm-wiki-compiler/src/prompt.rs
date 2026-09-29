@@ -170,8 +170,12 @@ mod tests {
     #[test]
     fn embedded_compilation_prompt_has_grounding_rule() {
         let prompt = load_prompt("wiki-compilation", None).unwrap();
-        assert_eq!(prompt.fingerprint_tag(), "wiki-compilation@1");
+        assert_eq!(prompt.fingerprint_tag(), "wiki-compilation@2");
         assert!(prompt.body.contains("llm-wiki:cite claim="));
+        // T1 finding #2: entity/concept ids also "appear in KNOWLEDGE" — the
+        // rule must pin citations to claim-kind nodes explicitly.
+        assert!(prompt.body.contains("must NEVER appear in a cite"));
+        assert!(prompt.body.contains("only allowed source of facts"));
         assert!(prompt.body.contains("{{KNOWLEDGE}}"));
         assert!(prompt.body.contains("{{RELATED}}"));
         assert!(prompt.body.contains("{{REPAIR_NOTES}}"));

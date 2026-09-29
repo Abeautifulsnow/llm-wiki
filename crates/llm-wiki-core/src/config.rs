@@ -61,6 +61,14 @@ pub struct LlmConfig {
     /// project config (PRD §32 / security constraint).
     #[serde(default = "default_api_key_env")]
     pub api_key_env: String,
+    /// Per-request output ceiling for the analysis and planning stages (the
+    /// compile stage scales its own estimate but never goes below this).
+    /// Thinking models spend chain-of-thought tokens from the SAME budget —
+    /// a reasoning-heavy response can exhaust 4096 before any visible JSON
+    /// is emitted (observed: 10-13K chars of reasoning, content_len 0). Raise
+    /// this when pointing at a thinking model.
+    #[serde(default = "default_max_output_tokens")]
+    pub max_output_tokens: u32,
     #[serde(default = "default_max_concurrency")]
     pub max_concurrency: u32,
     #[serde(default = "default_timeout_seconds")]
@@ -159,6 +167,9 @@ fn default_base_url() -> String {
 fn default_api_key_env() -> String {
     "LLM_WIKI_API_KEY".to_owned()
 }
+fn default_max_output_tokens() -> u32 {
+    4096
+}
 fn default_max_concurrency() -> u32 {
     4
 }
@@ -219,6 +230,7 @@ impl Default for LlmConfig {
             base_url: default_base_url(),
             model: String::new(),
             api_key_env: default_api_key_env(),
+            max_output_tokens: default_max_output_tokens(),
             max_concurrency: default_max_concurrency(),
             timeout_seconds: default_timeout_seconds(),
         }

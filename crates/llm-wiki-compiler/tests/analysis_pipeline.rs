@@ -156,6 +156,7 @@ fn analyzer(provider: Arc<dyn LlmProvider>) -> DocumentAnalyzer {
         llm_wiki_compiler::load_prompt("document-analysis", None).unwrap(),
         6000,
         0.10,
+        4096,
     )
 }
 
@@ -167,6 +168,7 @@ fn lenient_analyzer(provider: Arc<dyn LlmProvider>) -> DocumentAnalyzer {
         llm_wiki_compiler::load_prompt("document-analysis", None).unwrap(),
         6000,
         0.50,
+        4096,
     )
 }
 
@@ -435,6 +437,7 @@ async fn oversized_section_is_segmented_and_evidence_spans_segments() {
         llm_wiki_compiler::load_prompt("document-analysis", None).unwrap(),
         64,
         0.10,
+        4096,
     );
     let outcome = analyzer.analyze_document(&doc, None).await.unwrap();
 

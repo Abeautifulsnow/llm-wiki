@@ -744,6 +744,7 @@ async fn replan_inner(
         hierarchical: config.planning.hierarchical,
         max_cluster_nodes: config.planning.max_cluster_nodes as usize,
         max_plan_input_tokens: config.analysis.max_plan_input_tokens as u64,
+        max_output_tokens: config.llm.max_output_tokens,
         ..PlannerConfig::default()
     };
     let planner = WikiPlanner::new(
@@ -873,6 +874,7 @@ async fn replan_execute(
         env.compilation_prompt.clone(),
         CompilerConfig {
             max_input_tokens: config.analysis.max_input_tokens as u64,
+            min_output_tokens: config.llm.max_output_tokens,
             ..CompilerConfig::default()
         },
     )
@@ -1329,6 +1331,7 @@ async fn replan_analyze_pending(
         env.analysis_prompt.clone(),
         config.analysis.section_target_tokens,
         config.analysis.max_rejected_claim_ratio,
+        config.llm.max_output_tokens,
     )
     .with_cache(stage_cache);
     let mut llm_request_count = 0u32;

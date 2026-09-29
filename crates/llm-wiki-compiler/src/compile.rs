@@ -44,6 +44,11 @@ pub struct CompilerConfig {
     /// Input budget for one page-compilation prompt (PRD §14: over-budget
     /// payloads must fail closed — never truncate, never widen the window).
     pub max_input_tokens: u64,
+    /// FLOOR for the per-page output ceiling: the compile stage scales its
+    /// own estimate with the page's knowledge, but thinking models spend
+    /// chain-of-thought from the same budget, so the estimate never goes
+    /// below the configured `[llm] max_output_tokens`.
+    pub min_output_tokens: u32,
 }
 
 impl Default for CompilerConfig {
@@ -53,6 +58,7 @@ impl Default for CompilerConfig {
             language_tag: "und".to_owned(),
             schema_version: 1,
             max_input_tokens: 32_000,
+            min_output_tokens: 4096,
         }
     }
 }
@@ -292,7 +298,8 @@ impl WikiCompiler {
 
         // Output scales with the knowledge the page may render.
         let max_output_tokens = (estimate_tokens(&knowledge_json) * 6 + 2_000)
-            .clamp(2_048, u64::from(MAX_PAGE_OUTPUT_TOKENS)) as u32;
+            .clamp(2_048, u64::from(MAX_PAGE_OUTPUT_TOKENS))
+            .max(u64::from(self.config.min_output_tokens)) as u32;
 
         let template = self.prompt.render(&[
             ("LANGUAGE", &self.config.language),
