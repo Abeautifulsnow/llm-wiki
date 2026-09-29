@@ -3,7 +3,7 @@
 //! happen in a single transaction; knowledge node identity is assigned by the
 //! registry beforehand (claims are `kind='claim'` registry nodes, PRD §12.1.1).
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Transaction};
 use serde::{Deserialize, Serialize};
 
 use llm_wiki_core::error::{Result, WikiError};
@@ -96,6 +96,7 @@ pub struct RetiredSourceKnowledge {
     pub retired_registry_nodes: Vec<KnowledgeNodeId>,
 }
 
+/// Length note: ~102 lines — one §19.3 transaction (retire claims + relations + unsupported nodes) with exactly one revision bump; the parts must stay in one tx body.
 /// Retires the active claims and relations of a REMOVED source without
 /// replacement (PRD §19.3: deletion must leave no ghost knowledge). Registry
 /// nodes that lose all supporting claims AND touching relations are retired
@@ -275,106 +276,101 @@ pub struct PersistedAnalysis {
 }
 
 /// Persists one analysis inside a single transaction.
-pub fn persist_analysis(
-    conn: &mut Connection,
+/// Serializes a section's heading path for citation rows (empty when the
+/// section id has no recorded path).
+fn heading_path_json_of(
     persistence: &AnalysisPersistence,
-) -> Result<PersistedAnalysis> {
-    let tx = conn
-        .transaction()
-        .map_err(|e| WikiError::Storage(format!("begin tx: {e}")))?;
+    section_id: &Option<SectionId>,
+) -> Result<String> {
+    let path = section_id
+        .as_ref()
+        .and_then(|sid| {
+            persistence
+                .heading_paths
+                .iter()
+                .find(|(candidate, _)| candidate == sid)
+                .map(|(_, path)| path.clone())
+        })
+        .unwrap_or_default();
+    serde_json::to_string(&path)
+        .map_err(|e| WikiError::Storage(format!("serialize heading path: {e}")))
+}
 
-    let analysis_id = llm_wiki_core::ids::AnalysisId::generate();
+/// Replace-source step 1: collect the claim nodes AND relation endpoints this
+/// source supported BEFORE the replacement, then retire the source's active
+/// claims and relations. The nodes that end up with no active claim and no
+/// touching relation are ghost knowledge (PRD §19.3) and are retired by
+/// [`sweep_ghost_nodes`] AFTER the new claims and relations exist.
+fn replace_previous_knowledge(
+    tx: &Transaction<'_>,
+    persistence: &AnalysisPersistence,
+) -> Result<Vec<KnowledgeNodeId>> {
+    let retired_build = persistence.record.build_id.as_ref().map(|b| b.as_str());
+    let mut replaced_nodes: Vec<KnowledgeNodeId> = Vec::new();
+    if !persistence.replace_source {
+        return Ok(replaced_nodes);
+    }
+    {
+        let mut stmt = tx
+            .prepare(
+                "SELECT DISTINCT node_id FROM claims
+                 WHERE source_id = ?1 AND status = 'active'",
+            )
+            .map_err(db)?;
+        let rows = stmt
+            .query_map(params![persistence.record.source_id.as_str()], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(db)?;
+        for row in rows {
+            replaced_nodes.push(KnowledgeNodeId::from_validated(row.map_err(db)?));
+        }
+    }
+    for column in ["r.source_node_id", "r.target_node_id"] {
+        // Column names are compile-time constants, never user input.
+        let sql = format!(
+            "SELECT DISTINCT {column} FROM relations r
+             JOIN document_analyses a ON a.analysis_id = r.analysis_id
+             WHERE a.source_id = ?1 AND r.status = 'active'"
+        );
+        let mut stmt = tx.prepare(&sql).map_err(db)?;
+        let rows = stmt
+            .query_map(params![persistence.record.source_id.as_str()], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(db)?;
+        for row in rows {
+            let node_id = KnowledgeNodeId::from_validated(row.map_err(db)?);
+            if !replaced_nodes.contains(&node_id) {
+                replaced_nodes.push(node_id);
+            }
+        }
+    }
     tx.execute(
-        "INSERT INTO document_analyses
-         (analysis_id, source_id, build_id, model, prompt_version, unit_count, llm_request_count, status, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![
-            analysis_id.as_str(),
-            persistence.record.source_id.as_str(),
-            persistence.record.build_id.as_ref().map(|b| b.as_str()),
-            persistence.record.model,
-            persistence.record.prompt_version,
-            persistence.record.unit_count,
-            persistence.record.llm_request_count,
-            persistence.record.status,
-            chrono::Utc::now().to_rfc3339()
-        ],
+        "UPDATE claims SET status = 'retired', retired_build_id = ?2 WHERE source_id = ?1 AND status = 'active'",
+        params![persistence.record.source_id.as_str(), retired_build],
     )
     .map_err(db)?;
+    tx.execute(
+        "UPDATE relations SET status = 'retired', retired_build_id = ?2
+         WHERE status = 'active' AND analysis_id IN
+         (SELECT analysis_id FROM document_analyses WHERE source_id = ?1)",
+        params![persistence.record.source_id.as_str(), retired_build],
+    )
+    .map_err(db)?;
+    Ok(replaced_nodes)
+}
 
+/// Inserts the analysis's active claims with their evidence citations.
+/// Returns the number of citation rows written.
+fn insert_claim_rows(
+    tx: &Transaction<'_>,
+    persistence: &AnalysisPersistence,
+    analysis_id: &llm_wiki_core::ids::AnalysisId,
+) -> Result<usize> {
     let retired_build = persistence.record.build_id.as_ref().map(|b| b.as_str());
-    // Claim nodes AND relation endpoints this source supported BEFORE the
-    // replacement: those that end up with no active claim and no touching
-    // relation are ghost knowledge (PRD §19.3) — a later build must not plan
-    // an anchor-less claim or an orphaned entity — and are retired below,
-    // after the new claims and relations exist.
-    let mut replaced_nodes: Vec<KnowledgeNodeId> = Vec::new();
-    if persistence.replace_source {
-        {
-            let mut stmt = tx
-                .prepare(
-                    "SELECT DISTINCT node_id FROM claims
-                     WHERE source_id = ?1 AND status = 'active'",
-                )
-                .map_err(db)?;
-            let rows = stmt
-                .query_map(params![persistence.record.source_id.as_str()], |row| {
-                    row.get::<_, String>(0)
-                })
-                .map_err(db)?;
-            for row in rows {
-                replaced_nodes.push(KnowledgeNodeId::from_validated(row.map_err(db)?));
-            }
-        }
-        for column in ["r.source_node_id", "r.target_node_id"] {
-            // Column names are compile-time constants, never user input.
-            let sql = format!(
-                "SELECT DISTINCT {column} FROM relations r
-                 JOIN document_analyses a ON a.analysis_id = r.analysis_id
-                 WHERE a.source_id = ?1 AND r.status = 'active'"
-            );
-            let mut stmt = tx.prepare(&sql).map_err(db)?;
-            let rows = stmt
-                .query_map(params![persistence.record.source_id.as_str()], |row| {
-                    row.get::<_, String>(0)
-                })
-                .map_err(db)?;
-            for row in rows {
-                let node_id = KnowledgeNodeId::from_validated(row.map_err(db)?);
-                if !replaced_nodes.contains(&node_id) {
-                    replaced_nodes.push(node_id);
-                }
-            }
-        }
-        tx.execute(
-            "UPDATE claims SET status = 'retired', retired_build_id = ?2 WHERE source_id = ?1 AND status = 'active'",
-            params![persistence.record.source_id.as_str(), retired_build],
-        )
-        .map_err(db)?;
-        tx.execute(
-            "UPDATE relations SET status = 'retired', retired_build_id = ?2
-             WHERE status = 'active' AND analysis_id IN
-             (SELECT analysis_id FROM document_analyses WHERE source_id = ?1)",
-            params![persistence.record.source_id.as_str(), retired_build],
-        )
-        .map_err(db)?;
-    }
-
-    let heading_path_json = |section_id: &Option<SectionId>| -> Result<String> {
-        let path = section_id
-            .as_ref()
-            .and_then(|sid| {
-                persistence
-                    .heading_paths
-                    .iter()
-                    .find(|(candidate, _)| candidate == sid)
-                    .map(|(_, path)| path.clone())
-            })
-            .unwrap_or_default();
-        serde_json::to_string(&path)
-            .map_err(|e| WikiError::Storage(format!("serialize heading path: {e}")))
-    };
-
+    let heading_path_json =
+        |section_id: &Option<SectionId>| heading_path_json_of(persistence, section_id);
     let mut citation_count = 0usize;
     for claim in &persistence.claims {
         let claim_row_id = ClaimRowId::generate();
@@ -419,7 +415,20 @@ pub fn persist_analysis(
             citation_count += 1;
         }
     }
+    Ok(citation_count)
+}
 
+/// Inserts the analysis's active relations with their evidence citations.
+/// Returns the number of citation rows written.
+fn insert_relation_rows(
+    tx: &Transaction<'_>,
+    persistence: &AnalysisPersistence,
+    analysis_id: &llm_wiki_core::ids::AnalysisId,
+) -> Result<usize> {
+    let retired_build = persistence.record.build_id.as_ref().map(|b| b.as_str());
+    let heading_path_json =
+        |section_id: &Option<SectionId>| heading_path_json_of(persistence, section_id);
+    let mut citation_count = 0usize;
     for relation in &persistence.relations {
         let relation_row_id = llm_wiki_core::ids::RelationRowId::generate();
         tx.execute(
@@ -457,7 +466,17 @@ pub fn persist_analysis(
             citation_count += 1;
         }
     }
+    Ok(citation_count)
+}
 
+/// Inserts the auditable rejected-candidate rows (PRD §11: unverifiable
+/// candidates never become knowledge).
+fn insert_rejected_rows(
+    tx: &Transaction<'_>,
+    persistence: &AnalysisPersistence,
+    analysis_id: &llm_wiki_core::ids::AnalysisId,
+) -> Result<()> {
+    let retired_build = persistence.record.build_id.as_ref().map(|b| b.as_str());
     for rejected in &persistence.rejected_claims {
         tx.execute(
             "INSERT INTO rejected_claims (rejected_id, analysis_id, source_id, candidate_json, claimed_section_id, reason, build_id)
@@ -474,6 +493,95 @@ pub fn persist_analysis(
         )
         .map_err(db)?;
     }
+    Ok(())
+}
+
+/// Ghost-knowledge sweep (PRD §19.3): with the NEW claims and relations
+/// already inserted, retire replaced knowledge nodes (claims AND relation
+/// endpoints) that neither carry an active claim anymore nor touch an
+/// active relation. One revision bump for the whole batch. Re-analysis of
+/// unchanged content re-inserts the same identities (the registry
+/// re-activates a retired node under its stable id on resolution), so
+/// identical rebuilds retire nothing and the registry revision stays
+/// stable (§37.3 determinism).
+fn sweep_ghost_nodes(
+    tx: &Transaction<'_>,
+    persistence: &AnalysisPersistence,
+    replaced_nodes: &[KnowledgeNodeId],
+) -> Result<()> {
+    if !persistence.replace_source || replaced_nodes.is_empty() {
+        return Ok(());
+    }
+    let retired_build = persistence.record.build_id.as_ref().map(|b| b.as_str());
+    let mut retired_registry_nodes = 0u64;
+    for node_id in replaced_nodes {
+        let active_claims: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM claims WHERE node_id = ?1 AND status = 'active'",
+                params![node_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(db)?;
+        let active_relations: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM relations
+                 WHERE status = 'active' AND (source_node_id = ?1 OR target_node_id = ?1)",
+                params![node_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(db)?;
+        if active_claims == 0 && active_relations == 0 {
+            retired_registry_nodes += tx
+                .execute(
+                    "UPDATE knowledge_registry SET status = 'retired', retired_build_id = ?2
+                     WHERE id = ?1 AND status = 'active'",
+                    params![node_id.as_str(), retired_build],
+                )
+                .map_err(db)? as u64;
+        }
+    }
+    if retired_registry_nodes > 0 {
+        bump_revision(tx)?;
+        tracing::info!(
+            source = %persistence.record.source_id,
+            nodes = retired_registry_nodes,
+            "retired unsupported knowledge nodes after re-analysis"
+        );
+    }
+    Ok(())
+}
+
+pub fn persist_analysis(
+    conn: &mut Connection,
+    persistence: &AnalysisPersistence,
+) -> Result<PersistedAnalysis> {
+    let tx = conn
+        .transaction()
+        .map_err(|e| WikiError::Storage(format!("begin tx: {e}")))?;
+
+    let analysis_id = llm_wiki_core::ids::AnalysisId::generate();
+    tx.execute(
+        "INSERT INTO document_analyses
+         (analysis_id, source_id, build_id, model, prompt_version, unit_count, llm_request_count, status, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            analysis_id.as_str(),
+            persistence.record.source_id.as_str(),
+            persistence.record.build_id.as_ref().map(|b| b.as_str()),
+            persistence.record.model,
+            persistence.record.prompt_version,
+            persistence.record.unit_count,
+            persistence.record.llm_request_count,
+            persistence.record.status,
+            chrono::Utc::now().to_rfc3339()
+        ],
+    )
+    .map_err(db)?;
+
+    let replaced_nodes = replace_previous_knowledge(&tx, persistence)?;
+    let claim_citations = insert_claim_rows(&tx, persistence, &analysis_id)?;
+    let relation_citations = insert_relation_rows(&tx, persistence, &analysis_id)?;
+    insert_rejected_rows(&tx, persistence, &analysis_id)?;
 
     tx.execute(
         "UPDATE document_analyses SET claim_count = ?2, rejected_claim_count = ?3, rejected_relation_count = ?4 WHERE analysis_id = ?1",
@@ -486,51 +594,7 @@ pub fn persist_analysis(
     )
     .map_err(db)?;
 
-    // Ghost-knowledge sweep (PRD §19.3): with the NEW claims and relations
-    // already inserted, retire replaced knowledge nodes (claims AND relation
-    // endpoints) that neither carry an active claim anymore nor touch an
-    // active relation. One revision bump for the whole batch. Re-analysis of
-    // unchanged content re-inserts the same identities (the registry
-    // re-activates a retired node under its stable id on resolution), so
-    // identical rebuilds retire nothing and the registry revision stays
-    // stable (§37.3 determinism).
-    if persistence.replace_source && !replaced_nodes.is_empty() {
-        let mut retired_registry_nodes = 0u64;
-        for node_id in &replaced_nodes {
-            let active_claims: i64 = tx
-                .query_row(
-                    "SELECT COUNT(*) FROM claims WHERE node_id = ?1 AND status = 'active'",
-                    params![node_id.as_str()],
-                    |row| row.get(0),
-                )
-                .map_err(db)?;
-            let active_relations: i64 = tx
-                .query_row(
-                    "SELECT COUNT(*) FROM relations
-                     WHERE status = 'active' AND (source_node_id = ?1 OR target_node_id = ?1)",
-                    params![node_id.as_str()],
-                    |row| row.get(0),
-                )
-                .map_err(db)?;
-            if active_claims == 0 && active_relations == 0 {
-                retired_registry_nodes += tx
-                    .execute(
-                        "UPDATE knowledge_registry SET status = 'retired', retired_build_id = ?2
-                         WHERE id = ?1 AND status = 'active'",
-                        params![node_id.as_str(), retired_build],
-                    )
-                    .map_err(db)? as u64;
-            }
-        }
-        if retired_registry_nodes > 0 {
-            bump_revision(&tx)?;
-            tracing::info!(
-                source = %persistence.record.source_id,
-                nodes = retired_registry_nodes,
-                "retired unsupported knowledge nodes after re-analysis"
-            );
-        }
-    }
+    sweep_ghost_nodes(&tx, persistence, &replaced_nodes)?;
 
     tx.commit()
         .map_err(|e| WikiError::Storage(format!("commit analysis: {e}")))?;
@@ -539,7 +603,7 @@ pub fn persist_analysis(
         claim_count: persistence.claims.len(),
         rejected_claim_count: persistence.rejected_claims.len(),
         relation_count: persistence.relations.len(),
-        citation_count,
+        citation_count: claim_citations + relation_citations,
     })
 }
 

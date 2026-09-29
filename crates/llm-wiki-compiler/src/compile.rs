@@ -149,6 +149,7 @@ impl WikiCompiler {
         })
     }
 
+    /// Length note: ~108 lines — the single-page pipeline (validate → repair → expand citations → resolve links); stages share local state and run in a fixed order.
     async fn compile_page(
         &self,
         page: &llm_wiki_core::model::WikiPagePlan,

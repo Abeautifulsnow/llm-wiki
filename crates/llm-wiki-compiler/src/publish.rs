@@ -454,6 +454,7 @@ pub fn publish(
 // Recovery
 // ---------------------------------------------------------------------------
 
+/// Length note: ~118 lines — the §35 crash-recovery state machine; each branch maps 1:1 to a test in the crash matrix, so splitting would break the auditability of the decision table.
 /// Resolves a possibly-interrupted publish under a single consistent view
 /// (PRD §35). Called before every build and exposed for `doctor`:
 ///

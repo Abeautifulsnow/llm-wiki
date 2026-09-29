@@ -119,8 +119,8 @@ fn next_line_is_item(lines: &[&str], line_index: usize) -> bool {
         .iter()
         .skip(line_index + 1)
         .find(|l| {
-            let t = l.trim();
-            !t.is_empty() && !t.starts_with('#')
+            let trimmed = l.trim();
+            !trimmed.is_empty() && !trimmed.starts_with('#')
         })
         .is_some_and(|l| l.trim_start().starts_with("- "))
 }

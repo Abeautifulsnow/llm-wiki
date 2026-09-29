@@ -21,11 +21,11 @@ use std::sync::Arc;
 
 use llm_wiki_core::config::{lexical_absolute, Config};
 use llm_wiki_core::error::{Result, WikiError};
-use llm_wiki_core::ids::{BuildId, KnowledgeNodeId, WikiPageId};
+use llm_wiki_core::ids::{BuildId, KnowledgeNodeId, SourceId, WikiPageId};
 use llm_wiki_core::model::{WikiPagePlan, WikiPlan};
 use llm_wiki_llm::LlmProvider;
 use llm_wiki_markdown::parse_document;
-use llm_wiki_source::{Scanner, SourceManifest};
+use llm_wiki_source::{ScanOutput, Scanner, SourceManifest};
 use llm_wiki_storage::{
     finish_build, get_active_build_id, insert_page_id_maps, latest_completed_build,
     list_recent_plan_decisions_by_outcome, list_sources, load_generation_pages,
@@ -159,6 +159,201 @@ impl PlanDiff {
     }
 }
 
+/// The old/new ref sets shared by the matching passes and classifiers.
+struct RefSets<'a> {
+    old_refs: &'a [BTreeSet<KnowledgeNodeId>],
+    new_refs: &'a [BTreeSet<KnowledgeNodeId>],
+}
+
+/// Outcome of the two matching passes over the ref sets.
+struct MatchPass {
+    /// Each new page's best old page (larger overlap first, then old slug
+    /// order).
+    best_old: Vec<Option<usize>>,
+    /// Old pages named best by which new pages (split detection).
+    claimants: Vec<Vec<usize>>,
+    /// Each old page's knowledge flows to ONE new page (larger overlap
+    /// first, then new slug order — slugs are unique within a plan).
+    flows_to: Vec<Option<usize>>,
+}
+
+fn match_pass(
+    old_refs: &[BTreeSet<KnowledgeNodeId>],
+    new_refs: &[BTreeSet<KnowledgeNodeId>],
+    old_pages: &[GenerationPageView],
+    new_plan: &WikiPlan,
+) -> MatchPass {
+    let mut best_old: Vec<Option<usize>> = Vec::with_capacity(new_plan.pages.len());
+    let mut claimants: Vec<Vec<usize>> = vec![Vec::new(); old_pages.len()];
+    for (i, new_set) in new_refs.iter().enumerate() {
+        let mut candidates: Vec<(usize, usize)> = old_refs
+            .iter()
+            .enumerate()
+            .map(|(j, old_set)| (j, new_set.intersection(old_set).count()))
+            .filter(|(_, overlap)| *overlap > 0)
+            .collect();
+        candidates.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| old_pages[a.0].slug.cmp(&old_pages[b.0].slug))
+        });
+        let best = candidates.first().map(|(j, _)| *j);
+        if let Some(j) = best {
+            claimants[j].push(i);
+        }
+        best_old.push(best);
+    }
+
+    let mut flows_to: Vec<Option<usize>> = vec![None; old_pages.len()];
+    for (j, old_set) in old_refs.iter().enumerate() {
+        let mut best: Option<usize> = None;
+        for (i, new_set) in new_refs.iter().enumerate() {
+            let overlap = new_set.intersection(old_set).count();
+            if overlap == 0 {
+                continue;
+            }
+            let better = match best {
+                None => true,
+                Some(current) => {
+                    let current_overlap = old_set.intersection(&new_refs[current]).count();
+                    overlap > current_overlap
+                        || (overlap == current_overlap
+                            && new_plan.pages[i].slug < new_plan.pages[current].slug)
+                }
+            };
+            if better {
+                best = Some(i);
+            }
+        }
+        flows_to[j] = best;
+    }
+
+    MatchPass {
+        best_old,
+        claimants,
+        flows_to,
+    }
+}
+
+/// Classifies one new plan page (§19.2 fixed order): split successors are
+/// handled by the caller; the remaining classes are merge (≥2 flowing old
+/// pages, dominant first), unchanged/modified (mutual best match), created.
+fn classify_new_page(
+    index: usize,
+    page: &WikiPagePlan,
+    refs: &RefSets<'_>,
+    old_pages: &[GenerationPageView],
+    pass: &MatchPass,
+    split_primaries: &BTreeSet<usize>,
+    diff: &mut PlanDiff,
+) {
+    let RefSets { old_refs, new_refs } = *refs;
+    if pass.best_old[index].is_some_and(|primary| split_primaries.contains(&primary)) {
+        return; // split successor: fresh plan id kept, recorded by the caller
+    }
+    // Old pages whose knowledge flows into THIS page (split primaries belong
+    // to their split successors, never to a merge).
+    let mut predecessors: Vec<usize> = (0..old_pages.len())
+        .filter(|&j| pass.flows_to[j] == Some(index) && !split_primaries.contains(&j))
+        .collect();
+    // Dominant first: larger ref overlap, then old slug order.
+    predecessors.sort_by(|&a, &b| {
+        let overlap_a = new_refs[index].intersection(&old_refs[a]).count();
+        let overlap_b = new_refs[index].intersection(&old_refs[b]).count();
+        overlap_b
+            .cmp(&overlap_a)
+            .then_with(|| old_pages[a].slug.cmp(&old_pages[b].slug))
+    });
+    if predecessors.len() >= 2 {
+        let dominant = predecessors[0];
+        diff.merged.push(MergeOutcome {
+            continued: ContinuedPage {
+                index,
+                page_id: old_pages[dominant].page_id.clone(),
+                predecessor_id: old_pages[dominant].page_id.clone(),
+                title: page.title.clone(),
+                slug: page.slug.clone(),
+            },
+            predecessors: predecessors
+                .iter()
+                .map(|&j| old_pages[j].page_id.clone())
+                .collect(),
+        });
+        return;
+    }
+    // Mutual best match with the primary: the identity continues.
+    if let Some(primary) = pass.best_old[index] {
+        if pass.flows_to[primary] == Some(index) {
+            let identical = new_refs[index] == old_refs[primary]
+                && page.title.trim() == old_pages[primary].title.trim()
+                && page.category == old_pages[primary].category;
+            let entry = ContinuedPage {
+                index,
+                page_id: old_pages[primary].page_id.clone(),
+                predecessor_id: old_pages[primary].page_id.clone(),
+                title: page.title.clone(),
+                slug: page.slug.clone(),
+            };
+            if identical {
+                diff.unchanged.push(entry);
+            } else {
+                diff.modified.push(entry);
+            }
+            return;
+        }
+    }
+    // No old page continues this new page: brand-new knowledge placement.
+    diff.created.push(CreatedPage {
+        index,
+        page_id: page.id.clone(),
+        title: page.title.clone(),
+        slug: page.slug.clone(),
+    });
+}
+
+/// Retirements: old pages neither kept (unchanged/modified), nor merge
+/// predecessors, nor split primaries — with the refs no new page covers
+/// (§19.2 ghost check).
+fn collect_retirements(
+    old_pages: &[GenerationPageView],
+    old_refs: &[BTreeSet<KnowledgeNodeId>],
+    new_refs: &[BTreeSet<KnowledgeNodeId>],
+    split_primaries: &BTreeSet<usize>,
+    diff: &PlanDiff,
+) -> Vec<RetiredPage> {
+    let kept: BTreeSet<WikiPageId> = diff
+        .unchanged
+        .iter()
+        .chain(&diff.modified)
+        .map(|entry| entry.predecessor_id.clone())
+        .collect();
+    let merged_predecessors: BTreeSet<WikiPageId> = diff
+        .merged
+        .iter()
+        .flat_map(|merge| merge.predecessors.iter().cloned())
+        .collect();
+    let covered_refs: BTreeSet<KnowledgeNodeId> = new_refs.iter().flatten().cloned().collect();
+    let mut retired = Vec::new();
+    for (j, page) in old_pages.iter().enumerate() {
+        if split_primaries.contains(&j)
+            || kept.contains(&page.page_id)
+            || merged_predecessors.contains(&page.page_id)
+        {
+            continue;
+        }
+        let lost_refs = old_refs[j]
+            .iter()
+            .filter(|node_id| !covered_refs.contains(*node_id))
+            .cloned()
+            .collect();
+        retired.push(RetiredPage {
+            page_id: page.page_id.clone(),
+            slug: page.slug.clone(),
+            lost_refs,
+        });
+    }
+    retired
+}
+
 /// Classifies every new plan page against the current generation's pages
 /// (deterministic: fixed iteration order, BTree tie-breaks — same input,
 /// same classification).
@@ -188,55 +383,9 @@ pub fn plan_diff(old_pages: &[GenerationPageView], new_plan: &WikiPlan) -> PlanD
         .map(|page| page.knowledge_refs.iter().cloned().collect())
         .collect();
 
-    // Pass 1: each new page's best old page (larger overlap first, then old
-    // slug order — PRD §19.2 tie-break) and the reverse claimants.
-    let mut best_old: Vec<Option<usize>> = Vec::with_capacity(new_plan.pages.len());
-    let mut claimants: Vec<Vec<usize>> = vec![Vec::new(); old_pages.len()];
-    for (i, new_set) in new_refs.iter().enumerate() {
-        let mut candidates: Vec<(usize, usize)> = old_refs
-            .iter()
-            .enumerate()
-            .map(|(j, old_set)| (j, new_set.intersection(old_set).count()))
-            .filter(|(_, overlap)| *overlap > 0)
-            .collect();
-        candidates.sort_by(|a, b| {
-            b.1.cmp(&a.1)
-                .then_with(|| old_pages[a.0].slug.cmp(&old_pages[b.0].slug))
-        });
-        let best = candidates.first().map(|(j, _)| *j);
-        if let Some(j) = best {
-            claimants[j].push(i);
-        }
-        best_old.push(best);
-    }
-
-    // Pass 2: each old page's knowledge flows to ONE new page (larger
-    // overlap first, then new slug order — slugs are unique within a plan).
-    let mut flows_to: Vec<Option<usize>> = vec![None; old_pages.len()];
-    for (j, old_set) in old_refs.iter().enumerate() {
-        let mut best: Option<usize> = None;
-        for (i, new_set) in new_refs.iter().enumerate() {
-            let overlap = new_set.intersection(old_set).count();
-            if overlap == 0 {
-                continue;
-            }
-            let better = match best {
-                None => true,
-                Some(current) => {
-                    let current_overlap = old_set.intersection(&new_refs[current]).count();
-                    overlap > current_overlap
-                        || (overlap == current_overlap
-                            && new_plan.pages[i].slug < new_plan.pages[current].slug)
-                }
-            };
-            if better {
-                best = Some(i);
-            }
-        }
-        flows_to[j] = best;
-    }
-
-    let split_primaries: BTreeSet<usize> = claimants
+    let pass = match_pass(&old_refs, &new_refs, old_pages, new_plan);
+    let split_primaries: BTreeSet<usize> = pass
+        .claimants
         .iter()
         .enumerate()
         .filter(|(_, claim)| claim.len() >= 2)
@@ -246,7 +395,7 @@ pub fn plan_diff(old_pages: &[GenerationPageView], new_plan: &WikiPlan) -> PlanD
     let mut diff = PlanDiff::default();
 
     // Split outcomes: plan-order successors per split primary.
-    for (j, claim) in claimants.iter().enumerate() {
+    for (j, claim) in pass.claimants.iter().enumerate() {
         if claim.len() >= 2 {
             diff.split.push(SplitOutcome {
                 retired: old_pages[j].page_id.clone(),
@@ -261,101 +410,21 @@ pub fn plan_diff(old_pages: &[GenerationPageView], new_plan: &WikiPlan) -> PlanD
 
     // Merge / unchanged / modified / created per new page (plan order).
     for (i, page) in new_plan.pages.iter().enumerate() {
-        if best_old[i].is_some_and(|primary| split_primaries.contains(&primary)) {
-            continue; // split successor: fresh plan id kept, recorded above
-        }
-        // Old pages whose knowledge flows into THIS page (split primaries
-        // belong to their split successors, never to a merge).
-        let mut predecessors: Vec<usize> = (0..old_pages.len())
-            .filter(|&j| flows_to[j] == Some(i) && !split_primaries.contains(&j))
-            .collect();
-        // Dominant first: larger ref overlap, then old slug order.
-        predecessors.sort_by(|&a, &b| {
-            let overlap_a = new_refs[i].intersection(&old_refs[a]).count();
-            let overlap_b = new_refs[i].intersection(&old_refs[b]).count();
-            overlap_b
-                .cmp(&overlap_a)
-                .then_with(|| old_pages[a].slug.cmp(&old_pages[b].slug))
-        });
-        if predecessors.len() >= 2 {
-            let dominant = predecessors[0];
-            diff.merged.push(MergeOutcome {
-                continued: ContinuedPage {
-                    index: i,
-                    page_id: old_pages[dominant].page_id.clone(),
-                    predecessor_id: old_pages[dominant].page_id.clone(),
-                    title: page.title.clone(),
-                    slug: page.slug.clone(),
-                },
-                predecessors: predecessors
-                    .iter()
-                    .map(|&j| old_pages[j].page_id.clone())
-                    .collect(),
-            });
-            continue;
-        }
-        // Mutual best match with the primary: the identity continues.
-        if let Some(primary) = best_old[i] {
-            if flows_to[primary] == Some(i) {
-                let identical = new_refs[i] == old_refs[primary]
-                    && page.title.trim() == old_pages[primary].title.trim()
-                    && page.category == old_pages[primary].category;
-                let entry = ContinuedPage {
-                    index: i,
-                    page_id: old_pages[primary].page_id.clone(),
-                    predecessor_id: old_pages[primary].page_id.clone(),
-                    title: page.title.clone(),
-                    slug: page.slug.clone(),
-                };
-                if identical {
-                    diff.unchanged.push(entry);
-                } else {
-                    diff.modified.push(entry);
-                }
-                continue;
-            }
-        }
-        // No old page continues this new page: brand-new knowledge placement.
-        diff.created.push(CreatedPage {
-            index: i,
-            page_id: page.id.clone(),
-            title: page.title.clone(),
-            slug: page.slug.clone(),
-        });
+        classify_new_page(
+            i,
+            page,
+            &RefSets {
+                old_refs: &old_refs,
+                new_refs: &new_refs,
+            },
+            old_pages,
+            &pass,
+            &split_primaries,
+            &mut diff,
+        );
     }
 
-    // Retired: old pages neither kept (unchanged/modified), nor merge
-    // predecessors, nor split primaries.
-    let kept: BTreeSet<WikiPageId> = diff
-        .unchanged
-        .iter()
-        .chain(&diff.modified)
-        .map(|entry| entry.predecessor_id.clone())
-        .collect();
-    let merged_predecessors: BTreeSet<WikiPageId> = diff
-        .merged
-        .iter()
-        .flat_map(|merge| merge.predecessors.iter().cloned())
-        .collect();
-    let covered_refs: BTreeSet<KnowledgeNodeId> = new_refs.iter().flatten().cloned().collect();
-    for (j, page) in old_pages.iter().enumerate() {
-        if split_primaries.contains(&j)
-            || kept.contains(&page.page_id)
-            || merged_predecessors.contains(&page.page_id)
-        {
-            continue;
-        }
-        let lost_refs = old_refs[j]
-            .iter()
-            .filter(|node_id| !covered_refs.contains(*node_id))
-            .cloned()
-            .collect();
-        diff.retired.push(RetiredPage {
-            page_id: page.page_id.clone(),
-            slug: page.slug.clone(),
-            lost_refs,
-        });
-    }
+    diff.retired = collect_retirements(old_pages, &old_refs, &new_refs, &split_primaries, &diff);
 
     diff
 }
@@ -640,161 +709,26 @@ async fn replan_inner(
     dry_run: bool,
     recovery_note: Option<String>,
 ) -> Result<ReplanReport> {
-    // ---- Scan (§8) + §19.1 ChangeSet BEFORE the upsert overwrites hashes. ----
-    let wiki_dir_rel = normalized_rel_of(root, wiki_dir);
-    let scanner = Scanner::new(
-        root,
-        &config.source.include,
-        &config.source.exclude,
-        wiki_dir_rel,
-    )?;
-    let output = scanner.scan()?;
-    for diagnostic in &output.diagnostics {
-        warn_diagnostic(diagnostic);
-    }
-    let manifest = SourceManifest::from_scanned(&output.files);
-    if let Some(build_id) = build_id {
-        llm_wiki_storage::set_build_snapshot_hash(conn, build_id, &manifest.snapshot_hash())?;
-    }
-    // Cache rows record the source snapshot hash so cross-snapshot reuse is
-    // impossible (§28) — and so the execute hits the dry-run's warm entries.
-    env.cache
-        .set_source_snapshot_hash(&manifest.snapshot_hash());
-
-    let registry_before: Vec<SourceRecord> = list_sources(conn)?;
-    let scanned_sources: Vec<ScannedSource<'_>> = output
-        .files
-        .iter()
-        .map(|file| ScannedSource {
-            locator_key: file.locator_key.as_str(),
-            content_hash: &file.content_hash,
-        })
-        .collect();
-    let registered_sources: Vec<RegisteredSource<'_>> = registry_before
-        .iter()
-        .map(|record| RegisteredSource {
-            source_id: &record.source_id,
-            locator_key: record.locator_key.as_str(),
-            content_hash: &record.content_hash,
-        })
-        .collect();
-    let (file_outcomes, deleted_ids) = diff_manifest(&scanned_sources, &registered_sources);
-
-    // ---- §19.3 deleted sources: retire knowledge, mark removed. Replan
-    // after deletion is a legitimate structural change (PRD §19.2). The
-    // retirement mutates the knowledge registry in BOTH modes — the visible
-    // wiki is only ever touched by the §35 publish of the execute. ----
-    for source_id in &deleted_ids {
-        let record = registry_before
-            .iter()
-            .find(|record| &record.source_id == source_id)
-            .ok_or_else(|| {
-                WikiError::Storage(format!(
-                    "deleted source {source_id} missing from the registry"
-                ))
-            })?;
-        let retired = retire_source_knowledge(conn, source_id, build_id.map(|b| b.as_str()))?;
-        mark_removed(conn, &record.locator_key)?;
-        tracing::info!(
-            source = %record.rel_path,
-            claims = retired.retired_claims,
-            nodes_retired = retired.retired_registry_nodes.len(),
-            "replan retired deleted source"
-        );
-    }
-
-    // ---- Registry upsert: refresh hashes/paths, mint ids for added files. ----
-    let batch: Vec<SourceUpsert> = output
-        .files
-        .iter()
-        .map(|file| SourceUpsert {
-            locator_key: &file.locator_key,
-            rel_path: &file.rel_path,
-            content_hash: &file.content_hash,
-            size: file.size as i64,
-        })
-        .collect();
-    let upserted = upsert_sources_batch(conn, &batch, build_id.map(|b| b.as_str()))?;
-    let sources = upserted.len();
-    if sources == 0 {
-        return Err(WikiError::Source(format!(
-            "no markdown sources found under {}; nothing to replan",
-            root.display()
-        )));
-    }
+    // ---- Scan (§8) + §19.1 ChangeSet + §19.3 deletions + registry upsert:
+    // identical machinery to `build`, so cache keys and the knowledge state
+    // agree across the two commands (PRD §28). ----
+    let (output, file_outcomes, _deleted_ids, upserted, sources) =
+        replan_sync_sources(conn, root, wiki_dir, build_id, env, config)?;
 
     // ---- Selective re-analysis (§19.2): added + modified sources only, so
     // the fresh plan reflects current knowledge. ----
-    let changed_files: Vec<usize> = output
-        .files
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| {
-            matches!(
-                file_outcomes[*index],
-                FileOutcome::Added | FileOutcome::Modified(_)
-            )
-        })
-        .map(|(index, _)| index)
-        .collect();
-
-    if let Some(build_id) = build_id {
-        update_build_status(conn, build_id, "PARSING")?;
-    }
-    let stage_cache: Arc<dyn crate::cache::StageCache> = env.cache.clone();
-    let mut parsed = Vec::with_capacity(changed_files.len());
-    for index in changed_files {
-        let file = &output.files[index];
-        let (source_id, _created) = upserted[index].clone();
-        let absolute = root.join(&file.rel_path);
-        let raw = std::fs::read_to_string(&absolute)
-            .map_err(|e| WikiError::Source(format!("cannot read {}: {e}", absolute.display())))?;
-        let parsed_doc = parse_document(&raw, &file.rel_path);
-        for diagnostic in &parsed_doc.diagnostics {
-            tracing::warn!(
-                source = %file.rel_path,
-                kind = ?diagnostic.kind,
-                "{}",
-                diagnostic.message
-            );
-        }
-        parsed.push((file, source_id, parsed_doc));
-    }
-
-    if let Some(build_id) = build_id {
-        update_build_status(conn, build_id, "ANALYZING")?;
-    }
-    let analyzer = DocumentAnalyzer::new(
-        provider.clone(),
-        env.analysis_prompt.clone(),
-        config.analysis.section_target_tokens,
-        config.analysis.max_rejected_claim_ratio,
+    let mut llm_request_count = replan_analyze_pending(
+        conn,
+        root,
+        build_id,
+        env,
+        config,
+        provider,
+        &output,
+        &upserted,
+        &file_outcomes,
     )
-    .with_cache(stage_cache.clone());
-    let mut llm_request_count = 0u32;
-    for (file, source_id, parsed_doc) in &parsed {
-        let sections = register_sections(conn, source_id, &parsed_doc.sections, build_id)?;
-        let doc = AnalyzedDocument {
-            source_id: source_id.clone(),
-            rel_path: file.rel_path.clone(),
-            content_hash: file.content_hash.clone(),
-            language: parsed_doc.language.clone(),
-            sections,
-        };
-        let outcome = analyzer.analyze_document(&doc, build_id).await?;
-        llm_request_count += outcome.llm_request_count;
-        crate::persist::persist_outcome(
-            conn,
-            &doc,
-            &outcome,
-            &crate::persist::PersistOptions {
-                build_id: build_id.cloned(),
-                model: Some(provider.model().to_owned()),
-                prompt_version: Some(env.prompt_version.clone()),
-                replace_source: true,
-            },
-        )?;
-    }
+    .await?;
 
     // ---- FRESH planning (§19.2 step 3): the plan-identity short-circuit is
     // DISABLED so the plan is re-derived even when the reconciliation key
@@ -804,6 +738,7 @@ async fn replan_inner(
     if let Some(build_id) = build_id {
         update_build_status(conn, build_id, "PLANNING")?;
     }
+    let stage_cache: Arc<dyn crate::cache::StageCache> = env.cache.clone();
     let (base, registry_revision) = load_plan_input(conn)?;
     let planner_config = PlannerConfig {
         hierarchical: config.planning.hierarchical,
@@ -832,51 +767,7 @@ async fn replan_inner(
     let old_pages = load_generation_view(conn, active_build)?;
     let diff = plan_diff(&old_pages, &plan_outcome.plan);
 
-    // Per-class tables for the report (identical in both modes).
-    let unchanged_pages: Vec<String> = diff
-        .unchanged
-        .iter()
-        .map(|entry| entry.slug.clone())
-        .collect();
-    let modified_pages: Vec<String> = diff
-        .modified
-        .iter()
-        .map(|entry| entry.slug.clone())
-        .collect();
-    let merged_pages: Vec<(String, Vec<String>)> = diff
-        .merged
-        .iter()
-        .map(|merge| {
-            (
-                merge.continued.slug.clone(),
-                old_slugs_of(&merge.predecessors, &old_pages),
-            )
-        })
-        .collect();
-    let split_pages: Vec<(String, Vec<String>)> = diff
-        .split
-        .iter()
-        .map(|split| {
-            (
-                split.slug.clone(),
-                plan_slugs_of(&split.successors, &plan_outcome.plan),
-            )
-        })
-        .collect();
-    let created_pages: Vec<String> = diff.created.iter().map(|page| page.slug.clone()).collect();
-    let retired_pages: Vec<(String, Vec<String>)> = diff
-        .retired
-        .iter()
-        .map(|page| {
-            (
-                page.slug.clone(),
-                page.lost_refs
-                    .iter()
-                    .map(|id| id.as_str().to_owned())
-                    .collect(),
-            )
-        })
-        .collect();
+    let tables = ReplanTables::of(&diff, old_pages.as_slice(), &plan_outcome.plan);
     let knowledge_loss_warnings = knowledge_loss_warnings(&diff);
 
     if diff.is_empty() {
@@ -888,7 +779,7 @@ async fn replan_inner(
         report.no_replan_needed = true;
         report.triggers = triggers;
         report.unchanged = diff.unchanged.len();
-        report.unchanged_pages = unchanged_pages;
+        report.unchanged_pages = tables.unchanged;
         if dry_run {
             record_dry_run_decision(conn, active_build, &report)?;
         } else if let Some(build_id) = build_id {
@@ -911,12 +802,12 @@ async fn replan_inner(
         report.split = diff.split.len();
         report.created = diff.created.len();
         report.retired = diff.retired.len();
-        report.unchanged_pages = unchanged_pages;
-        report.modified_pages = modified_pages;
-        report.merged_pages = merged_pages;
-        report.split_pages = split_pages;
-        report.created_pages = created_pages;
-        report.retired_pages = retired_pages;
+        report.unchanged_pages = tables.unchanged;
+        report.modified_pages = tables.modified;
+        report.merged_pages = tables.merged;
+        report.split_pages = tables.split;
+        report.created_pages = tables.created;
+        report.retired_pages = tables.retired;
         report.knowledge_loss_warnings = knowledge_loss_warnings;
         report.estimated_compile_llm_calls = estimated_calls;
         report.estimated_max_output_tokens = estimated_calls * u64::from(MAX_PAGE_OUTPUT_TOKENS);
@@ -933,68 +824,50 @@ async fn replan_inner(
         return Ok(report);
     }
 
-    // ---- Execute (§19.2 step 6): compile ALL non-unchanged pages, carry
-    // unchanged pages byte-identical, publish through §35. ----
-    let build_id = build_id.expect("execute mode owns a build row");
+    replan_execute(
+        conn,
+        wiki_dir,
+        active_build,
+        build_id.expect("execute mode owns a build row"),
+        env,
+        config,
+        provider,
+        diff,
+        plan_outcome.plan,
+        llm_request_count,
+        sources,
+        tables,
+        knowledge_loss_warnings,
+        recovery_note,
+    )
+    .await
+}
+
+/// Execute mode (§19.2 step 6): compile ALL non-unchanged pages, carry
+/// unchanged pages byte-identical, write the §45 page-identity map and
+/// publish through the unchanged §35 contract.
+#[allow(clippy::too_many_arguments)]
+async fn replan_execute(
+    conn: &mut rusqlite::Connection,
+    wiki_dir: &Path,
+    active_build: &BuildId,
+    build_id: &BuildId,
+    env: &PipelineEnv,
+    config: &Config,
+    provider: &Arc<dyn LlmProvider>,
+    diff: PlanDiff,
+    plan: WikiPlan,
+    mut llm_request_count: u32,
+    sources: usize,
+    tables: ReplanTables,
+    knowledge_loss_warnings: Vec<String>,
+    recovery_note: Option<String>,
+) -> Result<ReplanReport> {
     let new_kb = load_knowledge_base(conn)?;
-    let plan = &plan_outcome.plan;
-
-    // Final id per plan page: predecessors' stable ids for
-    // unchanged/modified/merge-dominant pages, fresh planner ids otherwise.
-    let mut final_ids: Vec<WikiPageId> = plan.pages.iter().map(|page| page.id.clone()).collect();
-    for entry in diff.unchanged.iter().chain(&diff.modified) {
-        final_ids[entry.index] = entry.page_id.clone();
-    }
-    for merge in &diff.merged {
-        final_ids[merge.continued.index] = merge.continued.page_id.clone();
-    }
-    let plan_id_to_final: BTreeMap<String, WikiPageId> = plan
-        .pages
-        .iter()
-        .enumerate()
-        .map(|(i, page)| (page.id.as_str().to_owned(), final_ids[i].clone()))
-        .collect();
-    let remapped_pages: Vec<WikiPagePlan> = plan
-        .pages
-        .iter()
-        .enumerate()
-        .map(|(i, page)| {
-            let mut page = page.clone();
-            page.id = final_ids[i].clone();
-            page.related_pages = page
-                .related_pages
-                .iter()
-                .map(|related| {
-                    plan_id_to_final
-                        .get(related.as_str())
-                        .cloned()
-                        .unwrap_or_else(|| related.clone())
-                })
-                .collect();
-            page
-        })
-        .collect();
-    let remapped_plan = WikiPlan {
-        pages: remapped_pages,
-    };
-
-    let mut recompile: BTreeSet<WikiPageId> = BTreeSet::new();
-    for entry in &diff.modified {
-        recompile.insert(entry.page_id.clone());
-    }
-    for merge in &diff.merged {
-        recompile.insert(merge.continued.page_id.clone());
-    }
-    for split in &diff.split {
-        for successor in &split.successors {
-            recompile.insert(successor.clone());
-        }
-    }
-    for created in &diff.created {
-        recompile.insert(created.page_id.clone());
-    }
+    let (remapped_plan, recompile) = replan_remap_plan(&diff, plan);
 
     update_build_status(conn, build_id, "COMPILING")?;
+    let stage_cache: Arc<dyn crate::cache::StageCache> = env.cache.clone();
     let compiler = WikiCompiler::new(
         provider.clone(),
         env.compilation_prompt.clone(),
@@ -1016,14 +889,168 @@ async fn replan_inner(
         )));
     }
 
-    // ---- Final page set: compiled records + carried rows copied VERBATIM
-    // from the current generation (frontmatter keeps the ORIGINAL build id;
-    // link rows are filtered to surviving pages for FK, like §19). ----
+    // Final page set: compiled records + carried rows copied VERBATIM from
+    // the current generation (frontmatter keeps the ORIGINAL build id; link
+    // rows are filtered to surviving pages for FK, like §19).
+    let new_pages = replan_assemble_pages(conn, active_build, &remapped_plan, &compiled)?;
+
+    // Decision row AFTER the final check (compile succeeded), mirroring the
+    // incremental contract (§19.2: one final judgment row per build).
+    let notes = format!(
+        "executed: {} unchanged (carried), {} modified, {} merged, {} split, {} created, {} retired; {} recompiled, {} carried",
+        diff.unchanged.len(),
+        diff.modified.len(),
+        diff.merged.len(),
+        diff.split.len(),
+        diff.created.len(),
+        diff.retired.len(),
+        recompile.len(),
+        diff.unchanged.len()
+    );
+    record_decision(
+        conn,
+        build_id,
+        None,
+        OUTCOME_REPLAN_EXECUTED,
+        None,
+        recompile.len(),
+        if knowledge_loss_warnings.is_empty() {
+            notes
+        } else {
+            format!(
+                "{notes}; knowledge-loss: {}",
+                knowledge_loss_warnings.join(" | ")
+            )
+        },
+    )?;
+
+    // Index (§31) + stable page-identity rows (§45) + publish (§35).
+    update_build_status(conn, build_id, "INDEXING")?;
+    let stats = persist_generation(conn, build_id, &new_pages)?;
+
+    // page_id_map (§45): written AFTER persist_generation so successor
+    // references resolve, BEFORE publish so a publish failure never leaves
+    // an error path after the pointer moved.
+    replan_write_map_rows(conn, build_id, &diff)?;
+
+    let published = crate::publish::publish(
+        conn,
+        wiki_dir,
+        build_id,
+        &new_pages,
+        config.build.keep_generations,
+    )?;
+
+    tracing::info!(
+        build = %build_id,
+        recompiled = recompile.len(),
+        carried = diff.unchanged.len(),
+        "replan published"
+    );
+    Ok(ReplanReport {
+        dry_run: false,
+        no_replan_needed: false,
+        triggers: collect_triggers(conn, env, &diff)?,
+        unchanged: diff.unchanged.len(),
+        modified: diff.modified.len(),
+        merged: diff.merged.len(),
+        split: diff.split.len(),
+        created: diff.created.len(),
+        retired: diff.retired.len(),
+        unchanged_pages: tables.unchanged,
+        modified_pages: tables.modified,
+        merged_pages: tables.merged,
+        split_pages: tables.split,
+        created_pages: tables.created,
+        retired_pages: tables.retired,
+        knowledge_loss_warnings,
+        estimated_compile_llm_calls: 0,
+        estimated_max_output_tokens: 0,
+        build_id: Some(build_id.clone()),
+        sources,
+        pages: stats.pages,
+        citations: stats.citations,
+        links: stats.links,
+        recompiled: recompile.len(),
+        carried: diff.unchanged.len(),
+        llm_request_count,
+        cache: env.cache.stats(),
+        published_path: Some(published.published_path),
+        recovery: recovery_note,
+    })
+}
+
+/// Final ids per plan page: predecessors' stable ids for
+/// unchanged/modified/merge-dominant pages, fresh planner ids otherwise;
+/// related-page links are remapped to the final ids.
+fn replan_remap_plan(diff: &PlanDiff, plan: WikiPlan) -> (WikiPlan, BTreeSet<WikiPageId>) {
+    let mut final_ids: Vec<WikiPageId> = plan.pages.iter().map(|page| page.id.clone()).collect();
+    for entry in diff.unchanged.iter().chain(&diff.modified) {
+        final_ids[entry.index] = entry.page_id.clone();
+    }
+    for merge in &diff.merged {
+        final_ids[merge.continued.index] = merge.continued.page_id.clone();
+    }
+    let plan_id_to_final: BTreeMap<String, WikiPageId> = plan
+        .pages
+        .iter()
+        .enumerate()
+        .map(|(i, page)| (page.id.as_str().to_owned(), final_ids[i].clone()))
+        .collect();
+    let pages: Vec<WikiPagePlan> = plan
+        .pages
+        .iter()
+        .enumerate()
+        .map(|(i, page)| {
+            let mut page = page.clone();
+            page.id = final_ids[i].clone();
+            page.related_pages = page
+                .related_pages
+                .iter()
+                .map(|related| {
+                    plan_id_to_final
+                        .get(related.as_str())
+                        .cloned()
+                        .unwrap_or_else(|| related.clone())
+                })
+                .collect();
+            page
+        })
+        .collect();
+
+    let mut recompile: BTreeSet<WikiPageId> = BTreeSet::new();
+    for entry in &diff.modified {
+        recompile.insert(entry.page_id.clone());
+    }
+    for merge in &diff.merged {
+        recompile.insert(merge.continued.page_id.clone());
+    }
+    for split in &diff.split {
+        for successor in &split.successors {
+            recompile.insert(successor.clone());
+        }
+    }
+    for created in &diff.created {
+        recompile.insert(created.page_id.clone());
+    }
+    (WikiPlan { pages }, recompile)
+}
+
+/// Final page set: compiled records + unchanged rows carried VERBATIM from
+/// the current generation (frontmatter keeps the ORIGINAL build id; link
+/// rows are filtered to surviving pages for FK, like §19).
+fn replan_assemble_pages(
+    conn: &rusqlite::Connection,
+    active_build: &BuildId,
+    remapped_plan: &WikiPlan,
+    compiled: &crate::compile::CompiledGeneration,
+) -> Result<Vec<WikiPageRecord>> {
     let compiled_by_id: BTreeMap<String, &WikiPageRecord> = compiled
         .pages
         .iter()
         .map(|page| (page.page_id.as_str().to_owned(), page))
         .collect();
+    let old_pages = load_generation_view(conn, active_build)?;
     let carried_by_id: BTreeMap<String, &GenerationPageView> = old_pages
         .iter()
         .map(|page| (page.page_id.as_str().to_owned(), page))
@@ -1032,7 +1059,11 @@ async fn replan_inner(
         .into_iter()
         .map(|page| (page.page_id.as_str().to_owned(), page.language))
         .collect();
-    let surviving: BTreeSet<WikiPageId> = final_ids.iter().cloned().collect();
+    let surviving: BTreeSet<WikiPageId> = remapped_plan
+        .pages
+        .iter()
+        .map(|page| page.id.clone())
+        .collect();
 
     let mut new_pages: Vec<WikiPageRecord> = Vec::with_capacity(remapped_plan.pages.len());
     let mut slugs: BTreeSet<String> = BTreeSet::new();
@@ -1080,44 +1111,18 @@ async fn replan_inner(
             "every page was retired by the replan; refusing to publish an empty generation".into(),
         ));
     }
+    Ok(new_pages)
+}
 
-    // ---- Decision row AFTER the final check (compile succeeded), mirroring
-    // the incremental contract (§19.2: one final judgment row per build). ----
-    let notes = format!(
-        "executed: {} unchanged (carried), {} modified, {} merged, {} split, {} created, {} retired; {} recompiled, {} carried",
-        diff.unchanged.len(),
-        diff.modified.len(),
-        diff.merged.len(),
-        diff.split.len(),
-        diff.created.len(),
-        diff.retired.len(),
-        recompile.len(),
-        diff.unchanged.len()
-    );
-    record_decision(
-        conn,
-        build_id,
-        None,
-        OUTCOME_REPLAN_EXECUTED,
-        None,
-        recompile.len(),
-        if knowledge_loss_warnings.is_empty() {
-            notes
-        } else {
-            format!(
-                "{notes}; knowledge-loss: {}",
-                knowledge_loss_warnings.join(" | ")
-            )
-        },
-    )?;
-
-    // ---- Index (§31) + stable page-identity rows (§45) + publish (§35). ----
-    update_build_status(conn, build_id, "INDEXING")?;
-    let stats = persist_generation(conn, build_id, &new_pages)?;
-
-    // page_id_map (§45): written AFTER persist_generation so successor
-    // references resolve, BEFORE publish so a publish failure never leaves
-    // an error path after the pointer moved.
+/// §45 page-identity rows: keep / merge (dominant-first, pred == succ) /
+/// split / retire — written AFTER persist_generation so successor references
+/// resolve, BEFORE publish so a publish failure never leaves an error path
+/// after the pointer moved.
+fn replan_write_map_rows(
+    conn: &mut rusqlite::Connection,
+    build_id: &BuildId,
+    diff: &PlanDiff,
+) -> Result<()> {
     let mut map_rows: Vec<PageIdMapRow> = Vec::new();
     for entry in diff.unchanged.iter().chain(&diff.modified) {
         map_rows.push(PageIdMapRow {
@@ -1162,52 +1167,244 @@ async fn replan_inner(
         });
     }
     insert_page_id_maps(conn, &map_rows)?;
+    Ok(())
+}
 
-    let published = crate::publish::publish(
-        conn,
-        wiki_dir,
-        build_id,
-        &new_pages,
-        config.build.keep_generations,
+/// Scan (§8) + §19.1 ChangeSet (BEFORE the upsert overwrites hashes) +
+/// §19.3 deletions + registry upsert. The retirement mutates the knowledge
+/// registry in BOTH modes — the visible wiki is only ever touched by the
+/// §35 publish of the execute (PRD §19.2).
+#[allow(clippy::type_complexity)]
+fn replan_sync_sources(
+    conn: &mut rusqlite::Connection,
+    root: &Path,
+    wiki_dir: &Path,
+    build_id: Option<&BuildId>,
+    env: &PipelineEnv,
+    config: &Config,
+) -> Result<(
+    ScanOutput,
+    Vec<FileOutcome>,
+    Vec<SourceId>,
+    Vec<(SourceId, bool)>,
+    usize,
+)> {
+    let wiki_dir_rel = normalized_rel_of(root, wiki_dir);
+    let scanner = Scanner::new(
+        root,
+        &config.source.include,
+        &config.source.exclude,
+        wiki_dir_rel,
     )?;
+    let output = scanner.scan()?;
+    for diagnostic in &output.diagnostics {
+        warn_diagnostic(diagnostic);
+    }
+    let manifest = SourceManifest::from_scanned(&output.files);
+    if let Some(build_id) = build_id {
+        llm_wiki_storage::set_build_snapshot_hash(conn, build_id, &manifest.snapshot_hash())?;
+    }
+    // Cache rows record the source snapshot hash so cross-snapshot reuse is
+    // impossible (§28) — and so the execute hits the dry-run's warm entries.
+    env.cache
+        .set_source_snapshot_hash(&manifest.snapshot_hash());
 
-    tracing::info!(
-        build = %build_id,
-        recompiled = recompile.len(),
-        carried = diff.unchanged.len(),
-        "replan published"
-    );
-    Ok(ReplanReport {
-        dry_run: false,
-        no_replan_needed: false,
-        triggers: collect_triggers(conn, env, &diff)?,
-        unchanged: diff.unchanged.len(),
-        modified: diff.modified.len(),
-        merged: diff.merged.len(),
-        split: diff.split.len(),
-        created: diff.created.len(),
-        retired: diff.retired.len(),
-        unchanged_pages,
-        modified_pages,
-        merged_pages,
-        split_pages,
-        created_pages,
-        retired_pages,
-        knowledge_loss_warnings,
-        estimated_compile_llm_calls: 0,
-        estimated_max_output_tokens: 0,
-        build_id: Some(build_id.clone()),
-        sources,
-        pages: stats.pages,
-        citations: stats.citations,
-        links: stats.links,
-        recompiled: recompile.len(),
-        carried: diff.unchanged.len(),
-        llm_request_count,
-        cache: env.cache.stats(),
-        published_path: Some(published.published_path),
-        recovery: recovery_note,
-    })
+    let registry_before: Vec<SourceRecord> = list_sources(conn)?;
+    let scanned_sources: Vec<ScannedSource<'_>> = output
+        .files
+        .iter()
+        .map(|file| ScannedSource {
+            locator_key: file.locator_key.as_str(),
+            content_hash: &file.content_hash,
+        })
+        .collect();
+    let registered_sources: Vec<RegisteredSource<'_>> = registry_before
+        .iter()
+        .map(|record| RegisteredSource {
+            source_id: &record.source_id,
+            locator_key: record.locator_key.as_str(),
+            content_hash: &record.content_hash,
+        })
+        .collect();
+    let (file_outcomes, deleted_ids) = diff_manifest(&scanned_sources, &registered_sources);
+
+    // §19.3 deleted sources: replan after deletion is a legitimate
+    // structural change (PRD §19.2).
+    for source_id in &deleted_ids {
+        let record = registry_before
+            .iter()
+            .find(|record| &record.source_id == source_id)
+            .ok_or_else(|| {
+                WikiError::Storage(format!(
+                    "deleted source {source_id} missing from the registry"
+                ))
+            })?;
+        let retired = retire_source_knowledge(conn, source_id, build_id.map(|b| b.as_str()))?;
+        mark_removed(conn, &record.locator_key)?;
+        tracing::info!(
+            source = %record.rel_path,
+            claims = retired.retired_claims,
+            nodes_retired = retired.retired_registry_nodes.len(),
+            "replan retired deleted source"
+        );
+    }
+
+    // Registry upsert: refresh hashes/paths, mint ids for added files.
+    let batch: Vec<SourceUpsert> = output
+        .files
+        .iter()
+        .map(|file| SourceUpsert {
+            locator_key: &file.locator_key,
+            rel_path: &file.rel_path,
+            content_hash: &file.content_hash,
+            size: file.size as i64,
+        })
+        .collect();
+    let upserted = upsert_sources_batch(conn, &batch, build_id.map(|b| b.as_str()))?;
+    let sources = upserted.len();
+    if sources == 0 {
+        return Err(WikiError::Source(format!(
+            "no markdown sources found under {}; nothing to replan",
+            root.display()
+        )));
+    }
+    Ok((output, file_outcomes, deleted_ids, upserted, sources))
+}
+
+/// Selective re-analysis (§19.2): added + modified sources only, so the
+/// fresh plan reflects current knowledge. Returns the LLM requests spent.
+#[allow(clippy::too_many_arguments)]
+async fn replan_analyze_pending(
+    conn: &mut rusqlite::Connection,
+    root: &Path,
+    build_id: Option<&BuildId>,
+    env: &PipelineEnv,
+    config: &Config,
+    provider: &Arc<dyn LlmProvider>,
+    output: &ScanOutput,
+    upserted: &[(SourceId, bool)],
+    file_outcomes: &[FileOutcome],
+) -> Result<u32> {
+    let changed_files: Vec<usize> = output
+        .files
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            matches!(
+                file_outcomes[*index],
+                FileOutcome::Added | FileOutcome::Modified(_)
+            )
+        })
+        .map(|(index, _)| index)
+        .collect();
+
+    if let Some(build_id) = build_id {
+        update_build_status(conn, build_id, "PARSING")?;
+    }
+    let stage_cache: Arc<dyn crate::cache::StageCache> = env.cache.clone();
+    let mut parsed = Vec::with_capacity(changed_files.len());
+    for index in changed_files {
+        let file = &output.files[index];
+        let (source_id, _created) = upserted[index].clone();
+        let absolute = root.join(&file.rel_path);
+        let raw = std::fs::read_to_string(&absolute)
+            .map_err(|e| WikiError::Source(format!("cannot read {}: {e}", absolute.display())))?;
+        let parsed_doc = parse_document(&raw, &file.rel_path);
+        for diagnostic in &parsed_doc.diagnostics {
+            tracing::warn!(
+                source = %file.rel_path,
+                kind = ?diagnostic.kind,
+                "{}",
+                diagnostic.message
+            );
+        }
+        parsed.push((file, source_id, parsed_doc));
+    }
+
+    if let Some(build_id) = build_id {
+        update_build_status(conn, build_id, "ANALYZING")?;
+    }
+    let analyzer = DocumentAnalyzer::new(
+        provider.clone(),
+        env.analysis_prompt.clone(),
+        config.analysis.section_target_tokens,
+        config.analysis.max_rejected_claim_ratio,
+    )
+    .with_cache(stage_cache);
+    let mut llm_request_count = 0u32;
+    for (file, source_id, parsed_doc) in &parsed {
+        let sections = register_sections(conn, source_id, &parsed_doc.sections, build_id)?;
+        let doc = AnalyzedDocument {
+            source_id: source_id.clone(),
+            rel_path: file.rel_path.clone(),
+            content_hash: file.content_hash.clone(),
+            language: parsed_doc.language.clone(),
+            sections,
+        };
+        let outcome = analyzer.analyze_document(&doc, build_id).await?;
+        llm_request_count += outcome.llm_request_count;
+        crate::persist::persist_outcome(
+            conn,
+            &doc,
+            &outcome,
+            &crate::persist::PersistOptions {
+                build_id: build_id.cloned(),
+                model: Some(provider.model().to_owned()),
+                prompt_version: Some(env.prompt_version.clone()),
+                replace_source: true,
+            },
+        )?;
+    }
+    Ok(llm_request_count)
+}
+
+/// Per-class page tables for the dry-run/execute reports (identical in both
+/// modes): slugs only, deterministic order.
+struct ReplanTables {
+    unchanged: Vec<String>,
+    modified: Vec<String>,
+    merged: Vec<(String, Vec<String>)>,
+    split: Vec<(String, Vec<String>)>,
+    created: Vec<String>,
+    retired: Vec<(String, Vec<String>)>,
+}
+
+impl ReplanTables {
+    fn of(diff: &PlanDiff, old_pages: &[GenerationPageView], plan: &WikiPlan) -> Self {
+        Self {
+            unchanged: diff.unchanged.iter().map(|e| e.slug.clone()).collect(),
+            modified: diff.modified.iter().map(|e| e.slug.clone()).collect(),
+            merged: diff
+                .merged
+                .iter()
+                .map(|merge| {
+                    (
+                        merge.continued.slug.clone(),
+                        old_slugs_of(&merge.predecessors, old_pages),
+                    )
+                })
+                .collect(),
+            split: diff
+                .split
+                .iter()
+                .map(|split| (split.slug.clone(), plan_slugs_of(&split.successors, plan)))
+                .collect(),
+            created: diff.created.iter().map(|page| page.slug.clone()).collect(),
+            retired: diff
+                .retired
+                .iter()
+                .map(|page| {
+                    (
+                        page.slug.clone(),
+                        page.lost_refs
+                            .iter()
+                            .map(|id| id.as_str().to_owned())
+                            .collect(),
+                    )
+                })
+                .collect(),
+        }
+    }
 }
 
 fn old_slugs_of(ids: &[WikiPageId], old_pages: &[GenerationPageView]) -> Vec<String> {

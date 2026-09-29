@@ -331,6 +331,7 @@ fn build(workspace: &Path, root_override: Option<&str>) -> Result<(), WikiError>
     Ok(())
 }
 
+/// Length note: ~91 lines — report formatting only (linear println branches over ReplanReport fields), no nesting.
 /// `llm-wiki replan [--dry-run]` (PRD §29/§19.2): thin transport over the
 /// compiler's replan service.
 fn replan(workspace: &Path, dry_run: bool) -> Result<(), WikiError> {
@@ -340,6 +341,7 @@ fn replan(workspace: &Path, dry_run: bool) -> Result<(), WikiError> {
 
     if dry_run {
         println!("replan --dry-run: auditing the global plan change (no compile, no publish)");
+        println!("  note: pending source changes are analyzed and the knowledge registry is updated; the published wiki is not touched");
     } else {
         println!("replan: fresh planning + stable-ID plan diff + recompile of every changed page");
     }
@@ -581,6 +583,7 @@ fn check_publish_state(
     }
 }
 
+/// Length note: ~91 lines — a flat check list (config/root/db/fts/journal), each check one report() call.
 fn doctor(workspace: &Path) -> Result<(), WikiError> {
     let config = load_config(workspace)?;
     let mut failures = 0usize;

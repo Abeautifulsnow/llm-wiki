@@ -64,11 +64,9 @@ pub enum MappingDecision {
     },
 }
 
-/// Runs the fixed-order mapping attempt over the inputs (PRD §19.2).
-pub fn map_incremental_change(input: &MappingInput) -> MappingDecision {
-    // ---- Fixed order, step 1: registry IDs + existing knowledge_refs. ----
-    // Nodes whose support is gone: deletion-retired nodes plus nodes a
-    // MODIFIED source no longer supports after re-analysis.
+/// Nodes whose support is gone: deletion-retired nodes plus nodes a MODIFIED
+/// source no longer supports after re-analysis (§19.2 fixed order, step 1).
+fn compute_gone_nodes(input: &MappingInput) -> BTreeSet<KnowledgeNodeId> {
     let mut gone: BTreeSet<KnowledgeNodeId> = input.deletion_gone.clone();
     for (source_id, pre) in &input.modified_pre {
         let Some(post) = input.changed_post.get(source_id) else {
@@ -81,6 +79,126 @@ pub fn map_incremental_change(input: &MappingInput) -> MappingDecision {
             }
         }
     }
+    gone
+}
+
+/// Previous page ownership, from the published citations: a page owns
+/// (source, section) when it cites a claim of that source anchored in that
+/// section. First page (by id) wins — page assignment of a node is unique, so
+/// ties cannot arise from well-formed generations.
+fn collect_ownership(
+    input: &MappingInput,
+) -> (
+    BTreeMap<(SourceId, SectionId), WikiPageId>,
+    BTreeMap<SourceId, WikiPageId>,
+) {
+    let mut section_owner: BTreeMap<(SourceId, SectionId), WikiPageId> = BTreeMap::new();
+    let mut source_owner: BTreeMap<SourceId, WikiPageId> = BTreeMap::new();
+    let mut pages_by_id: BTreeMap<&WikiPageId, &GenerationPageView> = BTreeMap::new();
+    for page in &input.prev_pages {
+        pages_by_id.insert(&page.page_id, page);
+    }
+    for page in pages_by_id.values() {
+        for citation in &page.citations {
+            source_owner
+                .entry(citation.source_id.clone())
+                .or_insert_with(|| page.page_id.clone());
+            if let Some(section_id) = &citation.section_id {
+                section_owner
+                    .entry((citation.source_id.clone(), section_id.clone()))
+                    .or_insert_with(|| page.page_id.clone());
+            }
+        }
+    }
+    (section_owner, source_owner)
+}
+
+/// What the per-candidate classification decided for one previous page.
+enum PageOutcome {
+    /// Zero refs left after DELETION-only losses (§19.3.5): dropped from the
+    /// new generation entirely.
+    Obsolete,
+    /// Recompile with these updated refs (previous refs minus unsupported
+    /// nodes, plus the absorbed ones).
+    Recompile { refs: Vec<KnowledgeNodeId> },
+    /// The change cannot be localized — stop at REPLAN_REQUIRED.
+    ReplanRequired {
+        trigger: &'static str,
+        reason: String,
+    },
+}
+
+/// Classifies one candidate page: drop unsupported refs, absorb the new
+/// nodes, then enforce the §19.3.5 obsolete rule and the §19.2 cluster-
+/// membership guard (every surviving page keeps its previous top-level
+/// source directories).
+fn classify_candidate(
+    page: &GenerationPageView,
+    input: &MappingInput,
+    gone: &BTreeSet<KnowledgeNodeId>,
+    absorbed: &mut BTreeMap<WikiPageId, Vec<KnowledgeNodeId>>,
+) -> PageOutcome {
+    let mut refs: Vec<KnowledgeNodeId> = page
+        .knowledge_refs
+        .iter()
+        .filter(|node_id| !gone.contains(node_id) && input.new_kb.nodes.contains_key(*node_id))
+        .cloned()
+        .collect();
+    let absorbed_refs = absorbed.remove(&page.page_id).unwrap_or_default();
+    refs.extend(absorbed_refs);
+
+    if refs.is_empty() {
+        // §19.3.5: a page emptied by DELETION-only losses becomes obsolete. A
+        // page emptied because a MODIFIED source's knowledge moved away is a
+        // structural outcome the plan must own: `page-emptied` (§19.2), never
+        // a silent drop.
+        let deletion_only = page.knowledge_refs.iter().all(|node_id| {
+            if gone.contains(node_id) {
+                // Classify the loss: deleted-source retirement (allowed to
+                // empty a page) vs re-analysis replacement (replan).
+                input.deletion_gone.contains(node_id)
+            } else {
+                // Dropped only because the node is missing from the new
+                // knowledge base entirely — an external anomaly, treated
+                // conservatively as NOT deletion-caused.
+                input.new_kb.nodes.contains_key(node_id)
+            }
+        });
+        return if deletion_only {
+            PageOutcome::Obsolete
+        } else {
+            PageOutcome::ReplanRequired {
+                trigger: TRIGGER_PAGE_EMPTIED,
+                reason: format!(
+                    "page '{}' (id {}) lost all of its knowledge because a changed source no longer supports it",
+                    page.title, page.page_id
+                ),
+            }
+        };
+    }
+
+    // ---- Cluster membership (§19.2): every surviving page keeps its
+    // previous top-level source directories. ----
+    let prev_dirs = top_level_dirs(&page.knowledge_refs, &input.prev_kb);
+    let new_dirs = top_level_dirs(&refs, &input.new_kb);
+    if !new_dirs.is_subset(&prev_dirs) {
+        let intruders: Vec<String> = new_dirs.difference(&prev_dirs).cloned().collect();
+        return PageOutcome::ReplanRequired {
+            trigger: TRIGGER_STRUCTURAL_CHANGE,
+            reason: format!(
+                "page '{}' would start mixing knowledge from source directories {intruders:?} it never covered; cluster boundaries changed",
+                page.title
+            ),
+        };
+    }
+
+    PageOutcome::Recompile { refs }
+}
+
+/// Runs the fixed-order mapping attempt over the inputs (PRD §19.2).
+pub fn map_incremental_change(input: &MappingInput) -> MappingDecision {
+    // ---- Fixed order, step 1: registry IDs + existing knowledge_refs. ----
+    let gone = compute_gone_nodes(input);
 
     // ---- Brand-new nodes of changed sources that need a page. A node that
     // already existed in the previous knowledge base keeps its existing page
@@ -99,33 +217,11 @@ pub fn map_incremental_change(input: &MappingInput) -> MappingDecision {
         }
     }
 
-    // ---- Previous page ownership, from the published citations: a page
-    // owns (source, section) when it cites a claim of that source anchored
-    // in that section. First page (by id) wins — page assignment of a node is
-    // unique, so ties cannot arise from well-formed generations. ----
-    let mut pages_by_id: BTreeMap<&WikiPageId, &GenerationPageView> = BTreeMap::new();
-    for page in &input.prev_pages {
-        pages_by_id.insert(&page.page_id, page);
-    }
-    let mut section_owner: BTreeMap<(SourceId, SectionId), WikiPageId> = BTreeMap::new();
-    let mut source_owner: BTreeMap<SourceId, WikiPageId> = BTreeMap::new();
-    for page in pages_by_id.values() {
-        for citation in &page.citations {
-            source_owner
-                .entry(citation.source_id.clone())
-                .or_insert_with(|| page.page_id.clone());
-            if let Some(section_id) = &citation.section_id {
-                section_owner
-                    .entry((citation.source_id.clone(), section_id.clone()))
-                    .or_insert_with(|| page.page_id.clone());
-            }
-        }
-    }
-
     // ---- Candidate pages (PRD §19.2): pages owning affected nodes (their
     // refs contain a `gone` node) plus pages that previously cited a MODIFIED
     // source (they must absorb its new nodes). Added sources have no previous
     // owner — their brand-new nodes fail the mapping below. ----
+    let (section_owner, source_owner) = collect_ownership(input);
     let mut candidates: BTreeSet<WikiPageId> = BTreeSet::new();
     for page in &input.prev_pages {
         let refs_gone = page
@@ -170,72 +266,27 @@ pub fn map_incremental_change(input: &MappingInput) -> MappingDecision {
         }
     }
 
-    // ---- Per-candidate updated refs: drop unsupported nodes, append the
-    // absorbed ones (deterministic order: previous order first, absorbed
-    // sorted). ----
-    let mut updated_refs: BTreeMap<WikiPageId, Vec<KnowledgeNodeId>> = BTreeMap::new();
+    // ---- Per-candidate classification (deterministic order: previous
+    // order first, absorbed sorted). ----
     let mut obsolete: BTreeSet<WikiPageId> = BTreeSet::new();
     let mut recompile: BTreeSet<WikiPageId> = BTreeSet::new();
+    let mut updated_refs: BTreeMap<WikiPageId, Vec<KnowledgeNodeId>> = BTreeMap::new();
     for page in &input.prev_pages {
         if !candidates.contains(&page.page_id) {
             continue;
         }
-        let mut refs: Vec<KnowledgeNodeId> = page
-            .knowledge_refs
-            .iter()
-            .filter(|node_id| !gone.contains(node_id) && input.new_kb.nodes.contains_key(*node_id))
-            .cloned()
-            .collect();
-        let absorbed_refs = absorbed.remove(&page.page_id).unwrap_or_default();
-        refs.extend(absorbed_refs);
-
-        if refs.is_empty() {
-            // §19.3.5: a page emptied by DELETION-only losses becomes
-            // obsolete. A page emptied because a MODIFIED source's knowledge
-            // moved away is a structural outcome the plan must own:
-            // `page-emptied` (§19.2), never a silent drop.
-            let deletion_only = page.knowledge_refs.iter().all(|node_id| {
-                if gone.contains(node_id) {
-                    // Classify the loss: deleted-source retirement (allowed
-                    // to empty a page) vs re-analysis replacement (replan).
-                    input.deletion_gone.contains(node_id)
-                } else {
-                    // Dropped only because the node is missing from the new
-                    // knowledge base entirely — an external anomaly, treated
-                    // conservatively as NOT deletion-caused.
-                    input.new_kb.nodes.contains_key(node_id)
-                }
-            });
-            if deletion_only {
+        match classify_candidate(page, input, &gone, &mut absorbed) {
+            PageOutcome::Obsolete => {
                 obsolete.insert(page.page_id.clone());
-                continue;
             }
-            return MappingDecision::ReplanRequired {
-                trigger: TRIGGER_PAGE_EMPTIED,
-                reason: format!(
-                    "page '{}' (id {}) lost all of its knowledge because a changed source no longer supports it",
-                    page.title, page.page_id
-                ),
-            };
+            PageOutcome::Recompile { refs } => {
+                recompile.insert(page.page_id.clone());
+                updated_refs.insert(page.page_id.clone(), refs);
+            }
+            PageOutcome::ReplanRequired { trigger, reason } => {
+                return MappingDecision::ReplanRequired { trigger, reason };
+            }
         }
-
-        // ---- Cluster membership (§19.2): every surviving page keeps its
-        // previous top-level source directories. ----
-        let prev_dirs = top_level_dirs(&page.knowledge_refs, &input.prev_kb);
-        let new_dirs = top_level_dirs(&refs, &input.new_kb);
-        if !new_dirs.is_subset(&prev_dirs) {
-            let intruders: Vec<String> = new_dirs.difference(&prev_dirs).cloned().collect();
-            return MappingDecision::ReplanRequired {
-                trigger: TRIGGER_STRUCTURAL_CHANGE,
-                reason: format!(
-                    "page '{}' would start mixing knowledge from source directories {intruders:?} it never covered; cluster boundaries changed",
-                    page.title
-                ),
-            };
-        }
-
-        recompile.insert(page.page_id.clone());
-        updated_refs.insert(page.page_id.clone(), refs);
     }
 
     // Absorption targets are always candidate pages (a page can only own a

@@ -145,6 +145,7 @@ impl WikiPlanner {
         }
     }
 
+    /// Length note: ~94 lines — the three-layer stage scheduler (summary → local → reconcile), symmetric with plan_flat and driven by PlanCacheKeys.
     async fn plan_hierarchical(
         &self,
         base: &KnowledgeBase,
@@ -434,6 +435,7 @@ impl WikiPlanner {
             .await
     }
 
+    /// Length note: ~85 lines — one shape→repair→re-validate round with its failure accounting; the repair call must stay adjacent to the validation that judged it.
     /// Shape → referential/semantic round with exactly one repair carrying
     /// machine-readable reasons (PRD §11/§28). Whichever stage fails first
     /// consumes the single repair budget; the repaired response is validated

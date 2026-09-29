@@ -168,6 +168,143 @@ const SUMMARY_MARK: &str = "Summarize the following cluster";
 const LOCAL_MARK: &str = "THIS cluster's knowledge";
 const RECONCILE_MARK: &str = "final global wiki plan";
 
+/// Analysis stage: annotated spans in each section become claims quoting
+/// them verbatim; sections without any fall back to their first non-empty
+/// line (still source-backed, so evidence validation passes by construction).
+fn eval_analysis_response(
+    prompt: &str,
+    span_to_page: &BTreeMap<String, Vec<String>>,
+) -> Result<String, LlmError> {
+    let section_ids = json_string_values(prompt, "section_id");
+    let contents = json_string_values(prompt, "content");
+    let mut claims: Vec<serde_json::Value> = Vec::new();
+    for (section_id, content) in section_ids.iter().zip(contents.iter()) {
+        let mut quoted = false;
+        for line in content.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            if span_to_page.contains_key(line) {
+                claims.push(serde_json::json!({
+                    "text": line,
+                    "section_id": section_id,
+                    "evidence_text": line,
+                    "evidence_start": content.find(line).unwrap_or(0),
+                    "confidence": 0.95,
+                }));
+                quoted = true;
+            }
+        }
+        if !quoted {
+            if let Some(first) = content.lines().map(str::trim).find(|line| !line.is_empty()) {
+                claims.push(serde_json::json!({
+                    "text": first,
+                    "section_id": section_id,
+                    "evidence_text": first,
+                    "evidence_start": content.find(first).unwrap_or(0),
+                    "confidence": 0.9,
+                }));
+            }
+        }
+    }
+    Ok(serde_json::json!({
+        "summary": "Deterministic eval analysis.",
+        "topics": ["eval"],
+        "entities": [],
+        "concepts": [],
+        "claims": claims,
+        "relations": [],
+    })
+    .to_string())
+}
+
+/// Groups node ids into pages by their recorded titles (a claim lands on
+/// EVERY page its span belongs to — shared docs feed multiple expected
+/// pages). Ids without a recorded title land on the catch-all page.
+fn group_by_titles(
+    ids: &[String],
+    id_to_page: &BTreeMap<String, Vec<String>>,
+) -> serde_json::Value {
+    let mut by_page: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for id in ids {
+        let titles = id_to_page
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| vec!["Eval Platform".to_owned()]);
+        for title in titles {
+            let refs = by_page.entry(title).or_default();
+            if !refs.contains(id) {
+                refs.push(id.clone());
+            }
+        }
+    }
+    let pages: Vec<serde_json::Value> = by_page
+        .into_iter()
+        .map(|(title, refs)| {
+            serde_json::json!({
+                "title": title,
+                "category": "concepts",
+                "purpose": "cover the eval corpus knowledge",
+                "knowledge_refs": refs,
+            })
+        })
+        .collect();
+    serde_json::json!({ "pages": pages })
+}
+
+/// Planning stage: SUMMARY records the id→titles grouping, LOCAL proposes
+/// per-cluster pages, RECONCILE re-groups the accumulated proposals.
+fn eval_planning_response(
+    prompt: &str,
+    span_to_page: &BTreeMap<String, Vec<String>>,
+    id_to_page: &Mutex<BTreeMap<String, Vec<String>>>,
+    proposed: &Mutex<Vec<String>>,
+) -> Result<String, LlmError> {
+    if prompt.contains(SUMMARY_MARK) {
+        // Summary payload: nodes with id/kind/name/statement — record the
+        // page grouping for every claim span.
+        let ids = json_string_values(prompt, "id");
+        let statements = json_string_values(prompt, "statement");
+        let mut map = id_to_page.lock().unwrap();
+        for (id, statement) in ids.into_iter().zip(statements) {
+            if let Some(titles) = span_to_page.get(&statement) {
+                for title in titles {
+                    map.entry(id.clone()).or_default().push(title.clone());
+                }
+            }
+        }
+        return Ok(serde_json::json!({"summary": "cluster of eval corpus knowledge"}).to_string());
+    }
+    if prompt.contains(LOCAL_MARK) {
+        let ids = kn_ids_in(prompt);
+        proposed.lock().unwrap().extend(ids.iter().cloned());
+        let map = id_to_page.lock().unwrap();
+        return Ok(group_by_titles(&ids, &map).to_string());
+    }
+    if prompt.contains(RECONCILE_MARK) {
+        let ids = proposed.lock().unwrap().clone();
+        let map = id_to_page.lock().unwrap();
+        return Ok(group_by_titles(&ids, &map).to_string());
+    }
+    Err(LlmError::Api {
+        code: 500,
+        message: "unrecognized planning stage".into(),
+    })
+}
+
+/// Compilation stage: the body carries every claim's VERBATIM statement
+/// (the annotated corpus spans, CJK included) before the cite comments —
+/// the full-text baseline the V0.2 FTS gates retrieve (PRD §20/§37.4).
+fn eval_compilation_response(prompt: &str) -> Result<String, LlmError> {
+    let claims = claim_ids_in(prompt);
+    let statements = json_string_values(prompt, "statement");
+    let mut body = String::from("## Overview\n\nThe eval page cites its claims.\n");
+    for statement in &statements {
+        body.push_str(&format!("\n{statement}\n"));
+    }
+    for id in &claims {
+        body.push_str(&format!("\n<!-- llm-wiki:cite claim=\"{id}\" -->\n"));
+    }
+    Ok(serde_json::json!({ "markdown": body }).to_string())
+}
+
 /// Builds the eval FakeLlmProvider. Grouping requires the fixture data; the
 /// provider records claim id → page title at the SUMMARY stage (statements
 /// are spans) and reuses that map at LOCAL/RECONCILE.
@@ -179,155 +316,13 @@ pub fn eval_llm(dataset: &Dataset, expected: &ExpectedPages) -> Arc<dyn LlmProvi
     // Node ids proposed by LOCAL stages; the RECONCILE payload carries no
     // node ids, so reconciliation groups this accumulated set.
     let proposed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    // statement → id observed at summary time is unnecessary: the summary
-    // payload carries node id + statement, so resolve directly.
     let handler = Arc::new(move |request: &LlmRequest| -> Result<String, LlmError> {
-        let prompt = &request.prompt;
         match request.task_tag.as_str() {
-            "document-analysis" => {
-                let section_ids = json_string_values(prompt, "section_id");
-                let contents = json_string_values(prompt, "content");
-                let mut claims: Vec<serde_json::Value> = Vec::new();
-                for (section_id, content) in section_ids.iter().zip(contents.iter()) {
-                    // Annotated spans in this section become claims quoting
-                    // them verbatim; sections without any fall back to their
-                    // first non-empty line (still source-backed).
-                    let mut quoted = false;
-                    for line in content.lines().map(str::trim).filter(|l| !l.is_empty()) {
-                        if span_to_page.contains_key(line) {
-                            claims.push(serde_json::json!({
-                                "text": line,
-                                "section_id": section_id,
-                                "evidence_text": line,
-                                "evidence_start": content.find(line).unwrap_or(0),
-                                "confidence": 0.95,
-                            }));
-                            quoted = true;
-                        }
-                    }
-                    if !quoted {
-                        if let Some(first) =
-                            content.lines().map(str::trim).find(|line| !line.is_empty())
-                        {
-                            claims.push(serde_json::json!({
-                                "text": first,
-                                "section_id": section_id,
-                                "evidence_text": first,
-                                "evidence_start": content.find(first).unwrap_or(0),
-                                "confidence": 0.9,
-                            }));
-                        }
-                    }
-                }
-                Ok(serde_json::json!({
-                    "summary": "Deterministic eval analysis.",
-                    "topics": ["eval"],
-                    "entities": [],
-                    "concepts": [],
-                    "claims": claims,
-                    "relations": [],
-                })
-                .to_string())
-            }
+            "document-analysis" => eval_analysis_response(&request.prompt, &span_to_page),
             "wiki-planning" => {
-                if prompt.contains(SUMMARY_MARK) {
-                    // Summary payload: nodes with id/kind/name/statement —
-                    // record the page grouping for every claim span.
-                    let ids = json_string_values(prompt, "id");
-                    let statements = json_string_values(prompt, "statement");
-                    let mut map = id_to_page.lock().unwrap();
-                    for (id, statement) in ids.into_iter().zip(statements) {
-                        if let Some(titles) = span_to_page.get(&statement) {
-                            for title in titles {
-                                map.entry(id.clone()).or_default().push(title.clone());
-                            }
-                        }
-                    }
-                    return Ok(
-                        serde_json::json!({"summary": "cluster of eval corpus knowledge"})
-                            .to_string(),
-                    );
-                }
-                if prompt.contains(LOCAL_MARK) {
-                    let ids = kn_ids_in(prompt);
-                    proposed.lock().unwrap().extend(ids.iter().cloned());
-                    let map = id_to_page.lock().unwrap();
-                    let mut by_page: BTreeMap<String, Vec<String>> = BTreeMap::new();
-                    for id in &ids {
-                        let titles = map
-                            .get(id)
-                            .cloned()
-                            .unwrap_or_else(|| vec!["Eval Platform".to_owned()]);
-                        for title in titles {
-                            let refs = by_page.entry(title).or_default();
-                            if !refs.contains(id) {
-                                refs.push(id.clone());
-                            }
-                        }
-                    }
-                    let pages: Vec<serde_json::Value> = by_page
-                        .into_iter()
-                        .map(|(title, refs)| {
-                            serde_json::json!({
-                                "title": title,
-                                "category": "concepts",
-                                "purpose": "cover the eval corpus knowledge",
-                                "knowledge_refs": refs,
-                            })
-                        })
-                        .collect();
-                    return Ok(serde_json::json!({ "pages": pages }).to_string());
-                }
-                if prompt.contains(RECONCILE_MARK) {
-                    let ids = proposed.lock().unwrap().clone();
-                    let map = id_to_page.lock().unwrap();
-                    let mut by_page: BTreeMap<String, Vec<String>> = BTreeMap::new();
-                    for id in &ids {
-                        let titles = map
-                            .get(id)
-                            .cloned()
-                            .unwrap_or_else(|| vec!["Eval Platform".to_owned()]);
-                        for title in titles {
-                            let refs = by_page.entry(title).or_default();
-                            if !refs.contains(id) {
-                                refs.push(id.clone());
-                            }
-                        }
-                    }
-                    let pages: Vec<serde_json::Value> = by_page
-                        .into_iter()
-                        .map(|(title, refs)| {
-                            serde_json::json!({
-                                "title": title,
-                                "category": "concepts",
-                                "purpose": "cover the eval corpus knowledge",
-                                "knowledge_refs": refs,
-                            })
-                        })
-                        .collect();
-                    return Ok(serde_json::json!({ "pages": pages }).to_string());
-                }
-                Err(LlmError::Api {
-                    code: 500,
-                    message: "unrecognized planning stage".into(),
-                })
+                eval_planning_response(&request.prompt, &span_to_page, &id_to_page, &proposed)
             }
-            "wiki-compilation" => {
-                let claims = claim_ids_in(prompt);
-                // Full-text baseline (PRD §20/§37.4): the body carries every
-                // claim's VERBATIM statement — the annotated corpus spans —
-                // so the V0.2 FTS gates retrieve real content (CJK spans
-                // included) rather than page titles alone.
-                let statements = json_string_values(prompt, "statement");
-                let mut body = String::from("## Overview\n\nThe eval page cites its claims.\n");
-                for statement in &statements {
-                    body.push_str(&format!("\n{statement}\n"));
-                }
-                for id in &claims {
-                    body.push_str(&format!("\n<!-- llm-wiki:cite claim=\"{id}\" -->\n"));
-                }
-                Ok(serde_json::json!({ "markdown": body }).to_string())
-            }
+            "wiki-compilation" => eval_compilation_response(&request.prompt),
             other => Err(LlmError::Api {
                 code: 500,
                 message: format!("unexpected task tag {other}"),

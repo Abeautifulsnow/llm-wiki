@@ -259,6 +259,7 @@ pub struct NodeDraft {
     pub description: Option<String>,
 }
 
+/// Length note: ~120 lines — one registry transaction resolving a whole draft batch (existence probe, merge-chain follow, insert, detail update); splitting would separate the merge-chain logic from its loop and break the exactly-one-revision-bump invariant's locality.
 /// Resolves or creates many nodes inside ONE transaction. The revision is
 /// bumped once **per created node** and once **per re-activated retired node**
 /// (PRD §12.1.1: every committed registry mutation increments the revision);

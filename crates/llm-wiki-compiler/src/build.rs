@@ -185,6 +185,7 @@ pub(crate) fn prepare_pipeline_env(
     })
 }
 
+/// Length note: ~95 lines — thin orchestration (recoveries + env prep + error terminalization); the heavy lifting lives in build_full_pipeline/build_incremental.
 /// Runs the whole V0.1 build pipeline. `workspace_root` is the project
 /// directory holding `.llm-wiki/config.toml`; paths inside `config` are
 /// resolved against it.
@@ -292,6 +293,298 @@ pub(crate) fn terminal_status_for(err: &WikiError) -> &'static str {
     }
 }
 
+/// Scan (§8): snapshot hash recorded on the build row and the §28 cache; the
+/// §19.1 ChangeSet is diffed BEFORE any upsert overwrites content hashes.
+fn scan_and_diff(
+    conn: &mut rusqlite::Connection,
+    root: &Path,
+    wiki_dir: &Path,
+    build_id: &BuildId,
+    config: &Config,
+    cache: &Arc<LlmCache>,
+) -> Result<(ScanOutput, Vec<FileOutcome>, Vec<SourceId>)> {
+    let wiki_dir_rel = normalized_rel_of(root, wiki_dir);
+    let scanner = Scanner::new(
+        root,
+        &config.source.include,
+        &config.source.exclude,
+        wiki_dir_rel,
+    )?;
+    let output = scanner.scan()?;
+    for diagnostic in &output.diagnostics {
+        warn_diagnostic(diagnostic);
+    }
+    let manifest = SourceManifest::from_scanned(&output.files);
+    llm_wiki_storage::set_build_snapshot_hash(conn, build_id, &manifest.snapshot_hash())?;
+    // Cache rows record the source snapshot hash so cross-snapshot reuse is
+    // impossible (PRD §28).
+    cache.set_source_snapshot_hash(&manifest.snapshot_hash());
+
+    // ---- §19.1 ChangeSet: pure diff BEFORE the upsert overwrites hashes. ----
+    let registry_before = list_sources(conn)?;
+    let scanned_sources: Vec<ScannedSource<'_>> = output
+        .files
+        .iter()
+        .map(|file| ScannedSource {
+            locator_key: file.locator_key.as_str(),
+            content_hash: &file.content_hash,
+        })
+        .collect();
+    let registered_sources: Vec<RegisteredSource<'_>> = registry_before
+        .iter()
+        .map(|record| RegisteredSource {
+            source_id: &record.source_id,
+            locator_key: record.locator_key.as_str(),
+            content_hash: &record.content_hash,
+        })
+        .collect();
+    let (file_outcomes, deleted_ids) = diff_manifest(&scanned_sources, &registered_sources);
+    Ok((output, file_outcomes, deleted_ids))
+}
+
+/// §19.2 BuildFingerprint guard: ANY drift in a planning-relevant field vs
+/// the last COMPLETED build stops the build at REPLAN_REQUIRED — the current
+/// plan is stale and must never be silently extended (the trigger is recorded
+/// for `replan --dry-run` auditing). Applies before the no-change fast path
+/// too: a prompt/config/schema change invalidates the PLAN, not just the
+/// incremental mapping. `build.incremental = false` is the explicit
+/// full-rebuild escape hatch (V0.1 behavior, no guard).
+fn fingerprint_guard(
+    conn: &mut rusqlite::Connection,
+    build_id: &BuildId,
+    fingerprint_json: &str,
+) -> Result<()> {
+    let Some(previous) = latest_completed_build(conn)? else {
+        return Ok(());
+    };
+    let drifted = match &previous.build_fingerprint {
+        Some(previous_fp) => previous_fp != fingerprint_json,
+        // A completed build without a fingerprint predates §19
+        // auditing: plan compatibility cannot be proven.
+        None => true,
+    };
+    if !drifted {
+        return Ok(());
+    }
+    let notes = format!(
+        "build fingerprint differs from the last completed build {} (prompts, schema, parser, model or effective config changed)",
+        previous.build_id
+    );
+    record_decision(
+        conn,
+        build_id,
+        None,
+        OUTCOME_REPLAN_REQUIRED,
+        Some(TRIGGER_FINGERPRINT_CHANGED),
+        0,
+        notes.clone(),
+    )?;
+    tracing::warn!(build = %build_id, "{notes}");
+    Err(WikiError::ReplanRequired {
+        reason: format!(
+            "{notes} (trigger: {TRIGGER_FINGERPRINT_CHANGED}); the previous generation stays visible"
+        ),
+    })
+}
+
+/// The mapped outcome: the post-analysis knowledge base (compile base),
+/// the pages to recompile, their updated refs, the obsolete pages and the
+/// reloaded previous-generation pages.
+type MappedIncremental = (
+    llm_wiki_core::plan::KnowledgeBase,
+    BTreeSet<WikiPageId>,
+    BTreeMap<WikiPageId, Vec<KnowledgeNodeId>>,
+    BTreeSet<WikiPageId>,
+    Vec<GenerationPageView>,
+);
+
+/// Runs the deterministic §19.2 mapping over the post-analysis knowledge
+/// state. A REPLAN_REQUIRED outcome is recorded and propagated; a local
+/// update returns the new knowledge base (the compile base) plus the
+/// recompile/updated-refs/obsolete sets and the reloaded previous pages.
+#[allow(clippy::too_many_arguments)]
+fn map_incremental_or_fail(
+    conn: &mut rusqlite::Connection,
+    build_id: &BuildId,
+    prev_build_id: &BuildId,
+    prev_pages: Vec<GenerationPageView>,
+    prev_kb: llm_wiki_core::plan::KnowledgeBase,
+    deletion_gone: BTreeSet<KnowledgeNodeId>,
+    change_set: &ChangeSet,
+    modified_ids: BTreeSet<SourceId>,
+) -> Result<MappedIncremental> {
+    let new_kb = load_knowledge_base(conn)?;
+    let mapping = map_incremental_change(&MappingInput {
+        prev_pages: prev_pages.clone(),
+        // The PRE-analysis knowledge state: what counts as "brand-new" is
+        // decided against it, never against the post-analysis base.
+        prev_kb,
+        new_kb: new_kb.clone(),
+        deletion_gone,
+        modified_pre: modified_pre_of(conn, &change_set.modified)?,
+        changed_post: changed_post_of(conn, change_set)?,
+        modified_ids,
+    });
+    match mapping {
+        MappingDecision::LocalUpdate {
+            recompile,
+            updated_refs,
+            obsolete,
+        } => {
+            // Load the previous generation's pages again for the assembly
+            // step (the mapping consumed the view; page data is unchanged).
+            let pages = load_generation_view(conn, prev_build_id)?;
+            Ok((new_kb, recompile, updated_refs, obsolete, pages))
+        }
+        MappingDecision::ReplanRequired { trigger, reason } => {
+            record_decision(
+                conn,
+                build_id,
+                None,
+                OUTCOME_REPLAN_REQUIRED,
+                Some(trigger),
+                0,
+                reason.clone(),
+            )?;
+            tracing::warn!(build = %build_id, trigger, "{reason}");
+            Err(WikiError::ReplanRequired {
+                reason: format!("{trigger}: {reason}"),
+            })
+        }
+    }
+}
+
+/// Compile → topology guard → decision row → merge carried pages → index →
+/// publish: the second half of the incremental pipeline (§19.2/§35), split
+/// out so `build_incremental` stays an orchestrator.
+#[allow(clippy::too_many_arguments)]
+async fn compile_and_publish_incremental(
+    conn: &mut rusqlite::Connection,
+    wiki_dir: &Path,
+    build_id: &BuildId,
+    config: &Config,
+    provider: Arc<dyn LlmProvider>,
+    cache: &Arc<LlmCache>,
+    compilation_prompt: &PromptDocument,
+    change_set: &ChangeSet,
+    prev_pages: &[GenerationPageView],
+    prev_build_id: &BuildId,
+    new_kb: &llm_wiki_core::plan::KnowledgeBase,
+    plan: &WikiPlan,
+    surviving_ids: BTreeSet<WikiPageId>,
+    recompile: BTreeSet<WikiPageId>,
+    obsolete: BTreeSet<WikiPageId>,
+    llm_request_count: u32,
+) -> Result<(GenerationStats, u32, IncrementalSummary)> {
+    let prev_meta = load_generation_pages(conn, prev_build_id)?;
+    let language_of: BTreeMap<String, String> = prev_meta
+        .iter()
+        .map(|page| (page.page_id.as_str().to_owned(), page.language.clone()))
+        .collect();
+
+    // ---- Partial compile (§19.2): ONLY affected pages consume requests. ----
+    update_build_status(conn, build_id, "COMPILING")?;
+    let stage_cache: Arc<dyn StageCache> = cache.clone();
+    let compiler = WikiCompiler::new(
+        provider.clone(),
+        compilation_prompt.clone(),
+        CompilerConfig {
+            max_input_tokens: config.analysis.max_input_tokens as u64,
+            ..CompilerConfig::default()
+        },
+    )
+    .with_cache(stage_cache);
+    let compiled = compiler
+        .compile_plan_subset(plan, new_kb, build_id, &recompile)
+        .await?;
+    let llm_request_count = llm_request_count + compiled.llm_request_count;
+    if compiled.pages.len() != recompile.len() {
+        return Err(WikiError::Compilation(format!(
+            "partial compile produced {} page(s) for {} affected page(s)",
+            compiled.pages.len(),
+            recompile.len()
+        )));
+    }
+
+    // ---- Related-page topology check among surviving pages (§19.2): the
+    // recompiled pages' outbound links must equal their previous ones.
+    // Carried pages match by construction (verbatim copy). ----
+    verify_related_page_topology(
+        conn,
+        build_id,
+        prev_pages,
+        &compiled.pages,
+        &surviving_ids,
+        &recompile,
+    )?;
+
+    let carried = surviving_ids.len() - recompile.len();
+    let candidates = recompile.len() + obsolete.len();
+
+    // Record the judgment (PRD §19.2: every decision is recorded, with
+    // candidate count, recompiled count and outcome). This happens only once
+    // the mapping is FINAL — the post-compile topology check above may still
+    // revoke it into a replan-required row, and a build must never carry a
+    // local-update row for a wiki it did not publish.
+    record_decision(
+        conn,
+        build_id,
+        None,
+        OUTCOME_LOCAL_UPDATE,
+        None,
+        recompile.len(),
+        format!(
+            "{} source(s) changed ({} added, {} modified, {} deleted); {} candidate page(s), {} recompiled, {} carried, {} obsolete",
+            change_set.changed_count() + change_set.deleted.len(),
+            change_set.added.len(),
+            change_set.modified.len(),
+            change_set.deleted.len(),
+            candidates,
+            recompile.len(),
+            carried,
+            obsolete.len()
+        ),
+    )?;
+
+    // ---- Final page set: recompiled records + carried rows copied VERBATIM
+    // from the previous generation (content/body_hash/refs/citations/links;
+    // the frontmatter keeps the ORIGINAL build id — never rewritten, so the
+    // on-disk file is byte-identical and §36 lint stays consistent). ----
+    let new_pages = merge_compiled_and_carried(
+        prev_pages,
+        &obsolete,
+        &compiled.pages,
+        &language_of,
+        &surviving_ids,
+    )?;
+    if new_pages.is_empty() {
+        return Err(WikiError::Compilation(
+            "every page became obsolete; refusing to publish an empty generation".into(),
+        ));
+    }
+
+    // ---- Index + Publish (§35, unchanged contract): new immutable
+    // generation, pointer swap, previous generation intact on failure. ----
+    update_build_status(conn, build_id, "INDEXING")?;
+    let stats = persist_generation(conn, build_id, &new_pages)?;
+    publish(
+        conn,
+        wiki_dir,
+        build_id,
+        &new_pages,
+        config.build.keep_generations,
+    )?;
+
+    let summary = IncrementalSummary {
+        changed: change_set.changed_count(),
+        deleted: change_set.deleted.len(),
+        recompiled: recompile.len(),
+        carried,
+        obsolete: obsolete.len(),
+    };
+    Ok((stats, llm_request_count, summary))
+}
+
 /// Persists one §19.2 decision row (every judgment is recorded).
 pub(crate) fn record_decision(
     conn: &mut rusqlite::Connection,
@@ -332,43 +625,9 @@ async fn build_inner(
     analysis_prompt_version: &str,
     fingerprint_json: &str,
 ) -> Result<(GenerationStats, usize, u32, Option<IncrementalSummary>)> {
-    // ---- Scan (§8): sources are upserted in ONE transaction. ----
-    let wiki_dir_rel = normalized_rel_of(root, wiki_dir);
-    let scanner = Scanner::new(
-        root,
-        &config.source.include,
-        &config.source.exclude,
-        wiki_dir_rel,
-    )?;
-    let output = scanner.scan()?;
-    for diagnostic in &output.diagnostics {
-        warn_diagnostic(diagnostic);
-    }
-    let manifest = SourceManifest::from_scanned(&output.files);
-    llm_wiki_storage::set_build_snapshot_hash(conn, build_id, &manifest.snapshot_hash())?;
-    // Cache rows record the source snapshot hash so cross-snapshot reuse is
-    // impossible (PRD §28).
-    cache.set_source_snapshot_hash(&manifest.snapshot_hash());
-
-    // ---- §19.1 ChangeSet: pure diff BEFORE the upsert overwrites hashes. ----
-    let registry_before = list_sources(conn)?;
-    let scanned_sources: Vec<ScannedSource<'_>> = output
-        .files
-        .iter()
-        .map(|file| ScannedSource {
-            locator_key: file.locator_key.as_str(),
-            content_hash: &file.content_hash,
-        })
-        .collect();
-    let registered_sources: Vec<RegisteredSource<'_>> = registry_before
-        .iter()
-        .map(|record| RegisteredSource {
-            source_id: &record.source_id,
-            locator_key: record.locator_key.as_str(),
-            content_hash: &record.content_hash,
-        })
-        .collect();
-    let (file_outcomes, deleted_ids) = diff_manifest(&scanned_sources, &registered_sources);
+    // ---- Scan (§8) + §19.1 ChangeSet (before the upsert overwrites hashes).
+    let (output, file_outcomes, deleted_ids) =
+        scan_and_diff(conn, root, wiki_dir, build_id, config, cache)?;
     let scan_has_changes = !deleted_ids.is_empty()
         || file_outcomes
             .iter()
@@ -381,43 +640,11 @@ async fn build_inner(
         None
     };
 
-    // ---- §19.2 BuildFingerprint guard: ANY drift in a planning-relevant
-    // field vs the last COMPLETED build stops the build at REPLAN_REQUIRED —
-    // the current plan is stale and must never be silently extended (the
-    // trigger is recorded for `replan --dry-run` auditing). Applies before the
-    // no-change fast path too: a prompt/config/schema change invalidates the
-    // PLAN, not just the incremental mapping. `build.incremental = false` is
-    // the explicit full-rebuild escape hatch (V0.1 behavior, no guard). ----
+    // ---- §19.2 BuildFingerprint guard (any drift → REPLAN_REQUIRED, before
+    // the fast path too: a prompt/config/schema change invalidates the PLAN,
+    // not just the incremental mapping). ----
     if incremental_enabled {
-        if let Some(previous) = latest_completed_build(conn)? {
-            let drifted = match &previous.build_fingerprint {
-                Some(previous_fp) => previous_fp != fingerprint_json,
-                // A completed build without a fingerprint predates §19
-                // auditing: plan compatibility cannot be proven.
-                None => true,
-            };
-            if drifted {
-                let notes = format!(
-                    "build fingerprint differs from the last completed build {} (prompts, schema, parser, model or effective config changed)",
-                    previous.build_id
-                );
-                record_decision(
-                    conn,
-                    build_id,
-                    None,
-                    OUTCOME_REPLAN_REQUIRED,
-                    Some(TRIGGER_FINGERPRINT_CHANGED),
-                    0,
-                    notes.clone(),
-                )?;
-                tracing::warn!(build = %build_id, "{notes}");
-                return Err(WikiError::ReplanRequired {
-                    reason: format!(
-                        "{notes} (trigger: {TRIGGER_FINGERPRINT_CHANGED}); the previous generation stays visible"
-                    ),
-                });
-            }
-        }
+        fingerprint_guard(conn, build_id, fingerprint_json)?;
     }
 
     if incremental_enabled && active_build.is_some() && !scan_has_changes {
@@ -464,7 +691,6 @@ async fn build_inner(
             &output,
             &file_outcomes,
             deleted_ids,
-            &registry_before,
             previous,
             prev_pages.expect("checked above"),
         )
@@ -478,6 +704,46 @@ async fn build_inner(
     // through the planner when the registry revision or the plan cache keys
     // moved. That is the user-driven escape hatch until `llm-wiki replan`
     // lands (next V0.2 slice). ----
+    build_full_pipeline(
+        conn,
+        root,
+        wiki_dir,
+        build_id,
+        config,
+        provider,
+        cache,
+        config_hash,
+        analysis_prompt,
+        planning_prompt,
+        compilation_prompt,
+        analysis_prompt_version,
+        &output,
+    )
+    .await
+    .map(|(stats, sources, count)| (stats, sources, count, None))
+}
+
+/// The V0.1 full pipeline: upsert ALL sources, parse + analyze everything,
+/// plan from scratch, compile every planned page, persist and publish
+/// (§31/§35). Served the whole workspace until V0.2's incremental path split
+/// out; now reached on first build, `build.incremental = false`, or when no
+/// previous generation exists to carry over.
+#[allow(clippy::too_many_arguments)]
+async fn build_full_pipeline(
+    conn: &mut rusqlite::Connection,
+    root: &Path,
+    wiki_dir: &Path,
+    build_id: &BuildId,
+    config: &Config,
+    provider: Arc<dyn LlmProvider>,
+    cache: &Arc<LlmCache>,
+    config_hash: &str,
+    analysis_prompt: &PromptDocument,
+    planning_prompt: &PromptDocument,
+    compilation_prompt: &PromptDocument,
+    analysis_prompt_version: &str,
+    output: &ScanOutput,
+) -> Result<(GenerationStats, usize, u32)> {
     let batch: Vec<SourceUpsert> = output
         .files
         .iter()
@@ -605,7 +871,7 @@ async fn build_inner(
         config.build.keep_generations,
     )?;
 
-    Ok((stats, sources, llm_request_count, None))
+    Ok((stats, sources, llm_request_count))
 }
 
 /// The §19 incremental pipeline: deletions retired → selective re-analysis →
@@ -627,7 +893,6 @@ async fn build_incremental(
     output: &ScanOutput,
     file_outcomes: &[FileOutcome],
     deleted_ids: Vec<SourceId>,
-    registry_before: &[SourceRecord],
     prev_build_id: &BuildId,
     prev_pages: Vec<GenerationPageView>,
 ) -> Result<(GenerationStats, usize, u32, Option<IncrementalSummary>)> {
@@ -636,9 +901,108 @@ async fn build_incremental(
     let prev_kb = load_knowledge_base(conn)?;
 
     // ---- §19.3 deleted sources: retire knowledge, mark removed. No ghost
-    // claims may survive (§53 DoD #5). ----
+    // claims may survive (§53 DoD #5). The registry is read BEFORE the upsert
+    // below overwrites the content hashes (§19.1). ----
+    let registry_before = list_sources(conn)?;
+    let deletion_gone = retire_deleted_sources(conn, &deleted_ids, &registry_before, build_id)?;
+
+    // ---- Registry upsert: refresh hashes/paths, mint ids for added files. ----
+    let (upserted, change_set) =
+        upsert_scan_outputs(conn, output, build_id, file_outcomes, deleted_ids)?;
+    let sources = upserted.len();
+
+    // Changed sources = added + modified; everything else is skipped entirely
+    // (§19.2: only re-analyze the affected set; unchanged sections and
+    // SectionIds stay as-is).
+    let modified_ids: BTreeSet<SourceId> = change_set.modified.iter().cloned().collect();
+    let changed_files: Vec<usize> = output
+        .files
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            matches!(
+                file_outcomes[*index],
+                FileOutcome::Added | FileOutcome::Modified(_)
+            )
+        })
+        .map(|(index, _)| index)
+        .collect();
+
+    // ---- Selective re-analysis (§19.2) + the mapping over its outcome. ----
+    update_build_status(conn, build_id, "PARSING")?;
+    let llm_request_count = analyze_changed_sources(
+        conn,
+        root,
+        build_id,
+        config,
+        provider.clone(),
+        cache,
+        analysis_prompt,
+        analysis_prompt_version,
+        output,
+        &upserted,
+        &changed_files,
+    )
+    .await?;
+
+    // ---- Deterministic mapping attempt (§19.2 fixed order). Zero planner
+    // LLM calls: the current plan's page identities are reused. ----
+    update_build_status(conn, build_id, "PLANNING")?;
+    let (new_kb, recompile, updated_refs, obsolete, prev_pages) = map_incremental_or_fail(
+        conn,
+        build_id,
+        prev_build_id,
+        prev_pages,
+        prev_kb,
+        deletion_gone,
+        &change_set,
+        modified_ids,
+    )?;
+    // ---- Assemble the new generation: survivors keep their page identity,
+    // slugs, titles and categories; recompiled pages take the mapped refs. ----
+    let (plan, surviving_ids) =
+        assemble_surviving_plan(&prev_pages, &obsolete, &updated_refs, &new_kb);
+
+    let (stats, llm_request_count, summary) = compile_and_publish_incremental(
+        conn,
+        wiki_dir,
+        build_id,
+        config,
+        provider,
+        cache,
+        compilation_prompt,
+        &change_set,
+        &prev_pages,
+        prev_build_id,
+        &new_kb,
+        &plan,
+        surviving_ids,
+        recompile,
+        obsolete,
+        llm_request_count,
+    )
+    .await?;
+    tracing::info!(
+        build = %build_id,
+        changed = summary.changed,
+        recompiled = summary.recompiled,
+        carried = summary.carried,
+        obsolete = summary.obsolete,
+        "incremental build published"
+    );
+    Ok((stats, sources, llm_request_count, Some(summary)))
+}
+
+/// §19.3 deleted sources: retire their knowledge and mark them removed in the
+/// registry. Returns the node ids whose support vanished (mapping input).
+fn retire_deleted_sources(
+    conn: &mut rusqlite::Connection,
+    deleted_ids: &[SourceId],
+    registry_before: &[SourceRecord],
+    build_id: &BuildId,
+) -> Result<BTreeSet<KnowledgeNodeId>> {
     let mut deletion_gone: BTreeSet<KnowledgeNodeId> = BTreeSet::new();
-    for source_id in &deleted_ids {
+    for source_id in deleted_ids {
         let record = registry_before
             .iter()
             .find(|record| &record.source_id == source_id)
@@ -658,8 +1022,19 @@ async fn build_incremental(
             "deleted source retired"
         );
     }
+    Ok(deletion_gone)
+}
 
-    // ---- Registry upsert: refresh hashes/paths, mint ids for added files. ----
+/// Upserts the scanned sources (hashes refresh, added files mint ids) and
+/// finalizes the ChangeSet. MUST run AFTER the ChangeSet diff — the upsert
+/// overwrites content hashes (§19.1).
+fn upsert_scan_outputs(
+    conn: &mut rusqlite::Connection,
+    output: &ScanOutput,
+    build_id: &BuildId,
+    file_outcomes: &[FileOutcome],
+    deleted_ids: Vec<SourceId>,
+) -> Result<(Vec<(SourceId, bool)>, ChangeSet)> {
     let batch: Vec<SourceUpsert> = output
         .files
         .iter()
@@ -671,49 +1046,83 @@ async fn build_incremental(
         })
         .collect();
     let upserted = upsert_sources_batch(conn, &batch, Some(build_id.as_str()))?;
-    let sources = upserted.len();
-    if sources == 0 {
+    if upserted.is_empty() {
         return Err(WikiError::Source(format!(
             "no markdown sources found under {}; nothing to build",
-            root.display()
+            output
+                .files
+                .first()
+                .map(|f| f.rel_path.as_str())
+                .unwrap_or("<unknown>")
         )));
     }
-    let change_set: ChangeSet = finalize_change_set(file_outcomes, deleted_ids, &upserted);
+    let change_set = finalize_change_set(file_outcomes, deleted_ids, &upserted);
+    Ok((upserted, change_set))
+}
 
-    // Changed sources = added + modified; everything else is skipped entirely
-    // (§19.2: only re-analyze the affected set; unchanged sections and
-    // SectionIds stay as-is).
-    let modified_ids: BTreeSet<SourceId> = change_set.modified.iter().cloned().collect();
-    let changed_files: Vec<usize> = output
-        .files
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| {
-            matches!(
-                file_outcomes[*index],
-                FileOutcome::Added | FileOutcome::Modified(_)
-            )
-        })
-        .map(|(index, _)| index)
-        .collect();
-
-    // Previous node ownership of modified sources, BEFORE re-analysis
-    // retires their old claims (§19.2 mapping input).
+/// Previous node ownership of modified sources, BEFORE re-analysis retires
+/// their old claims (§19.2 mapping input).
+fn modified_pre_of(
+    conn: &rusqlite::Connection,
+    modified_ids: &[SourceId],
+) -> Result<BTreeMap<SourceId, Vec<llm_wiki_storage::SourceNodeSection>>> {
     let mut modified_pre: BTreeMap<SourceId, Vec<llm_wiki_storage::SourceNodeSection>> =
         BTreeMap::new();
-    for source_id in &modified_ids {
+    for source_id in modified_ids {
         modified_pre.insert(
             source_id.clone(),
             list_source_active_node_sections(conn, source_id)?,
         );
     }
+    Ok(modified_pre)
+}
 
-    // ---- Parse (§9) + register sections for CHANGED sources only. ----
-    update_build_status(conn, build_id, "PARSING")?;
-    let mut parsed = Vec::with_capacity(changed_files.len());
+/// Post-build node state of every changed source (mapping input).
+fn changed_post_of(
+    conn: &rusqlite::Connection,
+    change_set: &ChangeSet,
+) -> Result<BTreeMap<SourceId, Vec<llm_wiki_storage::SourceNodeSection>>> {
+    let mut changed_post: BTreeMap<SourceId, Vec<llm_wiki_storage::SourceNodeSection>> =
+        BTreeMap::new();
+    for source_id in change_set.added.iter().chain(change_set.modified.iter()) {
+        changed_post.insert(
+            source_id.clone(),
+            list_source_active_node_sections(conn, source_id)?,
+        );
+    }
+    Ok(changed_post)
+}
+
+/// Parses + analyzes ONLY the changed sources (§19.2 selective re-analysis;
+/// modified sources replace their previous active knowledge — no stale
+/// claims, §53 DoD #4). Returns the LLM requests spent.
+#[allow(clippy::too_many_arguments)]
+async fn analyze_changed_sources(
+    conn: &mut rusqlite::Connection,
+    root: &Path,
+    build_id: &BuildId,
+    config: &Config,
+    provider: Arc<dyn LlmProvider>,
+    cache: &Arc<LlmCache>,
+    analysis_prompt: &PromptDocument,
+    analysis_prompt_version: &str,
+    output: &ScanOutput,
+    upserted: &[(SourceId, bool)],
+    changed_files: &[usize],
+) -> Result<u32> {
+    update_build_status(conn, build_id, "ANALYZING")?;
+    let stage_cache: Arc<dyn StageCache> = cache.clone();
+    let analyzer = DocumentAnalyzer::new(
+        provider.clone(),
+        analysis_prompt.clone(),
+        config.analysis.section_target_tokens,
+        config.analysis.max_rejected_claim_ratio,
+    )
+    .with_cache(stage_cache);
+    let mut llm_request_count = 0u32;
     for index in changed_files {
-        let file = &output.files[index];
-        let (source_id, _created) = upserted[index].clone();
+        let file = &output.files[*index];
+        let (source_id, _created) = upserted[*index].clone();
         let absolute = root.join(&file.rel_path);
         let raw = std::fs::read_to_string(&absolute)
             .map_err(|e| WikiError::Source(format!("cannot read {}: {e}", absolute.display())))?;
@@ -726,23 +1135,7 @@ async fn build_incremental(
                 diagnostic.message
             );
         }
-        parsed.push((file, source_id, parsed_doc));
-    }
-
-    // ---- Analyze (§10/§11) selectively; modified sources replace their
-    // previous active knowledge (no stale claims, §53 DoD #4). ----
-    update_build_status(conn, build_id, "ANALYZING")?;
-    let stage_cache: Arc<dyn StageCache> = cache.clone();
-    let analyzer = DocumentAnalyzer::new(
-        provider.clone(),
-        analysis_prompt.clone(),
-        config.analysis.section_target_tokens,
-        config.analysis.max_rejected_claim_ratio,
-    )
-    .with_cache(stage_cache.clone());
-    let mut llm_request_count = 0u32;
-    for (file, source_id, parsed_doc) in &parsed {
-        let sections = register_sections(conn, source_id, &parsed_doc.sections, Some(build_id))?;
+        let sections = register_sections(conn, &source_id, &parsed_doc.sections, Some(build_id))?;
         let doc = AnalyzedDocument {
             source_id: source_id.clone(),
             rel_path: file.rel_path.clone(),
@@ -764,71 +1157,22 @@ async fn build_incremental(
             },
         )?;
     }
+    Ok(llm_request_count)
+}
 
-    // Post-build node state of every changed source (mapping input).
-    let mut changed_post: BTreeMap<SourceId, Vec<llm_wiki_storage::SourceNodeSection>> =
-        BTreeMap::new();
-    for source_id in change_set.added.iter().chain(change_set.modified.iter()) {
-        changed_post.insert(
-            source_id.clone(),
-            list_source_active_node_sections(conn, source_id)?,
-        );
-    }
-
-    // ---- Deterministic mapping attempt (§19.2 fixed order). Zero planner
-    // LLM calls: the current plan's page identities are reused. ----
-    let new_kb = load_knowledge_base(conn)?;
-    let mapping = map_incremental_change(&MappingInput {
-        prev_pages,
-        prev_kb,
-        // The post-build knowledge state is also the compile base below.
-        new_kb: new_kb.clone(),
-        deletion_gone,
-        modified_pre,
-        changed_post,
-        modified_ids,
-    });
-    let (recompile, updated_refs, obsolete, prev_pages) = match mapping {
-        MappingDecision::LocalUpdate {
-            recompile,
-            updated_refs,
-            obsolete,
-        } => {
-            // Load the previous generation's pages again for the assembly
-            // step (the mapping consumed the view; page data is unchanged).
-            let pages = load_generation_view(conn, prev_build_id)?;
-            (recompile, updated_refs, obsolete, pages)
-        }
-        MappingDecision::ReplanRequired { trigger, reason } => {
-            record_decision(
-                conn,
-                build_id,
-                None,
-                OUTCOME_REPLAN_REQUIRED,
-                Some(trigger),
-                0,
-                reason.clone(),
-            )?;
-            tracing::warn!(build = %build_id, trigger, "{reason}");
-            return Err(WikiError::ReplanRequired {
-                reason: format!("{trigger}: {reason}"),
-            });
-        }
-    };
-    let survivors = prev_pages.len() - obsolete.len();
-    let carried = survivors - recompile.len();
-    let candidates = recompile.len() + obsolete.len();
-
-    // ---- Assemble the new generation: survivors keep their page identity,
-    // slugs, titles and categories; recompiled pages take the mapped refs. ----
-    let prev_meta = load_generation_pages(conn, prev_build_id)?;
-    let language_of: BTreeMap<String, String> = prev_meta
-        .iter()
-        .map(|page| (page.page_id.as_str().to_owned(), page.language.clone()))
-        .collect();
+/// Builds the surviving-page plan from the previous generation: survivors
+/// keep their page identity, slugs, titles and categories; recompiled pages
+/// take the mapped refs. Returns (plan, surviving ids); the language map is
+/// resolved by the caller from `load_generation_pages`.
+fn assemble_surviving_plan(
+    prev_pages: &[GenerationPageView],
+    obsolete: &BTreeSet<WikiPageId>,
+    updated_refs: &BTreeMap<WikiPageId, Vec<KnowledgeNodeId>>,
+    new_kb: &llm_wiki_core::plan::KnowledgeBase,
+) -> (WikiPlan, BTreeSet<WikiPageId>) {
     let mut plan_pages: Vec<WikiPagePlan> = Vec::new();
     let mut surviving_ids: BTreeSet<WikiPageId> = BTreeSet::new();
-    for page in &prev_pages {
+    for page in prev_pages {
         if obsolete.contains(&page.page_id) {
             continue; // §19.3.5: zero refs left — excluded from the generation
         }
@@ -868,34 +1212,21 @@ async fn build_incremental(
             related_pages,
         });
     }
-    let plan = WikiPlan { pages: plan_pages };
+    (WikiPlan { pages: plan_pages }, surviving_ids)
+}
 
-    // ---- Partial compile (§19.2): ONLY affected pages consume requests. ----
-    update_build_status(conn, build_id, "COMPILING")?;
-    let compiler = WikiCompiler::new(
-        provider.clone(),
-        compilation_prompt.clone(),
-        CompilerConfig {
-            max_input_tokens: config.analysis.max_input_tokens as u64,
-            ..CompilerConfig::default()
-        },
-    )
-    .with_cache(stage_cache);
-    let compiled = compiler
-        .compile_plan_subset(&plan, &new_kb, build_id, &recompile)
-        .await?;
-    llm_request_count += compiled.llm_request_count;
-    if compiled.pages.len() != recompile.len() {
-        return Err(WikiError::Compilation(format!(
-            "partial compile produced {} page(s) for {} affected page(s)",
-            compiled.pages.len(),
-            recompile.len()
-        )));
-    }
-
-    // ---- Related-page topology check among surviving pages (§19.2): the
-    // recompiled pages' outbound links must equal their previous ones.
-    // Carried pages match by construction (verbatim copy). ----
+/// §19.2 related-page topology guard: every recompiled page's outbound links
+/// must equal its previous ones (carried pages match by construction). A
+/// divergence is a structural change → REPLAN_REQUIRED with the trigger
+/// recorded; the previous generation stays visible.
+fn verify_related_page_topology(
+    conn: &mut rusqlite::Connection,
+    build_id: &BuildId,
+    prev_pages: &[GenerationPageView],
+    compiled: &[WikiPageRecord],
+    surviving_ids: &BTreeSet<WikiPageId>,
+    recompile: &BTreeSet<WikiPageId>,
+) -> Result<()> {
     let previous_topology: BTreeMap<&WikiPageId, BTreeSet<String>> = prev_pages
         .iter()
         .map(|page| {
@@ -909,7 +1240,10 @@ async fn build_incremental(
             )
         })
         .collect();
-    for record in &compiled.pages {
+    for record in compiled {
+        if !recompile.contains(&record.page_id) {
+            continue;
+        }
         let targets: BTreeSet<String> = record
             .links
             .iter()
@@ -935,43 +1269,26 @@ async fn build_incremental(
             });
         }
     }
+    Ok(())
+}
 
-    // Record the judgment (PRD §19.2: every decision is recorded, with
-    // candidate count, recompiled count and outcome). This happens only once
-    // the mapping is FINAL — the post-compile topology check above may still
-    // revoke it into a replan-required row, and a build must never carry a
-    // local-update row for a wiki it did not publish.
-    record_decision(
-        conn,
-        build_id,
-        None,
-        OUTCOME_LOCAL_UPDATE,
-        None,
-        recompile.len(),
-        format!(
-            "{} source(s) changed ({} added, {} modified, {} deleted); {} candidate page(s), {} recompiled, {} carried, {} obsolete",
-            change_set.changed_count() + change_set.deleted.len(),
-            change_set.added.len(),
-            change_set.modified.len(),
-            change_set.deleted.len(),
-            candidates,
-            recompile.len(),
-            carried,
-            obsolete.len()
-        ),
-    )?;
-
-    // ---- Final page set: recompiled records + carried rows copied VERBATIM
-    // from the previous generation (content/body_hash/refs/citations/links;
-    // the frontmatter keeps the ORIGINAL build id — never rewritten, so the
-    // on-disk file is byte-identical and §36 lint stays consistent). ----
+/// Final page set: recompiled records + carried rows copied VERBATIM from
+/// the previous generation (content/body_hash/refs/citations/links; the
+/// frontmatter keeps the ORIGINAL build id — never rewritten, so the on-disk
+/// file is byte-identical and §36 lint stays consistent).
+fn merge_compiled_and_carried(
+    prev_pages: &[GenerationPageView],
+    obsolete: &BTreeSet<WikiPageId>,
+    compiled: &[WikiPageRecord],
+    language_of: &BTreeMap<String, String>,
+    surviving_ids: &BTreeSet<WikiPageId>,
+) -> Result<Vec<WikiPageRecord>> {
     let compiled_by_id: BTreeMap<String, &WikiPageRecord> = compiled
-        .pages
         .iter()
         .map(|page| (page.page_id.as_str().to_owned(), page))
         .collect();
-    let mut new_pages: Vec<WikiPageRecord> = Vec::with_capacity(survivors);
-    for page in &prev_pages {
+    let mut new_pages: Vec<WikiPageRecord> = Vec::with_capacity(prev_pages.len() - obsolete.len());
+    for page in prev_pages {
         if obsolete.contains(&page.page_id) {
             continue;
         }
@@ -1000,40 +1317,7 @@ async fn build_incremental(
                 .collect(),
         });
     }
-    if new_pages.is_empty() {
-        return Err(WikiError::Compilation(
-            "every page became obsolete; refusing to publish an empty generation".into(),
-        ));
-    }
-
-    // ---- Index + Publish (§35, unchanged contract): new immutable
-    // generation, pointer swap, previous generation intact on failure. ----
-    update_build_status(conn, build_id, "INDEXING")?;
-    let stats = persist_generation(conn, build_id, &new_pages)?;
-    publish(
-        conn,
-        wiki_dir,
-        build_id,
-        &new_pages,
-        config.build.keep_generations,
-    )?;
-
-    let summary = IncrementalSummary {
-        changed: change_set.changed_count(),
-        deleted: change_set.deleted.len(),
-        recompiled: recompile.len(),
-        carried,
-        obsolete: obsolete.len(),
-    };
-    tracing::info!(
-        build = %build_id,
-        changed = summary.changed,
-        recompiled = summary.recompiled,
-        carried = summary.carried,
-        obsolete = summary.obsolete,
-        "incremental build published"
-    );
-    Ok((stats, sources, llm_request_count, Some(summary)))
+    Ok(new_pages)
 }
 
 /// Persists the parsed sections through the Section Registry (PRD §45):

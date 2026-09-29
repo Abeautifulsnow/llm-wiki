@@ -72,6 +72,11 @@ pub fn default_tokenizer() -> &'static dyn SearchTokenizer {
 
 /// True for CJK Unified Ideographs (incl. Extension A and compatibility
 /// forms) — the script that must never go through the Latin tokenizer.
+///
+/// Kana/Hangul are deliberately OUT of V0.2 scope: PRD §20's CJK strategy
+/// targets Chinese (the zh-CN fixtures). Extending to Kana/Hangul requires
+/// re-running every Top-K gate with versioned thresholds — a V0.3 candidate,
+/// not a drive-by change.
 fn is_han_char(c: char) -> bool {
     matches!(c as u32, 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF)
 }
@@ -192,6 +197,21 @@ pub fn rebuild_search_index(
     conn.execute("DELETE FROM wiki_fts", []).map_err(db)?;
     conn.execute("DELETE FROM wiki_page_text", []).map_err(db)?;
 
+    // INSERT prepares are hoisted out of the per-section loop (rusqlite
+    // `Statement::insert` also returns the rowid, so the FTS row can link to
+    // its content row without a separate `last_insert_rowid` round-trip).
+    let mut insert_text = conn
+        .prepare(
+            "INSERT INTO wiki_page_text (page_id, build_id, slug, title, aliases_json, heading_path_json, body)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .map_err(|e| WikiError::Storage(format!("prepare text insert: {e}")))?;
+    let mut insert_fts = conn
+        .prepare(
+            "INSERT INTO wiki_fts (rowid, title, headings, body, aliases) VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .map_err(|e| WikiError::Storage(format!("prepare fts insert: {e}")))?;
+
     let mut stmt = conn
         .prepare(
             "SELECT page_id, slug, title, content FROM wiki_pages
@@ -232,7 +252,8 @@ pub fn rebuild_search_index(
         };
         for (heading_path, body) in section_rows {
             insert_section_row(
-                conn,
+                &mut insert_text,
+                &mut insert_fts,
                 tokenizer,
                 &page_id,
                 build_id,
@@ -262,7 +283,8 @@ fn page_aliases(parsed_aliases: Option<&str>) -> Vec<String> {
 
 #[allow(clippy::too_many_arguments)]
 fn insert_section_row(
-    conn: &Connection,
+    text_stmt: &mut rusqlite::Statement<'_>,
+    fts_stmt: &mut rusqlite::Statement<'_>,
     tokenizer: &dyn SearchTokenizer,
     page_id: &str,
     build_id: &BuildId,
@@ -272,10 +294,10 @@ fn insert_section_row(
     heading_path: &[String],
     body: &str,
 ) -> Result<()> {
-    conn.execute(
-        "INSERT INTO wiki_page_text (page_id, build_id, slug, title, aliases_json, heading_path_json, body)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
+    // `Statement::insert` executes AND returns the rowid — the FTS row links
+    // to its content row without a second round-trip.
+    let rowid = text_stmt
+        .insert(params![
             page_id,
             build_id.as_str(),
             slug,
@@ -283,21 +305,17 @@ fn insert_section_row(
             json!(aliases).to_string(),
             json!(heading_path).to_string(),
             body
-        ],
-    )
-    .map_err(db)?;
-    let rowid = conn.last_insert_rowid();
-    conn.execute(
-        "INSERT INTO wiki_fts (rowid, title, headings, body, aliases) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![
+        ])
+        .map_err(db)?;
+    fts_stmt
+        .insert(params![
             rowid,
             tokenizer.analyze(title).join(" "),
             tokenizer.analyze(&heading_path.join(" ")).join(" "),
             tokenizer.analyze(body).join(" "),
             tokenizer.analyze(&aliases.join(" ")).join(" ")
-        ],
-    )
-    .map_err(db)?;
+        ])
+        .map_err(db)?;
     Ok(())
 }
 
