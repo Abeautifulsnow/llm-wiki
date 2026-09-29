@@ -14,6 +14,7 @@ pub mod knowledge;
 pub mod migrations;
 pub mod page_id_map;
 pub mod registry;
+pub mod search_index;
 pub mod sections;
 pub mod sources;
 pub mod state;
@@ -45,6 +46,11 @@ pub use page_id_map::{
 pub use registry::{
     canonical_key, current_revision, get_entry, get_or_create, get_or_create_batch, merge, resolve,
     retire, NodeDraft, NodeKind, RegistryEntry,
+};
+pub use search_index::{
+    activate_build_with_search_index, clear_search_index, default_tokenizer,
+    ensure_search_index_matches_active, probe_fts5, rebuild_search_index, search_index,
+    DefaultSearchTokenizer, SearchIndexRow, SearchIndexStats, SearchTokenizer, FTS5_UNAVAILABLE,
 };
 pub use sections::{apply_section_matches, load_active_sections, SectionApplyStats, StoredSection};
 pub use sources::{

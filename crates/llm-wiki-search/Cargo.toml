@@ -1,6 +1,6 @@
 [package]
 name = "llm-wiki-search"
-description = "Search layer placeholder — FTS/rank fusion land in V0.2+ (PRD §20, §50)"
+description = "Search layer: TextAnalyzer + FullTextSearch over SQLite FTS5 (PRD §7.6, §20, §5.5)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,3 +8,9 @@ repository.workspace = true
 
 [dependencies]
 llm-wiki-core = { workspace = true }
+llm-wiki-storage = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

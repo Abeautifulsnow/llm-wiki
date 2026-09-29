@@ -13,7 +13,8 @@
 //! 5. atomically replace `current.json` (temp file in the same directory,
 //!    then rename over the target);
 //! 6. ONE database transaction: switch `active_build_id` AND mark the build
-//!    COMPLETED;
+//!    COMPLETED, with the FTS search-index rebuild joined into the same
+//!    transaction (PRD §20 — index and pointer flip atomically);
 //! 7. delete the journal file.
 //!
 //! A crash after any step is resolved by [`recover_if_needed`]: the journal
@@ -37,8 +38,9 @@ use llm_wiki_core::error::{Result, WikiError};
 use llm_wiki_core::hash::sha256_hex;
 use llm_wiki_core::ids::BuildId;
 use llm_wiki_storage::{
-    activate_build, get_active_build_id, load_generation_pages, set_active_build,
-    update_build_status, WikiPageRecord,
+    activate_build_with_search_index, default_tokenizer, ensure_search_index_matches_active,
+    get_active_build_id, load_generation_pages, set_active_build, update_build_status,
+    WikiPageRecord,
 };
 
 /// Bounded rename retry (PRD §35): a reader holding the pointer file open on
@@ -423,8 +425,12 @@ pub fn publish(
     // Step 5: atomically replace the pointer.
     write_current_pointer(&paths, build_id)?;
 
-    // Step 6: ONE transaction — active_build_id AND COMPLETED.
-    activate_build(conn, build_id)?;
+    // Step 6: ONE transaction — active_build_id AND COMPLETED, with the FTS
+    // index rebuild for the activated generation joined into the same
+    // transaction (PRD §20: FTS and active_build_id flip atomically; a
+    // failure — e.g. an FTS5-less SQLite — aborts the publish and the
+    // previous generation stays fully visible).
+    activate_build_with_search_index(conn, build_id, default_tokenizer())?;
 
     // Step 7: clear the intent.
     clear_journal(&paths)?;
@@ -469,8 +475,10 @@ pub fn recover_if_needed(
 
     let Some(journal) = journal else {
         return match (&pointer, &db_active) {
-            (None, None) => Ok(None),
-            (Some(pointer), Some(active)) if pointer.build_id == active.as_str() => Ok(None),
+            (None, None) => verify_recovery_index(conn).map(|()| None),
+            (Some(pointer), Some(active)) if pointer.build_id == active.as_str() => {
+                verify_recovery_index(conn).map(|()| None)
+            }
             (Some(pointer), Some(active)) => Err(WikiError::PublishRecovery(format!(
                 "current.json points at {} but the database active_build_id is {} and there is no publish journal; refusing to guess",
                 pointer.build_id,
@@ -520,9 +528,11 @@ pub fn recover_if_needed(
         }
     } else if pointer_is_new {
         // Crash between steps 5 and 6: pointer moved, database not committed.
-        // Complete the verified new version when it still validates.
+        // Complete the verified new version — INCLUDING the search index
+        // rebuild, joined to the same commit-point transaction — when it
+        // still validates.
         if validate_generation_from_db(conn, &paths, &new_id).is_ok() {
-            activate_build(conn, &new_id)?;
+            activate_build_with_search_index(conn, &new_id, default_tokenizer())?;
             clear_journal(&paths)?;
             RecoveryReport {
                 action: RecoveryAction::CompletedNew,
@@ -562,8 +572,20 @@ pub fn recover_if_needed(
         )?
     };
 
+    // Post-recovery invariant (PRD §20/§35): the FTS index must cover exactly
+    // the ACTIVE generation's pages — recovery rebuilds on drift (and clears
+    // it when nothing is active) so search never serves a stale generation.
+    verify_recovery_index(conn)?;
+
     tracing::warn!(action = ?report.action, detail = %report.detail, "publish recovery ran");
     Ok(Some(report))
+}
+
+/// After ANY recovery outcome the index is re-verified against the active
+/// generation (rebuild on drift, clear when nothing is published).
+fn verify_recovery_index(conn: &mut rusqlite::Connection) -> Result<()> {
+    ensure_search_index_matches_active(conn, default_tokenizer())?;
+    Ok(())
 }
 
 /// Rolls back to the explicit old build recorded in the journal (PRD §35:

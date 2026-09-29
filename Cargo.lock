@@ -756,6 +756,7 @@ dependencies = [
  "llm-wiki-compiler",
  "llm-wiki-core",
  "llm-wiki-llm",
+ "llm-wiki-search",
  "llm-wiki-source",
  "llm-wiki-storage",
  "tokio",
@@ -805,6 +806,7 @@ dependencies = [
  "llm-wiki-compiler",
  "llm-wiki-core",
  "llm-wiki-llm",
+ "llm-wiki-search",
  "llm-wiki-storage",
  "serde",
  "serde_json",
@@ -840,7 +842,10 @@ dependencies = [
 name = "llm-wiki-search"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "llm-wiki-core",
+ "llm-wiki-storage",
+ "tokio",
 ]
 
 [[package]]
@@ -868,6 +873,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "llm-wiki-core",
+ "llm-wiki-markdown",
  "rusqlite",
  "serde",
  "serde_json",

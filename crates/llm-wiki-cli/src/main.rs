@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 use llm_wiki_core::config::{lexical_absolute, Config, LlmConfig};
 use llm_wiki_core::error::WikiError;
 use llm_wiki_llm::OpenAiCompatibleProvider;
+use llm_wiki_search::FullTextSearch;
 use llm_wiki_source::{ScanDiagnostic, Scanner, SourceManifest};
 
 #[derive(Parser)]
@@ -48,6 +49,13 @@ enum Command {
     },
     /// Show source counts and the latest build.
     Status,
+    /// Full-text search over the published wiki (PRD §5.5/§20): returns
+    /// page sections, not answers.
+    Search {
+        /// The query text (中文、English or mixed — the shared TextAnalyzer
+        /// handles all three).
+        query: String,
+    },
     /// Check configuration, filesystem layout, state db and provider env.
     Doctor,
     /// Lint the currently published generation (PRD §36): citation integrity,
@@ -83,6 +91,7 @@ fn run(command: Command) -> Result<(), WikiError> {
         Command::Build { root } => build(&workspace, root.as_deref()),
         Command::Replan { dry_run } => replan(&workspace, dry_run),
         Command::Status => status(&workspace),
+        Command::Search { query } => search(&workspace, &query),
         Command::Doctor => doctor(&workspace),
         Command::Lint => lint(&workspace),
     }
@@ -416,6 +425,47 @@ fn replan(workspace: &Path, dry_run: bool) -> Result<(), WikiError> {
     Ok(())
 }
 
+/// `llm-wiki search <query>` (PRD §5.5/§20): thin transport over
+/// `llm_wiki_search::FullTextSearch`. Prints ranked page sections with body
+/// snippets; a never-built workspace is not an error.
+fn search(workspace: &Path, query: &str) -> Result<(), WikiError> {
+    let config = load_config(workspace)?;
+    let db_path = state_db(workspace);
+    if !db_path.exists() {
+        println!("nothing published; run build first");
+        return Ok(());
+    }
+    let conn = llm_wiki_storage::open(&db_path)?;
+    let fts = llm_wiki_search::SqliteFullTextSearch::new(conn, config.search.full_text);
+    if !fts.has_published()? {
+        println!("nothing published; run build first");
+        return Ok(());
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| WikiError::Llm(format!("cannot start async runtime: {e}")))?;
+    let hits = runtime.block_on(fts.search(query, 10))?;
+
+    if hits.is_empty() {
+        println!("no results for {query:?}");
+        return Ok(());
+    }
+    for (rank_index, hit) in hits.iter().enumerate() {
+        println!(
+            "{}. {} [{}] @ {}",
+            rank_index + 1,
+            hit.title,
+            hit.slug,
+            hit.heading_path.join(" > ")
+        );
+        let snippet = hit.snippet.replace('\n', " ");
+        println!("   {snippet}");
+    }
+    Ok(())
+}
+
 fn warn_diagnostic(diagnostic: &ScanDiagnostic) {
     println!(
         "  ! {} {:?}: {}",
@@ -583,6 +633,23 @@ fn doctor(workspace: &Path) -> Result<(), WikiError> {
         let wiki_abs = lexical_absolute(workspace, &config.project.wiki_dir);
         let publish_state = check_publish_state(&conn, &wiki_abs);
         if !report("publish state", publish_state) {
+            failures += 1;
+        }
+
+        // FTS5 availability (PRD §20): with the bundled SQLite this always
+        // passes; a custom SQLite build without FTS5 must surface here as a
+        // reported degradation — search refuses to run rather than silently
+        // returning unusable results.
+        let fts_state = if llm_wiki_storage::probe_fts5(&conn) {
+            Ok("fts5 available".to_owned())
+        } else if config.search.full_text {
+            Err(WikiError::Index(
+                llm_wiki_storage::FTS5_UNAVAILABLE.to_owned(),
+            ))
+        } else {
+            Ok("fts5 unavailable (full-text search is disabled in config)".to_owned())
+        };
+        if !report("fts", fts_state) {
             failures += 1;
         }
     }

@@ -7,7 +7,7 @@
 //! can only disagree within a publish critical section, which the publish
 //! journal recovery resolves.
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Transaction};
 
 use llm_wiki_core::error::{Result, WikiError};
 use llm_wiki_core::ids::BuildId;
@@ -87,12 +87,12 @@ pub fn set_active_build(conn: &mut Connection, build_id: Option<&BuildId>) -> Re
     set_state(conn, ACTIVE_BUILD_KEY, build_id.map(|b| b.as_str()))
 }
 
-/// The publish commit point (PRD §35 step 6): ONE transaction that switches
-/// `active_build_id` and marks the build COMPLETED with its finish timestamp.
-pub fn activate_build(conn: &mut Connection, build_id: &BuildId) -> Result<()> {
-    let tx = conn
-        .transaction()
-        .map_err(|e| WikiError::Storage(format!("begin tx: {e}")))?;
+/// The §35 step-6 statements scoped to an OPEN transaction: switch
+/// `active_build_id` and mark the build COMPLETED with its finish timestamp.
+/// Shared by [`activate_build`] and the search-index composite
+/// (`search_index::activate_build_with_search_index`) so the FTS rebuild can
+/// join the SAME transaction and flip atomically with the pointer.
+pub(crate) fn activate_in_tx(tx: &Transaction, build_id: &BuildId) -> Result<()> {
     tx.execute(
         "INSERT INTO wiki_state (key, value) VALUES (?1, ?2)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -108,6 +108,16 @@ pub fn activate_build(conn: &mut Connection, build_id: &BuildId) -> Result<()> {
     if changed == 0 {
         return Err(WikiError::Storage(format!("unknown build {build_id}")));
     }
+    Ok(())
+}
+
+/// The publish commit point (PRD §35 step 6): ONE transaction that switches
+/// `active_build_id` and marks the build COMPLETED with its finish timestamp.
+pub fn activate_build(conn: &mut Connection, build_id: &BuildId) -> Result<()> {
+    let tx = conn
+        .transaction()
+        .map_err(|e| WikiError::Storage(format!("begin tx: {e}")))?;
+    activate_in_tx(&tx, build_id)?;
     tx.commit()
         .map_err(|e| WikiError::Storage(format!("commit activate_build: {e}")))?;
     Ok(())

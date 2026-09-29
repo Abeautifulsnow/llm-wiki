@@ -703,3 +703,106 @@ async fn second_identical_build_consumes_zero_new_llm_requests_and_keeps_the_man
 fn conn_of(path: &Path) -> rusqlite::Connection {
     open(path).unwrap()
 }
+
+// ---------------------------------------------------------------------------
+// Publish-step search index (PRD §20/§35: FTS joins the §35 step-6 transaction)
+// ---------------------------------------------------------------------------
+
+/// The tokenizer's OR-of-quoted-terms MATCH expression, mirroring the search
+/// crate's `fts_query` — keeps these tests independent of llm-wiki-search.
+fn fts_expression(tokenizer: &dyn llm_wiki_storage::SearchTokenizer, text: &str) -> String {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut terms = Vec::new();
+    for token in tokenizer.analyze(text) {
+        if seen.insert(token.clone()) {
+            terms.push(format!("\"{}\"", token.replace('"', "\"\"")));
+        }
+    }
+    terms.join(" OR ")
+}
+
+#[test]
+fn publish_flips_pointer_and_search_index_atomically() {
+    let wiki_dir = temp_dir("fts-publish");
+    let mut conn = open_in_memory().unwrap();
+    let tokenizer = llm_wiki_storage::default_tokenizer();
+
+    let first_pages = vec![page(
+        "streaming",
+        "# Streaming Processing\n\n## Checkpoints\n\n检查点默认每 30 秒持久化一次。\n",
+    )];
+    let first = new_build(&mut conn);
+    persist_generation(&mut conn, &first, &first_pages).unwrap();
+    publish(&mut conn, &wiki_dir, &first, &first_pages, 3).unwrap();
+
+    // CJK bigram + single-char queries hit the published page's section.
+    for query in ["检查点", "检查", "点"] {
+        let hits =
+            llm_wiki_storage::search_index(&conn, &fts_expression(tokenizer, query), 10).unwrap();
+        assert!(
+            hits.iter().any(|hit| hit.slug == "streaming"),
+            "query {query:?} must find the published page, got {:?}",
+            hits.iter().map(|h| h.slug.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    // A second publish replaces the index contents in the same transaction.
+    let second_pages = vec![page(
+        "sso",
+        "# Identity & Access\n\n配置单点登录（SSO）。\n",
+    )];
+    let second = new_build(&mut conn);
+    persist_generation(&mut conn, &second, &second_pages).unwrap();
+    publish(&mut conn, &wiki_dir, &second, &second_pages, 3).unwrap();
+
+    let hits =
+        llm_wiki_storage::search_index(&conn, &fts_expression(tokenizer, "检查点"), 10).unwrap();
+    assert!(
+        hits.iter().all(|hit| hit.slug != "streaming"),
+        "the superseded generation leaves the index"
+    );
+    let hits =
+        llm_wiki_storage::search_index(&conn, &fts_expression(tokenizer, "SSO 登录"), 10).unwrap();
+    assert_eq!(hits[0].slug, "sso");
+}
+
+#[test]
+fn recovery_rollback_rebuilds_the_previous_generation_index() {
+    let wiki_dir = temp_dir("fts-rollback");
+    let mut conn = open_in_memory().unwrap();
+    let tokenizer = llm_wiki_storage::default_tokenizer();
+
+    let old_pages = vec![page("old-doc", "# Old Doc\n\nrollback 检查点 content")];
+    let old_build = seed_published_generation(&mut conn, &wiki_dir, &old_pages);
+    // seed_published_generation writes only the filesystem side; the FTS
+    // rebuild reads wiki_pages rows, so persist the rolled-back generation.
+    persist_generation(&mut conn, &old_build, &old_pages).unwrap();
+    let new_pages = vec![page("new-doc", "# New Doc\n\nfresh 单点登录 content")];
+    let new_build = new_build(&mut conn);
+    persist_generation(&mut conn, &new_build, &new_pages).unwrap();
+
+    // Simulated crash: the database committed the new generation (index and
+    // all) but the pointer rename was lost — recovery must roll back to the
+    // explicit old build and the index must follow.
+    write_journal(&PublishPaths::new(&wiki_dir), Some(&old_build), &new_build).unwrap();
+    llm_wiki_storage::activate_build_with_search_index(&mut conn, &new_build, tokenizer).unwrap();
+    write_current_pointer(&PublishPaths::new(&wiki_dir), &old_build).unwrap();
+    assert_eq!(pointer_of(&wiki_dir).as_deref(), Some(old_build.as_str()));
+
+    let report = recover_if_needed(&mut conn, &wiki_dir).unwrap().unwrap();
+    assert!(matches!(
+        report.action,
+        llm_wiki_compiler::RecoveryAction::RolledBack
+    ));
+    assert_eq!(get_active_build_id(&conn).unwrap(), Some(old_build));
+
+    let hits =
+        llm_wiki_storage::search_index(&conn, &fts_expression(tokenizer, "检查点"), 10).unwrap();
+    assert!(hits.iter().any(|hit| hit.slug == "old-doc"), "{hits:?}");
+    let hits =
+        llm_wiki_storage::search_index(&conn, &fts_expression(tokenizer, "单点登录"), 10).unwrap();
+    assert!(
+        hits.iter().all(|hit| hit.slug != "new-doc"),
+        "the rolled-back generation never serves search: {hits:?}"
+    );
+}

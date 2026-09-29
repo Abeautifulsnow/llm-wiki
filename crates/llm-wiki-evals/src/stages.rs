@@ -314,7 +314,15 @@ pub fn eval_llm(dataset: &Dataset, expected: &ExpectedPages) -> Arc<dyn LlmProvi
             }
             "wiki-compilation" => {
                 let claims = claim_ids_in(prompt);
+                // Full-text baseline (PRD §20/§37.4): the body carries every
+                // claim's VERBATIM statement — the annotated corpus spans —
+                // so the V0.2 FTS gates retrieve real content (CJK spans
+                // included) rather than page titles alone.
+                let statements = json_string_values(prompt, "statement");
                 let mut body = String::from("## Overview\n\nThe eval page cites its claims.\n");
+                for statement in &statements {
+                    body.push_str(&format!("\n{statement}\n"));
+                }
                 for id in &claims {
                     body.push_str(&format!("\n<!-- llm-wiki:cite claim=\"{id}\" -->\n"));
                 }

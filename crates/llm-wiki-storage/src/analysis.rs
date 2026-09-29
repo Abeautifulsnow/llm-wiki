@@ -781,10 +781,14 @@ mod tests {
         let retired = retire_source_knowledge(&mut conn, &source_id, Some("bld_del")).unwrap();
         assert_eq!(retired.retired_claims, 2);
         assert_eq!(retired.retired_relations, 0);
-        assert_eq!(
-            retired.affected_nodes,
-            vec![only_node.clone(), shared_node.clone()]
-        );
+        // Order-insensitive: node ids minted in the same millisecond sort
+        // randomly, and affected_nodes is a set (the §19 mapping treats it as
+        // one).
+        let mut affected = retired.affected_nodes.clone();
+        let mut expected_affected = vec![only_node.clone(), shared_node.clone()];
+        affected.sort();
+        expected_affected.sort();
+        assert_eq!(affected, expected_affected);
         // The node only this source supported is retired from the registry;
         // the shared node stays (the other source still claims it).
         assert_eq!(retired.retired_registry_nodes, vec![only_node.clone()]);

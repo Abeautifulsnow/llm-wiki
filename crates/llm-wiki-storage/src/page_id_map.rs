@@ -96,14 +96,14 @@ fn row_to_entry(row: &rusqlite::Row) -> rusqlite::Result<PageIdMapEntry> {
 }
 
 /// Every relation whose PREDECESSOR is `page_id` — "what happened to this old
-/// page" (deterministic order: mapping id, which is chronological).
+/// page" (deterministic order: insertion rowid — mapping ids are random within one millisecond).
 pub fn list_page_id_maps_by_predecessor(
     conn: &Connection,
     page_id: &WikiPageId,
 ) -> Result<Vec<PageIdMapEntry>> {
     let mut stmt = conn
         .prepare(&format!(
-            "{SELECT_ENTRY} WHERE predecessor_page_id = ?1 ORDER BY mapping_id"
+            "{SELECT_ENTRY} WHERE predecessor_page_id = ?1 ORDER BY rowid"
         ))
         .map_err(|e| WikiError::Storage(format!("prepare page_id_map by predecessor: {e}")))?;
     let rows = stmt
@@ -117,14 +117,14 @@ pub fn list_page_id_maps_by_predecessor(
 }
 
 /// Every relation whose SUCCESSOR is `page_id` — "where did this page come
-/// from" (deterministic order: mapping id).
+/// from" (deterministic order: insertion rowid).
 pub fn list_page_id_maps_by_successor(
     conn: &Connection,
     page_id: &WikiPageId,
 ) -> Result<Vec<PageIdMapEntry>> {
     let mut stmt = conn
         .prepare(&format!(
-            "{SELECT_ENTRY} WHERE successor_page_id = ?1 ORDER BY mapping_id"
+            "{SELECT_ENTRY} WHERE successor_page_id = ?1 ORDER BY rowid"
         ))
         .map_err(|e| WikiError::Storage(format!("prepare page_id_map by successor: {e}")))?;
     let rows = stmt
@@ -137,14 +137,14 @@ pub fn list_page_id_maps_by_successor(
     Ok(out)
 }
 
-/// Every relation written by one build (deterministic order: mapping id).
+/// Every relation written by one build (deterministic order: insertion rowid).
 pub fn list_page_id_maps_for_build(
     conn: &Connection,
     build_id: &BuildId,
 ) -> Result<Vec<PageIdMapEntry>> {
     let mut stmt = conn
         .prepare(&format!(
-            "{SELECT_ENTRY} WHERE build_id = ?1 ORDER BY mapping_id"
+            "{SELECT_ENTRY} WHERE build_id = ?1 ORDER BY rowid"
         ))
         .map_err(|e| WikiError::Storage(format!("prepare page_id_map by build: {e}")))?;
     let rows = stmt
