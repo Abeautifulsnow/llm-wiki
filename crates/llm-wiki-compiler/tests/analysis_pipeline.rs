@@ -172,6 +172,47 @@ fn lenient_analyzer(provider: Arc<dyn LlmProvider>) -> DocumentAnalyzer {
     )
 }
 
+/// D1 red-test for the T1 fix (`425ec0c`): the configured
+/// `[llm] max_output_tokens` must reach the request — dropping the wiring in
+/// `build.rs`/`replan.rs` must turn this test red, not pass silently.
+#[tokio::test]
+async fn configured_max_output_tokens_reaches_the_analysis_request() {
+    let doc = fixture_doc();
+    let id_a = doc.sections[0].section_id.clone();
+    let response = analysis_response(
+        "One fact.",
+        serde_json::json!([valid_claim(
+            &id_a,
+            "retries the resolved to active transition up to three times"
+        )]),
+        serde_json::json!([]),
+    );
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let llm = Arc::new(FakeLlmProvider::new(
+        "fake-analysis",
+        Arc::new(move |request: &LlmRequest| {
+            log.lock().unwrap().push(request.max_output_tokens);
+            Ok(response.clone())
+        }),
+    ));
+    let analyzer = DocumentAnalyzer::new(
+        llm.clone(),
+        llm_wiki_compiler::load_prompt("document-analysis", None).unwrap(),
+        6000,
+        0.10,
+        12_345,
+    );
+    analyzer.analyze_document(&doc, None).await.unwrap();
+    let seen = seen.lock().unwrap().clone();
+    assert!(!seen.is_empty(), "the analyzer issued no requests");
+    assert!(
+        seen.iter().all(|&tokens| tokens == 12_345),
+        "request budgets {:?} != configured 12345",
+        seen
+    );
+}
+
 #[tokio::test]
 async fn happy_path_verifies_claims_and_persists_knowledge() {
     let doc = fixture_doc();

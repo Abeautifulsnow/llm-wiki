@@ -29,7 +29,9 @@ use crate::prompt::PromptDocument;
 
 /// Upper bound of the per-page output budget (`build_page_request` clamps
 /// every page to this ceiling); `replan --dry-run` uses it for the estimated
-/// compile cost upper bound (PRD §19.2).
+/// compile cost upper bound (PRD §19.2). NOT a hard system cap:
+/// `CompilerConfig.min_output_tokens` (from `[llm] max_output_tokens`) may
+/// push a request above this — thinking models legitimately need the room.
 pub const MAX_PAGE_OUTPUT_TOKENS: u32 = 16_384;
 
 #[derive(Debug, Clone)]

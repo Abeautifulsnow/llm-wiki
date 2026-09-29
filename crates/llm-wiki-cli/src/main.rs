@@ -151,6 +151,9 @@ provider = "openai-compatible"
 base_url = "http://localhost:8000/v1"
 model = ""
 api_key_env = "LLM_WIKI_API_KEY"
+# Thinking models spend reasoning tokens from this budget — raise for
+# deepseek-style models (4096 exhausts before any visible output).
+max_output_tokens = 4096
 max_concurrency = 4
 timeout_seconds = 120
 

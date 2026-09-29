@@ -77,7 +77,10 @@ llm-wiki replan                     # execute: stable page IDs survive merges/sp
 
 Model quality matters: extraction demands strict JSON and precise evidence
 ranges. Small local models may trip the rejected-claim safety gate — a
-mid-tier or larger model is recommended until measured otherwise.
+mid-tier or larger model is recommended until measured otherwise. Thinking
+models (deepseek-style) burn reasoning tokens from the request output budget:
+raise `[llm] max_output_tokens` (e.g. 32768) or analysis fails with
+`NO_JSON` before any visible output.
 
 ## Development
 
