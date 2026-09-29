@@ -12,6 +12,7 @@ pub mod connection;
 pub mod decisions;
 pub mod knowledge;
 pub mod migrations;
+pub mod page_id_map;
 pub mod registry;
 pub mod sections;
 pub mod sources;
@@ -30,11 +31,17 @@ pub use builds::{
 pub use cache::{count_cache_entries, get_cached_response, put_cached_response, CacheRow};
 pub use connection::{open, open_in_memory, Connection};
 pub use decisions::{
-    insert_plan_decision, list_plan_decisions, PlanDecision, PlanDecisionRow, OUTCOME_FAST_PATH,
-    OUTCOME_LOCAL_UPDATE, OUTCOME_REPLAN_REQUIRED, TRIGGER_FINGERPRINT_CHANGED,
+    insert_plan_decision, list_plan_decisions, list_recent_plan_decisions_by_outcome, PlanDecision,
+    PlanDecisionRow, OUTCOME_FAST_PATH, OUTCOME_LOCAL_UPDATE, OUTCOME_REPLAN_DRY_RUN,
+    OUTCOME_REPLAN_EXECUTED, OUTCOME_REPLAN_REQUIRED, TRIGGER_FINGERPRINT_CHANGED,
     TRIGGER_PAGE_EMPTIED, TRIGGER_STRUCTURAL_CHANGE, TRIGGER_UNMAPPABLE_NODE,
 };
 pub use knowledge::{list_active_relation_pairs, load_knowledge_base, load_plan_input};
+pub use page_id_map::{
+    insert_page_id_maps, list_page_id_maps_by_predecessor, list_page_id_maps_by_successor,
+    list_page_id_maps_for_build, PageIdMapEntry, PageIdMapRow, MAP_KIND_KEEP, MAP_KIND_MERGE,
+    MAP_KIND_RETIRE, MAP_KIND_SPLIT,
+};
 pub use registry::{
     canonical_key, current_revision, get_entry, get_or_create, get_or_create_batch, merge, resolve,
     retire, NodeDraft, NodeKind, RegistryEntry,

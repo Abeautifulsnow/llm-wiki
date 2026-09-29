@@ -18,6 +18,11 @@ use llm_wiki_core::ids::{BuildId, DecisionId, SourceId};
 pub const OUTCOME_LOCAL_UPDATE: &str = "local-update";
 pub const OUTCOME_REPLAN_REQUIRED: &str = "replan-required";
 pub const OUTCOME_FAST_PATH: &str = "fast-path";
+/// Explicit global re-plan audit outcomes (PRD §19.2/§29, V0.2): written by
+/// `llm-wiki replan` — `--dry-run` audits the diff and cost estimate without
+/// compiling or publishing; the bare command records the executed replan.
+pub const OUTCOME_REPLAN_DRY_RUN: &str = "replan-dry-run";
+pub const OUTCOME_REPLAN_EXECUTED: &str = "replan-executed";
 
 /// Recorded triggers (PRD §19.2; the fingerprint guard adds its own).
 pub const TRIGGER_FINGERPRINT_CHANGED: &str = "fingerprint-changed";
@@ -125,6 +130,55 @@ pub fn list_plan_decisions(conn: &Connection, build_id: &BuildId) -> Result<Vec<
     Ok(out)
 }
 
+/// Loads the most recent decision rows with one outcome ACROSS builds — the
+/// audit substrate `replan --dry-run` reads to report WHY the workspace needs
+/// a re-plan (pending `replan-required` rows, PRD §19.2). Deterministic:
+/// newest first, id as the tie-break.
+pub fn list_recent_plan_decisions_by_outcome(
+    conn: &Connection,
+    outcome: &str,
+    limit: u32,
+) -> Result<Vec<PlanDecisionRow>> {
+    let limit = limit.max(1);
+    let mut stmt = conn
+        .prepare(
+            "SELECT decision_id, build_id, source_id, outcome, \"trigger\", affected_pages, notes, created_at
+             FROM plan_decisions WHERE outcome = ?1
+             ORDER BY created_at DESC, decision_id DESC LIMIT ?2",
+        )
+        .map_err(|e| WikiError::Storage(format!("prepare decisions by outcome: {e}")))?;
+    let rows = stmt
+        .query_map(params![outcome, limit], |row| {
+            Ok((
+                row.get::<_, String>("decision_id")?,
+                row.get::<_, String>("build_id")?,
+                row.get::<_, Option<String>>("source_id")?,
+                row.get::<_, String>("outcome")?,
+                row.get::<_, Option<String>>("trigger")?,
+                row.get::<_, i64>("affected_pages")?,
+                row.get::<_, String>("notes")?,
+                row.get::<_, String>("created_at")?,
+            ))
+        })
+        .map_err(|e| WikiError::Storage(format!("decisions by outcome: {e}")))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (decision_id, build_id, source_id, outcome, trigger, affected_pages, notes, created_at) =
+            row.map_err(db)?;
+        out.push(PlanDecisionRow {
+            decision_id: DecisionId::from_validated(decision_id),
+            build_id: BuildId::from_validated(build_id),
+            source_id: source_id.map(SourceId::from_validated),
+            outcome,
+            trigger,
+            affected_pages: affected_pages.max(0) as u32,
+            notes,
+            created_at,
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +247,59 @@ mod tests {
         assert!(list_plan_decisions(&conn, &BuildId::generate())
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn recent_decisions_by_outcome_span_builds_newest_first() {
+        let mut conn = open_in_memory().unwrap();
+        let first =
+            crate::builds::start_build(&mut conn, &crate::builds::BuildDraft::default()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let second =
+            crate::builds::start_build(&mut conn, &crate::builds::BuildDraft::default()).unwrap();
+        for (build, note) in [(&first, "older drift"), (&second, "newer drift")] {
+            insert_plan_decision(
+                &mut conn,
+                &PlanDecision {
+                    build_id: build.clone(),
+                    source_id: None,
+                    outcome: OUTCOME_REPLAN_REQUIRED.to_owned(),
+                    trigger: Some(TRIGGER_FINGERPRINT_CHANGED.to_owned()),
+                    affected_pages: 0,
+                    notes: note.to_owned(),
+                },
+            )
+            .unwrap();
+        }
+        // A fast-path row must not leak into the replan-required query.
+        insert_plan_decision(
+            &mut conn,
+            &PlanDecision {
+                build_id: second.clone(),
+                source_id: None,
+                outcome: OUTCOME_FAST_PATH.to_owned(),
+                trigger: None,
+                affected_pages: 0,
+                notes: "no changes".into(),
+            },
+        )
+        .unwrap();
+
+        let rows =
+            list_recent_plan_decisions_by_outcome(&conn, OUTCOME_REPLAN_REQUIRED, 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].build_id, second, "newest first");
+        assert_eq!(rows[1].build_id, first);
+
+        let limited =
+            list_recent_plan_decisions_by_outcome(&conn, OUTCOME_REPLAN_REQUIRED, 1).unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].build_id, second);
+
+        assert!(
+            list_recent_plan_decisions_by_outcome(&conn, "no-such-outcome", 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

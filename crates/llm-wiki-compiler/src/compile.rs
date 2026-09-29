@@ -27,6 +27,11 @@ use llm_wiki_storage::{PageCitationRecord, PageLinkRecord, WikiPageRecord};
 use crate::cache::{generate_cached, remember_validated, repair_request, StageCache};
 use crate::prompt::PromptDocument;
 
+/// Upper bound of the per-page output budget (`build_page_request` clamps
+/// every page to this ceiling); `replan --dry-run` uses it for the estimated
+/// compile cost upper bound (PRD §19.2).
+pub const MAX_PAGE_OUTPUT_TOKENS: u32 = 16_384;
+
 #[derive(Debug, Clone)]
 pub struct CompilerConfig {
     /// Instruction for the writing language (goes into the prompt).
@@ -285,8 +290,8 @@ impl WikiCompiler {
         }
 
         // Output scales with the knowledge the page may render.
-        let max_output_tokens =
-            (estimate_tokens(&knowledge_json) * 6 + 2_000).clamp(2_048, 16_384) as u32;
+        let max_output_tokens = (estimate_tokens(&knowledge_json) * 6 + 2_000)
+            .clamp(2_048, u64::from(MAX_PAGE_OUTPUT_TOKENS)) as u32;
 
         let template = self.prompt.render(&[
             ("LANGUAGE", &self.config.language),

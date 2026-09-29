@@ -37,6 +37,15 @@ enum Command {
         /// Source root override (defaults to config `source.root`).
         root: Option<String>,
     },
+    /// Explicit global re-plan (PRD §19.2/§29): fresh planning + stable-ID
+    /// plan diff. `--dry-run` audits the change and cost WITHOUT compiling or
+    /// publishing; the bare command executes and republishes — it IS the user
+    /// confirmation, so audit with `--dry-run` first.
+    Replan {
+        /// Audit only: no compiler calls, no generation, no publish.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Show source counts and the latest build.
     Status,
     /// Check configuration, filesystem layout, state db and provider env.
@@ -72,6 +81,7 @@ fn run(command: Command) -> Result<(), WikiError> {
         Command::Init => init(&workspace),
         Command::Scan { root } => scan(&workspace, root.as_deref()),
         Command::Build { root } => build(&workspace, root.as_deref()),
+        Command::Replan { dry_run } => replan(&workspace, dry_run),
         Command::Status => status(&workspace),
         Command::Doctor => doctor(&workspace),
         Command::Lint => lint(&workspace),
@@ -306,6 +316,100 @@ fn build(workspace: &Path, root_override: Option<&str>) -> Result<(), WikiError>
         }
     }
     println!("  published: {}", report.published_path.display());
+    if let Some(recovery) = &report.recovery {
+        println!("  recovered publish: {recovery}");
+    }
+    Ok(())
+}
+
+/// `llm-wiki replan [--dry-run]` (PRD §29/§19.2): thin transport over the
+/// compiler's replan service.
+fn replan(workspace: &Path, dry_run: bool) -> Result<(), WikiError> {
+    let config = load_config(workspace)?;
+    config.validate()?;
+    let provider = build_provider(&config.llm)?;
+
+    if dry_run {
+        println!("replan --dry-run: auditing the global plan change (no compile, no publish)");
+    } else {
+        println!("replan: fresh planning + stable-ID plan diff + recompile of every changed page");
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| WikiError::Llm(format!("cannot start async runtime: {e}")))?;
+    let report = runtime.block_on(llm_wiki_compiler::replan(
+        workspace, &config, provider, dry_run,
+    ))?;
+
+    for trigger in &report.triggers {
+        println!("  trigger: {trigger}");
+    }
+    println!(
+        "  diff: {} unchanged, {} modified, {} merged, {} split, {} created, {} retired",
+        report.unchanged,
+        report.modified,
+        report.merged,
+        report.split,
+        report.created,
+        report.retired
+    );
+    for (slug, predecessors) in &report.merged_pages {
+        println!("    merged: {slug} ← {}", predecessors.join(", "));
+    }
+    for (slug, successors) in &report.split_pages {
+        println!("    split: {slug} → {}", successors.join(", "));
+    }
+    for (slug, lost) in &report.retired_pages {
+        if lost.is_empty() {
+            println!("    retired: {slug}");
+        } else {
+            println!(
+                "    retired: {slug} ({} ref(s) no new page covers)",
+                lost.len()
+            );
+        }
+    }
+    for warning in &report.knowledge_loss_warnings {
+        println!("  warning: {warning}");
+    }
+    if report.dry_run {
+        println!(
+            "  estimate: {} compile llm call(s), cost upper bound {} output tokens",
+            report.estimated_compile_llm_calls, report.estimated_max_output_tokens
+        );
+        println!(
+            "  spent on this audit: {} llm request(s) (cache: {} hit(s), {} miss(es))",
+            report.llm_request_count, report.cache.hits, report.cache.misses
+        );
+        if report.no_replan_needed {
+            println!("replan: nothing to change — the fresh plan matches the current generation");
+        } else {
+            println!("next: review the diff, then run `llm-wiki replan` to execute");
+        }
+        return Ok(());
+    }
+
+    if report.no_replan_needed {
+        println!("replan: nothing to change — the fresh plan matches the current generation");
+        return Ok(());
+    }
+    if let Some(build_id) = &report.build_id {
+        println!("replan {} completed", build_id);
+    }
+    println!(
+        "  pages: {}  citations: {}  links: {}  ({} recompiled, {} carried)",
+        report.pages, report.citations, report.links, report.recompiled, report.carried
+    );
+    println!("  llm requests: {}", report.llm_request_count);
+    println!(
+        "  llm cache: {} hit(s), {} miss(es)",
+        report.cache.hits, report.cache.misses
+    );
+    if let Some(path) = &report.published_path {
+        println!("  published: {}", path.display());
+    }
     if let Some(recovery) = &report.recovery {
         println!("  recovered publish: {recovery}");
     }

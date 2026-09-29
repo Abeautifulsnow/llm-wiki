@@ -152,6 +152,14 @@ opaque_id!(
 );
 
 opaque_id!(
+    /// Page-identity map row identity (PRD §45): one merge/split/retire/keep
+    /// relation between a predecessor and a successor `WikiPageId`, written to
+    /// `page_id_map` (migration 0007) by the explicit global re-plan.
+    PageMapId,
+    "pgm"
+);
+
+opaque_id!(
     /// Recomputable source locator: `hash(workspace + normalized relative path)`
     /// (PRD §8.2). Not an identity — the Source Registry maps it to a
     /// [`SourceId`].

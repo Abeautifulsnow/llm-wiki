@@ -54,8 +54,9 @@ use crate::plan::{PlannerConfig, WikiPlanner};
 use crate::prompt::{load_prompt, PromptDocument};
 use crate::publish::{publish, recover_if_needed, PublishPaths};
 
-/// Response schema version recorded on builds and cache rows (§28).
-const SCHEMA_VERSION: &str = "1";
+/// Response schema version recorded on builds and cache rows (§28); shared
+/// with the replan pipeline so cache keys and fingerprints agree.
+pub(crate) const SCHEMA_VERSION: &str = "1";
 
 /// §19 incremental outcome summary surfaced on the build report and CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,32 +95,29 @@ pub struct BuildReport {
     pub incremental: Option<IncrementalSummary>,
 }
 
-/// Runs the whole V0.1 build pipeline. `workspace_root` is the project
-/// directory holding `.llm-wiki/config.toml`; paths inside `config` are
-/// resolved against it.
-pub async fn run_build(
-    workspace_root: &Path,
+/// Prompts, hashes, fingerprint and §28 cache shared by `run_build` and the
+/// explicit re-plan (`replan.rs`): both commands must derive IDENTICAL cache
+/// keys and BuildFingerprints so a dry-run warms the cache for the execute
+/// and fingerprints stay comparable (PRD §28/§19.2).
+pub(crate) struct PipelineEnv {
+    pub analysis_prompt: PromptDocument,
+    pub planning_prompt: PromptDocument,
+    pub compilation_prompt: PromptDocument,
+    pub config_hash: String,
+    /// `name@version` of the analysis prompt.
+    pub prompt_version: String,
+    /// Canonical BuildFingerprint JSON (PRD §18.1/§19.2).
+    pub fingerprint_json: String,
+    pub cache: Arc<LlmCache>,
+}
+
+/// Loads prompts, derives the config hash + BuildFingerprint and opens the
+/// §28 LLM cache over `state_dir/state.db`.
+pub(crate) fn prepare_pipeline_env(
+    state_dir: &Path,
     config: &Config,
-    provider: Arc<dyn LlmProvider>,
-) -> Result<BuildReport> {
-    config.validate()?;
-    let root = lexical_absolute(workspace_root, &config.source.root);
-    let wiki_dir = lexical_absolute(workspace_root, &config.project.wiki_dir);
-
-    let state_dir = workspace_root.join(".llm-wiki");
-    std::fs::create_dir_all(&state_dir)
-        .map_err(|e| WikiError::Source(format!("cannot create state dir: {e}")))?;
-    let mut conn = open(&state_dir.join("state.db"))?;
-
-    // Startup recovery: stale builds from a dead process are INTERRUPTED and
-    // a possibly-interrupted publish is resolved before anything new starts.
-    let stale = mark_stale_builds_interrupted(&mut conn)?;
-    if stale > 0 {
-        tracing::warn!(count = stale, "marked stale builds INTERRUPTED");
-    }
-    let recovery = recover_if_needed(&mut conn, &wiki_dir)?;
-    let recovery_note = recovery.map(|report| report.detail);
-
+    provider: &Arc<dyn LlmProvider>,
+) -> Result<PipelineEnv> {
     let analysis_prompt = load_prompt("document-analysis", None)?;
     let planning_prompt = load_prompt("wiki-planning", None)?;
     let compilation_prompt = load_prompt("wiki-compilation", None)?;
@@ -147,7 +145,6 @@ pub async fn run_build(
         parser_version: llm_wiki_markdown::PARSER_VERSION.to_owned(),
         config_hash: config_hash.clone(),
     };
-    let fingerprint_json = fingerprint.to_json();
 
     // §28 LLM cache: its own connection to the same state db (WAL + busy
     // timeout keep the two safe). The key material covers model, per-task
@@ -176,6 +173,55 @@ pub async fn run_build(
             config_hash: config_hash.clone(),
         },
     )?);
+
+    Ok(PipelineEnv {
+        analysis_prompt,
+        planning_prompt,
+        compilation_prompt,
+        config_hash,
+        prompt_version,
+        fingerprint_json: fingerprint.to_json(),
+        cache,
+    })
+}
+
+/// Runs the whole V0.1 build pipeline. `workspace_root` is the project
+/// directory holding `.llm-wiki/config.toml`; paths inside `config` are
+/// resolved against it.
+pub async fn run_build(
+    workspace_root: &Path,
+    config: &Config,
+    provider: Arc<dyn LlmProvider>,
+) -> Result<BuildReport> {
+    config.validate()?;
+    let root = lexical_absolute(workspace_root, &config.source.root);
+    let wiki_dir = lexical_absolute(workspace_root, &config.project.wiki_dir);
+
+    let state_dir = workspace_root.join(".llm-wiki");
+    std::fs::create_dir_all(&state_dir)
+        .map_err(|e| WikiError::Source(format!("cannot create state dir: {e}")))?;
+    let mut conn = open(&state_dir.join("state.db"))?;
+
+    // Startup recovery: stale builds from a dead process are INTERRUPTED and
+    // a possibly-interrupted publish is resolved before anything new starts.
+    let stale = mark_stale_builds_interrupted(&mut conn)?;
+    if stale > 0 {
+        tracing::warn!(count = stale, "marked stale builds INTERRUPTED");
+    }
+    let recovery = recover_if_needed(&mut conn, &wiki_dir)?;
+    let recovery_note = recovery.map(|report| report.detail);
+
+    // Shared pipeline environment (prompts, config hash, fingerprint, §28
+    // cache) — identical for `build` and `replan` so cache keys and
+    // fingerprints agree across the two commands.
+    let env = prepare_pipeline_env(&state_dir, config, &provider)?;
+    let analysis_prompt = env.analysis_prompt.clone();
+    let planning_prompt = env.planning_prompt.clone();
+    let compilation_prompt = env.compilation_prompt.clone();
+    let config_hash = env.config_hash.clone();
+    let prompt_version = env.prompt_version.clone();
+    let fingerprint_json = env.fingerprint_json.clone();
+    let cache = env.cache.clone();
 
     let build_id = start_build(
         &mut conn,
@@ -239,7 +285,7 @@ pub async fn run_build(
 }
 
 /// Maps an error to the §31 terminal status the build must be marked with.
-fn terminal_status_for(err: &WikiError) -> &'static str {
+pub(crate) fn terminal_status_for(err: &WikiError) -> &'static str {
     match err {
         WikiError::ReplanRequired { .. } => "REPLAN_REQUIRED",
         _ => "FAILED",
@@ -247,7 +293,7 @@ fn terminal_status_for(err: &WikiError) -> &'static str {
 }
 
 /// Persists one §19.2 decision row (every judgment is recorded).
-fn record_decision(
+pub(crate) fn record_decision(
     conn: &mut rusqlite::Connection,
     build_id: &BuildId,
     source_id: Option<&SourceId>,
@@ -484,7 +530,7 @@ async fn build_inner(
     .with_cache(stage_cache.clone());
     let mut llm_request_count = 0u32;
     for (file, source_id, parsed_doc) in &parsed {
-        let sections = register_sections(conn, source_id, &parsed_doc.sections, build_id)?;
+        let sections = register_sections(conn, source_id, &parsed_doc.sections, Some(build_id))?;
         let doc = AnalyzedDocument {
             source_id: source_id.clone(),
             rel_path: file.rel_path.clone(),
@@ -696,7 +742,7 @@ async fn build_incremental(
     .with_cache(stage_cache.clone());
     let mut llm_request_count = 0u32;
     for (file, source_id, parsed_doc) in &parsed {
-        let sections = register_sections(conn, source_id, &parsed_doc.sections, build_id)?;
+        let sections = register_sections(conn, source_id, &parsed_doc.sections, Some(build_id))?;
         let doc = AnalyzedDocument {
             source_id: source_id.clone(),
             rel_path: file.rel_path.clone(),
@@ -994,11 +1040,11 @@ async fn build_incremental(
 /// identities are carried across builds deterministically; ambiguous matches
 /// are re-analyzed under a FRESH identity (never reusing the old id), and
 /// unmatched previous sections retire.
-fn register_sections(
+pub(crate) fn register_sections(
     conn: &mut rusqlite::Connection,
     source_id: &llm_wiki_core::ids::SourceId,
     sections: &[llm_wiki_markdown::SectionOutput],
-    build_id: &BuildId,
+    build_id: Option<&BuildId>,
 ) -> Result<Vec<crate::analysis::AnalysisSection>> {
     let prev: Vec<PrevSection> = load_active_sections(conn, source_id)?
         .into_iter()
@@ -1046,7 +1092,7 @@ fn register_sections(
         &current,
         &ranges,
         &created_ids,
-        Some(build_id.as_str()),
+        build_id.map(|id| id.as_str().to_owned()).as_deref(),
     )?;
 
     Ok(sections
@@ -1073,7 +1119,7 @@ fn register_sections(
 
 /// Relative path of `wiki_dir` inside the source root (hard-exclude defense
 /// in depth, PRD §8.4); `None` when wiki_dir lives outside the source tree.
-fn normalized_rel_of(root: &Path, wiki_dir: &Path) -> Option<String> {
+pub(crate) fn normalized_rel_of(root: &Path, wiki_dir: &Path) -> Option<String> {
     wiki_dir.strip_prefix(root).ok().map(|rel| {
         rel.components()
             .map(|c| c.as_os_str().to_string_lossy())
@@ -1082,7 +1128,7 @@ fn normalized_rel_of(root: &Path, wiki_dir: &Path) -> Option<String> {
     })
 }
 
-fn warn_diagnostic(diagnostic: &ScanDiagnostic) {
+pub(crate) fn warn_diagnostic(diagnostic: &ScanDiagnostic) {
     tracing::warn!(
         source = %diagnostic.rel_path,
         kind = ?diagnostic.kind,

@@ -16,6 +16,7 @@ pub mod persist;
 pub mod plan;
 pub mod prompt;
 pub mod publish;
+pub mod replan;
 
 pub use analysis::{
     AnalysisOutcome, AnalysisSection, AnalyzedDocument, DocumentAnalyzer, VerifiedRelation,
@@ -38,3 +39,4 @@ pub use publish::{
     PublishJournal, PublishPaths, PublishReport, RecoveryAction, RecoveryReport, RENAME_ATTEMPTS,
     RENAME_RETRY_DELAY,
 };
+pub use replan::{plan_diff, replan, PlanDiff, ReplanReport};

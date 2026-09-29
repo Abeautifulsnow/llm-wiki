@@ -78,6 +78,12 @@ pub struct WikiPlanner {
     /// §45 plan-identity: `plan_cache_identity(...)` over config/model/schema;
     /// `Some` enables plan persistence under the reconciliation key.
     plan_identity: Option<String>,
+    /// §19.2 explicit re-plan: when `true` the plan-identity short-circuit is
+    /// DISABLED — planning always runs fresh so the diff against the current
+    /// generation reflects the planner's actual output. The request-level §28
+    /// cache and plan persistence stay intact, so a `replan --dry-run` warms
+    /// the stage cache and the follow-up execute pays for planning once.
+    force_fresh: bool,
 }
 
 impl WikiPlanner {
@@ -92,6 +98,7 @@ impl WikiPlanner {
             config,
             cache: None,
             plan_identity: None,
+            force_fresh: false,
         }
     }
 
@@ -101,6 +108,14 @@ impl WikiPlanner {
     pub fn with_plan_cache(mut self, cache: Arc<dyn StageCache>, identity: String) -> Self {
         self.cache = Some(cache);
         self.plan_identity = Some(identity);
+        self
+    }
+
+    /// Forces FRESH planning by skipping the plan-identity short-circuit
+    /// (§19.2: `llm-wiki replan` must re-derive the plan even when the
+    /// reconciliation key still matches). Idempotent; default is `false`.
+    pub fn with_force_fresh(mut self, force_fresh: bool) -> Self {
+        self.force_fresh = force_fresh;
         self
     }
 
@@ -295,8 +310,13 @@ impl WikiPlanner {
 
     /// On a reconciliation-key hit, returns the stored validated plan — page
     /// IDs included — so rebuilds reuse planner-assigned identity (§45) with
-    /// zero LLM requests.
+    /// zero LLM requests. Skipped entirely when force-fresh planning was
+    /// requested (§19.2 explicit re-plan).
     fn cached_plan(&self, reconcile_key: &str) -> Result<Option<WikiPlan>> {
+        if self.force_fresh {
+            tracing::info!("force-fresh planning: skipping the plan-identity short-circuit");
+            return Ok(None);
+        }
         let (cache, identity) = match (&self.cache, &self.plan_identity) {
             (Some(cache), Some(identity)) => (cache, identity),
             _ => return Ok(None),
