@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use llm_wiki_core::error::{Result, WikiError};
 use llm_wiki_core::ids::WikiPageId;
+use llm_wiki_storage::graph::{graph_expand_from_page, GraphNeighbor};
 use llm_wiki_storage::search_index::{self, SearchTokenizer};
 use tokio::task::spawn_blocking;
 
@@ -109,6 +110,50 @@ impl SqliteFullTextSearch {
             .lock()
             .map_err(|poisoned| WikiError::Storage(poisoned.to_string()))?;
         Ok(llm_wiki_storage::get_active_build_id(&conn)?.is_some())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Graph exploration (PRD §17/§22)
+// ---------------------------------------------------------------------------
+
+/// One-hop Wiki-Graph expansion façade (PRD §17 graph, §22 limits). The
+/// stored graph is maintained by the publish flow regardless of config;
+/// `config.search.graph` gates the CONSUMPTION side — the CLI skips calling
+/// this façade when it is false, so a disabled flag costs nothing and a
+/// enabled one always reads the active generation's graph. Dependency
+/// direction unchanged: search → {core, storage}.
+pub struct SqliteGraphExploration {
+    conn: Arc<Mutex<llm_wiki_storage::Connection>>,
+}
+
+impl SqliteGraphExploration {
+    pub fn new(conn: llm_wiki_storage::Connection) -> Self {
+        Self {
+            conn: Arc::new(Mutex::new(conn)),
+        }
+    }
+
+    /// One-hop neighbors of a wiki page, deterministic and capped (pass
+    /// [`llm_wiki_storage::EXPAND_MAX_NODES`] for the §22 default). The page
+    /// reaches other pages via `links_to` (both directions) and — once edge
+    /// producers exist — entities/concepts via analysis relations, which the
+    /// storage expansion already supports for any node type.
+    pub async fn neighbors_of_page(
+        &self,
+        page_id: &WikiPageId,
+        limit: usize,
+    ) -> Result<Vec<GraphNeighbor>> {
+        let shared = Arc::clone(&self.conn);
+        let page_id = page_id.clone();
+        spawn_blocking(move || {
+            let conn = shared
+                .lock()
+                .map_err(|poisoned| WikiError::Storage(poisoned.to_string()))?;
+            graph_expand_from_page(&conn, &page_id, limit)
+        })
+        .await
+        .map_err(|e| WikiError::Storage(format!("graph expansion task failed: {e}")))?
     }
 }
 
@@ -292,5 +337,54 @@ mod tests {
             "{err}"
         );
         assert_eq!(err.exit_code(), 2, "config errors exit 2 (PRD §34)");
+    }
+
+    // ---- Graph exploration ----
+
+    #[tokio::test]
+    async fn graph_exploration_returns_related_pages_of_the_active_generation() {
+        let mut conn = llm_wiki_storage::open_in_memory().unwrap();
+        let build = start_build(&mut conn, &BuildDraft::default()).unwrap();
+        let target = page("sso", "Identity & Access", "# Identity & Access\n\nbody\n");
+        let target_id = target.page_id.clone();
+        let mut overview = page("overview", "Overview", "# Overview\n\nbody\n");
+        overview.links = vec![llm_wiki_storage::PageLinkRecord {
+            to_page_id: target_id.clone(),
+            target_title: "Identity & Access".into(),
+        }];
+        let overview_id = overview.page_id.clone();
+        persist_generation(&mut conn, &build, &[target, overview]).unwrap();
+        activate_build_with_search_index(&mut conn, &build, default_tokenizer()).unwrap();
+
+        let graph = SqliteGraphExploration::new(conn);
+        let neighbors = graph
+            .neighbors_of_page(&overview_id, llm_wiki_storage::EXPAND_MAX_NODES)
+            .await
+            .unwrap();
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].label, "Identity & Access");
+        assert_eq!(neighbors[0].relation, "links_to");
+        assert_eq!(
+            neighbors[0].direction,
+            llm_wiki_storage::NeighborDirection::Outgoing
+        );
+
+        // The target page sees the link as a backlink.
+        let back = graph
+            .neighbors_of_page(&target_id, llm_wiki_storage::EXPAND_MAX_NODES)
+            .await
+            .unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(
+            back[0].direction,
+            llm_wiki_storage::NeighborDirection::Incoming
+        );
+
+        // An unbuilt page id has no node and therefore no neighbors.
+        let empty = graph
+            .neighbors_of_page(&WikiPageId::generate(), 10)
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
     }
 }

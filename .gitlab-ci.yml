@@ -1,0 +1,25 @@
+stages:
+  - test
+
+# Real-LLM E2E tests are #[ignore]-gated on LLM_WIKI_E2E_API_KEY +
+# LLM_WIKI_E2E_BASE_URL and never run here (PRD §54: CI uses
+# FakeLlmProvider only).
+cargo-test:
+  stage: test
+  image: rust:1-bookworm
+  variables:
+    CARGO_TERM_COLOR: always
+  cache:
+    key:
+      files:
+        - Cargo.lock
+    paths:
+      - target/
+      - .cargo-cache/registry
+  before_script:
+    - export CARGO_HOME="$CI_PROJECT_DIR/.cargo-cache/registry"
+  script:
+    - cargo fmt --check
+    - cargo clippy --workspace --all-targets -- -D warnings
+    - python3 evals/check_fixtures.py
+    - cargo test --workspace

@@ -10,6 +10,7 @@ pub mod builds;
 pub mod cache;
 pub mod connection;
 pub mod decisions;
+pub mod graph;
 pub mod knowledge;
 pub mod migrations;
 pub mod page_id_map;
@@ -36,6 +37,11 @@ pub use decisions::{
     PlanDecisionRow, OUTCOME_FAST_PATH, OUTCOME_LOCAL_UPDATE, OUTCOME_REPLAN_DRY_RUN,
     OUTCOME_REPLAN_EXECUTED, OUTCOME_REPLAN_REQUIRED, TRIGGER_FINGERPRINT_CHANGED,
     TRIGGER_PAGE_EMPTIED, TRIGGER_STRUCTURAL_CHANGE, TRIGGER_UNMAPPABLE_NODE,
+};
+pub use graph::{
+    ensure_graph_matches_active, graph_expand, graph_expand_from_page, page_node_id, rebuild_graph,
+    GraphNeighbor, GraphStats, NeighborDirection, EXPAND_MAX_NODES, NODE_TYPE_CONCEPT,
+    NODE_TYPE_ENTITY, NODE_TYPE_PAGE, RELATION_LINKS_TO,
 };
 pub use knowledge::{list_active_relation_pairs, load_knowledge_base, load_plan_input};
 pub use page_id_map::{

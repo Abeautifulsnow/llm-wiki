@@ -97,6 +97,10 @@ pub struct SearchConfig {
     pub full_text: bool,
     #[serde(default)]
     pub vector: bool,
+    /// Gates the query-side consumption of the §17 Wiki Graph (one-hop
+    /// related pages in `search` output). The stored graph itself is always
+    /// rebuilt with the active generation, so this flag never makes the
+    /// config promise a capability that does not exist.
     #[serde(default = "default_true")]
     pub graph: bool,
 }

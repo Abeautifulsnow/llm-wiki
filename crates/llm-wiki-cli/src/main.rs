@@ -429,7 +429,9 @@ fn replan(workspace: &Path, dry_run: bool) -> Result<(), WikiError> {
 
 /// `llm-wiki search <query>` (PRD §5.5/§20): thin transport over
 /// `llm_wiki_search::FullTextSearch`. Prints ranked page sections with body
-/// snippets; a never-built workspace is not an error.
+/// snippets; a never-built workspace is not an error. With
+/// `config.search.graph = true` the top hit gains a one-hop "related" line
+/// from the §17 Wiki Graph (§22 limits: depth 1, max 10 nodes).
 fn search(workspace: &Path, query: &str) -> Result<(), WikiError> {
     let config = load_config(workspace)?;
     let db_path = state_db(workspace);
@@ -464,6 +466,54 @@ fn search(workspace: &Path, query: &str) -> Result<(), WikiError> {
         );
         let snippet = hit.snippet.replace('\n', " ");
         println!("   {snippet}");
+    }
+    print_related_pages(&db_path, &config, &hits[0], &runtime)?;
+    Ok(())
+}
+
+/// One-hop graph expansion of the top hit (PRD §17/§22), gated by
+/// `search.graph`. Outgoing links render as-is; incoming ones are marked as
+/// backlinks. A page without neighbors prints nothing — a disabled flag and
+/// an empty graph are indistinguishable from the outside, both are "no
+/// related line". A graph failure is downgraded to a warning: the FTS
+/// results above already delivered the search's value, and a supplementary
+/// line must not fail an otherwise successful command (success-shape
+/// principle for recoverable conditions).
+fn print_related_pages(
+    db_path: &Path,
+    config: &Config,
+    top: &llm_wiki_search::SearchHit,
+    runtime: &tokio::runtime::Runtime,
+) -> Result<(), WikiError> {
+    if !config.search.graph {
+        return Ok(());
+    }
+    let graph = match llm_wiki_storage::open(db_path) {
+        Ok(conn) => llm_wiki_search::SqliteGraphExploration::new(conn),
+        Err(error) => {
+            eprintln!("  ! related pages unavailable: {error}");
+            return Ok(());
+        }
+    };
+    let neighbors = match runtime
+        .block_on(graph.neighbors_of_page(&top.page_id, llm_wiki_storage::EXPAND_MAX_NODES))
+    {
+        Ok(neighbors) => neighbors,
+        Err(error) => {
+            eprintln!("  ! related pages unavailable: {error}");
+            return Ok(());
+        }
+    };
+    let related: Vec<String> = neighbors
+        .iter()
+        .filter(|n| n.node_type == llm_wiki_storage::NODE_TYPE_PAGE)
+        .map(|n| match n.direction {
+            llm_wiki_storage::NeighborDirection::Outgoing => n.label.clone(),
+            llm_wiki_storage::NeighborDirection::Incoming => format!("{} (backlink)", n.label),
+        })
+        .collect();
+    if !related.is_empty() {
+        println!("   related: {}", related.join("; "));
     }
     Ok(())
 }

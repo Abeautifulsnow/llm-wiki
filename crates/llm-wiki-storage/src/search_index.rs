@@ -319,11 +319,14 @@ fn insert_section_row(
     Ok(())
 }
 
-/// The §35 publish commit point (step 6) with the search index joined in:
-/// ONE transaction switches `active_build_id` + marks the build COMPLETED and
-/// rebuilds the FTS index for the activated generation. Any failure —
-/// including an FTS5-less SQLite — aborts the transaction, leaving the
-/// previous generation fully visible (PRD §35).
+/// The §35 publish commit point (step 6) with the derived indexes joined in:
+/// ONE transaction switches `active_build_id` + marks the build COMPLETED,
+/// rebuilds the FTS index for the activated generation AND rebuilds the
+/// §17 Wiki Graph (`graph::rebuild_graph`). Any failure — including an
+/// FTS5-less SQLite — aborts the transaction, leaving the previous
+/// generation fully visible (PRD §35). The graph rebuild is deliberately
+/// NOT config-gated: `search.graph` gates query-side consumption only, the
+/// stored graph always matches the active generation.
 pub fn activate_build_with_search_index(
     conn: &mut Connection,
     build_id: &BuildId,
@@ -334,6 +337,13 @@ pub fn activate_build_with_search_index(
         .map_err(|e| WikiError::Storage(format!("begin tx: {e}")))?;
     crate::state::activate_in_tx(&tx, build_id)?;
     let stats = rebuild_search_index(&tx, build_id, tokenizer)?;
+    let graph_stats = crate::graph::rebuild_graph(&tx, build_id)?;
+    tracing::debug!(
+        nodes = graph_stats.nodes,
+        edges = graph_stats.edges,
+        skipped = graph_stats.skipped_edges,
+        "wiki graph rebuilt with the activated generation"
+    );
     tx.commit()
         .map_err(|e| WikiError::Storage(format!("commit activate_build: {e}")))?;
     Ok(stats)

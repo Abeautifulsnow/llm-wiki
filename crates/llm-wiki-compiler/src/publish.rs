@@ -38,9 +38,9 @@ use llm_wiki_core::error::{Result, WikiError};
 use llm_wiki_core::hash::sha256_hex;
 use llm_wiki_core::ids::BuildId;
 use llm_wiki_storage::{
-    activate_build_with_search_index, default_tokenizer, ensure_search_index_matches_active,
-    get_active_build_id, load_generation_pages, set_active_build, update_build_status,
-    WikiPageRecord,
+    activate_build_with_search_index, default_tokenizer, ensure_graph_matches_active,
+    ensure_search_index_matches_active, get_active_build_id, load_generation_pages,
+    set_active_build, update_build_status, WikiPageRecord,
 };
 
 /// Bounded rename retry (PRD §35): a reader holding the pointer file open on
@@ -582,10 +582,12 @@ pub fn recover_if_needed(
     Ok(Some(report))
 }
 
-/// After ANY recovery outcome the index is re-verified against the active
-/// generation (rebuild on drift, clear when nothing is published).
+/// After ANY recovery outcome the derived indexes are re-verified against the
+/// active generation (rebuild on drift, clear when nothing is published):
+/// the FTS index (PRD §20) and the §17 Wiki Graph.
 fn verify_recovery_index(conn: &mut rusqlite::Connection) -> Result<()> {
     ensure_search_index_matches_active(conn, default_tokenizer())?;
+    ensure_graph_matches_active(conn)?;
     Ok(())
 }
 

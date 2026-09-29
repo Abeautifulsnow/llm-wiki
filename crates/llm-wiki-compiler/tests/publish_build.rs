@@ -273,6 +273,81 @@ fn missing_pointer_with_db_active_without_journal_is_publish_recovery() {
 }
 
 // ---------------------------------------------------------------------------
+// Wiki Graph (PRD §17): rebuilt inside the §35 activate transaction, verified
+// alongside the FTS index on recovery
+// ---------------------------------------------------------------------------
+
+#[test]
+fn publish_populates_the_graph_and_the_next_publish_flips_it_atomically() {
+    let wiki_dir = temp_dir("graph-publish");
+    let mut conn = open_in_memory().unwrap();
+
+    let target = page("sso", "# SSO");
+    let target_id = target.page_id.clone();
+    let mut overview = page("overview", "# Overview");
+    overview.links = vec![llm_wiki_storage::PageLinkRecord {
+        to_page_id: target_id.clone(),
+        target_title: "sso".into(),
+    }];
+    let overview_id = overview.page_id.clone();
+    // §35.3: generation rows are persisted BEFORE publish (the publish step-6
+    // index/graph rebuilds read them).
+    let first = new_build(&mut conn);
+    persist_generation(&mut conn, &first, &[target.clone(), overview.clone()]).unwrap();
+    publish(&mut conn, &wiki_dir, &first, &[target, overview], 3).unwrap();
+
+    let graph_counts = |conn: &rusqlite::Connection| -> (i64, i64) {
+        conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM graph_nodes), (SELECT COUNT(*) FROM graph_edges)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    };
+    assert_eq!(graph_counts(&conn), (2, 1), "two pages, one links_to edge");
+
+    // Expansion reaches the linked page in both directions (§22 1-hop).
+    let out = llm_wiki_storage::graph_expand_from_page(&conn, &overview_id, 10).unwrap();
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].label, "sso");
+    let back = llm_wiki_storage::graph_expand_from_page(&conn, &target_id, 10).unwrap();
+    assert_eq!(back.len(), 1);
+    assert_eq!(
+        back[0].direction,
+        llm_wiki_storage::NeighborDirection::Incoming
+    );
+
+    // A graph drift (page node lost — its edges first, they FK to it) is
+    // healed back to the active generation (the recovery path calls the same
+    // storage verification).
+    conn.execute("DELETE FROM graph_edges", []).unwrap();
+    conn.execute(
+        "DELETE FROM graph_nodes WHERE id = ?1",
+        params![llm_wiki_storage::page_node_id(&target_id)],
+    )
+    .unwrap();
+    let healed = llm_wiki_storage::ensure_graph_matches_active(&mut conn).unwrap();
+    assert!(healed.is_some(), "drift triggers a rebuild");
+    assert_eq!(graph_counts(&conn), (2, 1));
+
+    // A second publish with a disjoint page set flips the graph atomically —
+    // no node of the old generation survives.
+    let second_pages = vec![page("solo", "# Solo")];
+    let second = new_build(&mut conn);
+    persist_generation(&mut conn, &second, &second_pages).unwrap();
+    publish(&mut conn, &wiki_dir, &second, &second_pages, 3).unwrap();
+    assert_eq!(graph_counts(&conn), (1, 0));
+    let stale_page: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM graph_nodes WHERE id = ?1",
+            params![llm_wiki_storage::page_node_id(&overview_id)],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stale_page, 0, "old generation page nodes are gone");
+}
+
+// ---------------------------------------------------------------------------
 // End-to-end run_build with FakeLlmProvider
 // ---------------------------------------------------------------------------
 
