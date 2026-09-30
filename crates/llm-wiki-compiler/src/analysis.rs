@@ -661,71 +661,81 @@ fn validate_claim(candidate: &RawClaim, unit: &AnalysisUnit) -> Vec<ValidationIs
 /// validation issues on failure.
 fn locate_evidence(
     evidence_text: &str,
-    hint_start: Option<i64>,
+    _hint_start: Option<i64>,
     section_id: &str,
     unit: &AnalysisUnit,
 ) -> std::result::Result<(SectionId, SourceRange, String), Vec<ValidationIssue>> {
-    let entry = unit
+    let needle = fold_with_offsets(evidence_text);
+
+    // Cited-section first (T1 Run 11: SECTION_NOT_FOUND outnumbered
+    // EVIDENCE_NOT_IN_SECTION 28:1 — segmentation splits one SOURCE into
+    // several units, and thinking models routinely attribute a claim to a
+    // section_id from a NEIGHBORING unit. When the quoted text actually
+    // locates in one of THIS unit's sections, honor the evidence over the
+    // model's bookkeeping and use the section where it was found.)
+    let entry = match unit
         .entries
         .iter()
-        .find(|entry| entry.section_id.as_str() == section_id)
-        .ok_or_else(|| {
-            vec![ValidationIssue::new(
+        .find(|e| e.section_id.as_str() == section_id)
+    {
+        Some(entry) => entry,
+        None => {
+            // Try every section of the unit; first section where the quote
+            // locates wins (deterministic: entries are in document order).
+            for candidate in &unit.entries {
+                if locate_in_entry(&needle, candidate).is_some() {
+                    let (range, digest) = locate_in_entry(&needle, candidate).unwrap();
+                    return Ok((
+                        candidate.section_id.clone(),
+                        SourceRange::new(
+                            candidate.range_start + range.0,
+                            candidate.range_start + range.1,
+                        ),
+                        digest,
+                    ));
+                }
+            }
+            return Err(vec![ValidationIssue::new(
                 "SECTION_NOT_FOUND",
                 format!("section id '{section_id}' does not exist in this source"),
-            )]
-        })?;
-
-    let needle = fold_with_offsets(evidence_text);
-    if needle.text.is_empty() {
-        return Err(vec![ValidationIssue::new(
-            "EMPTY_EVIDENCE",
-            "claim has no evidence quote",
-        )]);
-    }
-    let haystack = fold_with_offsets(&entry.content);
-
-    let mut matches: Vec<(usize, usize)> = Vec::new(); // original byte start, byte end
-                                                       // Char-vector matching: `offsets` is indexed per folded CHAR, so a byte
-                                                       // based `str::find` would misalign on multi-byte (CJK) characters.
-    let hay: Vec<char> = haystack.text.chars().collect();
-    let needle_chars: Vec<char> = needle.text.chars().collect();
-    if !needle_chars.is_empty() && needle_chars.len() <= hay.len() {
-        let mut from = 0usize;
-        while from + needle_chars.len() <= hay.len() {
-            if hay[from..from + needle_chars.len()] == needle_chars[..] {
-                let a = from;
-                let b = a + needle_chars.len();
-                matches.push((haystack.offsets[a].0, haystack.offsets[b - 1].1));
-            }
-            from += 1;
+            )]);
         }
-    }
-
-    let picked = match matches.len() {
-        0 => {
-            return Err(vec![ValidationIssue::new(
-                "EVIDENCE_NOT_IN_SECTION",
-                format!("evidence quote not found in section '{section_id}'"),
-            )])
-        }
-        1 => matches[0],
-        _ => match hint_start {
-            Some(hint) => matches
-                .iter()
-                .copied()
-                .min_by_key(|(start, _)| (*start as i64 - hint).abs())
-                .unwrap(),
-            None => matches[0],
-        },
     };
 
-    let quoted = &entry.content[picked.0..picked.1];
-    Ok((
-        entry.section_id.clone(),
-        SourceRange::new(entry.range_start + picked.0, entry.range_start + picked.1),
-        sha256_hex(quoted.as_bytes()),
-    ))
+    if let Some((range, digest)) = locate_in_entry(&needle, entry) {
+        return Ok((
+            entry.section_id.clone(),
+            SourceRange::new(entry.range_start + range.0, entry.range_start + range.1),
+            digest,
+        ));
+    }
+    Err(vec![ValidationIssue::new(
+        "EVIDENCE_NOT_IN_SECTION",
+        format!("evidence quote not found in section '{section_id}'"),
+    )])
+}
+
+/// Locates the folded needle in one entry; returns
+/// `((content byte start, content byte end), digest of original bytes)`.
+fn locate_in_entry(needle: &FoldedText, entry: &UnitEntry) -> Option<((usize, usize), String)> {
+    let haystack = fold_with_offsets(&entry.content);
+    let hay: Vec<char> = haystack.text.chars().collect();
+    let needle_chars: Vec<char> = needle.text.chars().collect();
+    if needle_chars.is_empty() || needle_chars.len() > hay.len() {
+        return None;
+    }
+    let mut from = 0usize;
+    while from + needle_chars.len() <= hay.len() {
+        if hay[from..from + needle_chars.len()] == needle_chars[..] {
+            let a = from;
+            let b = a + needle_chars.len();
+            let picked = (haystack.offsets[a].0, haystack.offsets[b - 1].1);
+            let quoted = &entry.content[picked.0..picked.1];
+            return Some((picked, sha256_hex(quoted.as_bytes())));
+        }
+        from += 1;
+    }
+    None
 }
 
 /// A fold-insensitive view of a text: NFKC, keep only alphanumeric
@@ -834,6 +844,39 @@ mod locate_tests {
             &unit.entries[0].content[hyphen_range.start..hyphen_range.end],
             "a long-running task cannot be killed"
         );
+    }
+
+    /// T1 Run 11: SECTION_NOT_FOUND outnumbered EVIDENCE_NOT_IN_SECTION
+    /// 28:1 — segmentation splits one source into several units and models
+    /// attribute claims to section_ids from neighboring units. The locator
+    /// must honor the EVIDENCE over the model's bookkeeping.
+    #[test]
+    fn wrong_section_id_falls_back_to_evidence_location() {
+        let wrong_id = SectionId::generate();
+        let unit = AnalysisUnit {
+            entries: vec![UnitEntry {
+                section_id: SectionId::parse("sec_01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
+                heading_path: vec!["Doc".into()],
+                content: "The plugin runtime retries up to three times.".to_owned(),
+                range_start: 0,
+            }],
+        };
+        // Cited section id does not exist in this unit, but the quote does.
+        let (located, range, _) =
+            locate_evidence("up to three times", None, wrong_id.as_str(), &unit)
+                .map_err(|e| e.clone())
+                .unwrap();
+        assert_eq!(located, section());
+        assert_eq!(
+            &unit.entries[0].content[range.start..range.end],
+            "up to three times"
+        );
+
+        // A quote absent from EVERY section still fails with the cited-id
+        // error (truthful about what went wrong).
+        let err = locate_evidence("the runtime never retries", None, wrong_id.as_str(), &unit)
+            .unwrap_err();
+        assert_eq!(err[0].code, "SECTION_NOT_FOUND");
     }
 
     #[test]
