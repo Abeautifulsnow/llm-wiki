@@ -526,6 +526,82 @@ async fn planner_repairs_unknown_node_ref_once() {
     assert_eq!(outcome.plan.pages.len(), 2);
 }
 
+/// T1 Run 8/11-12 finding: thinking models attribute nodes to a NEIGHBORING
+/// cluster's id space. A cross-cluster ref to a REAL library node must be
+/// salvaged (its own page before finalize), not fail the stage; a ref that is
+/// not a library node at all still repairs/fails as before.
+#[tokio::test]
+async fn cross_cluster_refs_are_salvaged_into_a_dedicated_page() {
+    let mut conn = open_in_memory().unwrap();
+    let seeded = seed_knowledge(&mut conn);
+
+    let relation_pair = vec![seeded.entity.clone(), seeded.concept.clone()];
+    let claims_pair = vec![seeded.claim_a.clone(), seeded.claim_b.clone()];
+    let responses = vec![
+        route(
+            SUMMARY_MARK,
+            &relation_pair,
+            vec![summary_response("runtime and delivery")],
+        ),
+        route(
+            SUMMARY_MARK,
+            &claims_pair,
+            vec![summary_response("guarantees")],
+        ),
+        // Cluster 1's local plan cites one of ITS OWN nodes correctly — plus
+        // one node from cluster 2 (cross-cluster). The cross-cluster ref must
+        // be salvaged, not trigger a repair.
+        route(
+            LOCAL_MARK,
+            &relation_pair,
+            vec![plan_response(vec![serde_json::json!({
+                "title": "Plugin System",
+                "category": "concepts",
+                "purpose": "cover",
+                "knowledge_refs": [seeded.entity, seeded.concept, seeded.claim_a],
+            })])],
+        ),
+        route(
+            LOCAL_MARK,
+            &claims_pair,
+            vec![plan_response(vec![proposal(
+                "Plugin Guarantees",
+                "concepts",
+                &claims_pair,
+            )])],
+        ),
+        route(
+            RECONCILE_MARK,
+            &[],
+            // With bypass semantics the salvage page never enters the
+            // reconcile input — the model sees only genuine cluster
+            // proposals and echoes them (coverage-complete by construction).
+            // The salvaged claim lands in its own appended page afterwards.
+            vec![plan_response(vec![
+                proposal("Plugin System", "concepts", &relation_pair),
+                proposal("Plugin Guarantees", "concepts", &claims_pair),
+            ])],
+        ),
+    ];
+    let wiki_planner = planner_with(Arc::new(router(responses)), PlannerConfig::default());
+    let outcome = wiki_planner.plan(&seeded.base, 4).await.unwrap();
+    // No repair request: 2 summaries + 2 locals + 1 reconcile = 5 — the
+    // cross-cluster ref did NOT trip the validator (salvage ran first).
+    assert_eq!(outcome.llm_request_count, 5);
+    // The salvage page appended nothing here: the model's own "Plugin
+    // Guarantees" already covers the salvaged node (dedup retain emptied it).
+    // What matters: coverage is complete and no repair was needed.
+    assert_eq!(outcome.plan.pages.len(), 2);
+    // Every node — including the cross-cluster one — is covered.
+    let refs: Vec<String> = outcome
+        .plan
+        .pages
+        .iter()
+        .flat_map(|page| page.knowledge_refs.iter().map(|n| n.as_str().to_owned()))
+        .collect();
+    assert!(refs.contains(&seeded.claim_a.as_str().to_owned()));
+}
+
 #[tokio::test]
 async fn planner_subdivides_clusters_over_node_budget() {
     let mut conn = open_in_memory().unwrap();

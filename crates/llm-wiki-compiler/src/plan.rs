@@ -193,6 +193,7 @@ impl WikiPlanner {
 
         let mut proposals: Vec<RawPage> = Vec::new();
         let mut llm_request_count = 0u32;
+        let mut orphan_refs: Vec<String> = Vec::new();
 
         for (cluster, _summary_key) in clusters.iter().zip(summary_keys.iter()) {
             let payload = node_payload(base, &cluster.nodes);
@@ -209,26 +210,145 @@ impl WikiPlanner {
                 .iter()
                 .map(|node_id| node_id.as_str().to_owned())
                 .collect();
+            // Cross-cluster salvage (T1 Run 8/11-12): models attribute
+            // nodes to a neighboring cluster's id space. The validator closure
+            // strips refs that are REAL library nodes from other clusters into
+            // the orphan pool (they re-enter as a dedicated page after
+            // reconciliation); refs that are not library nodes still count as
+            // UNKNOWN_NODE_REF and go through the normal repair path.
+            let orphans: Arc<std::sync::Mutex<Vec<String>>> =
+                Arc::new(std::sync::Mutex::new(Vec::new()));
+            let orphans_v = Arc::clone(&orphans);
+            let validate = |plan: &RawPlanResponse| -> Vec<String> {
+                let mut issues = Vec::new();
+                let mut salvaged: Vec<String> = Vec::new();
+                let mut seen: BTreeSet<&str> = BTreeSet::new();
+                if plan.pages.is_empty() {
+                    issues.push("EMPTY_PLAN: no pages proposed".to_owned());
+                }
+                for page in &plan.pages {
+                    if page.title.trim().is_empty() {
+                        issues.push("EMPTY_TITLE: page title is empty".to_owned());
+                    }
+                    if page.knowledge_refs.is_empty() {
+                        issues.push(format!(
+                            "EMPTY_REFS: page '{}' has no knowledge_refs",
+                            page.title
+                        ));
+                    }
+                    for ref_id in &page.knowledge_refs {
+                        if allowed.contains(ref_id) {
+                            if !seen.insert(ref_id.as_str()) {
+                                issues.push(format!(
+                                    "DUPLICATE_NODE_ASSIGNMENT: '{ref_id}' assigned to multiple pages"
+                                ));
+                            }
+                        } else if base.nodes.keys().any(|k| k.as_str() == ref_id.as_str()) {
+                            salvaged.push(ref_id.clone());
+                        } else {
+                            issues.push(format!(
+                                "UNKNOWN_NODE_REF: '{ref_id}' is not a node of this cluster"
+                            ));
+                        }
+                    }
+                }
+                orphans_v.lock().unwrap().extend(salvaged);
+                issues
+            };
             let (raw_local, requests) = self
-                .stage_round_validated::<RawPlanResponse, _>(&local_stage, &compact, |plan| {
-                    validate_proposals(&plan.pages, &allowed)
-                })
+                .stage_round_validated::<RawPlanResponse, _>(&local_stage, &compact, validate)
                 .await?;
             llm_request_count += requests;
+            orphan_refs.extend(orphans.lock().unwrap().drain(..));
             proposals.extend(raw_local.pages);
         }
+
+        // Salvaged cross-cluster nodes BYPASS reconciliation: they form one
+        // deterministic page appended AFTER the merged plan (the model never
+        // sees them, so it cannot invent coverage errors around them). The
+        // proposed_union handed to the validator is widened accordingly.
+        let salvage_page = if orphan_refs.is_empty() {
+            None
+        } else {
+            let mut refs: Vec<String> = std::mem::take(&mut orphan_refs);
+            refs.sort();
+            refs.dedup();
+            tracing::warn!(
+                count = refs.len(),
+                "salvaging cross-cluster node refs into a dedicated page"
+            );
+            Some(RawPage {
+                title: "Miscellaneous Knowledge".to_owned(),
+                category: "concepts".to_owned(),
+                purpose: "Knowledge nodes whose assigning cluster could not be determined during planning.".to_owned(),
+                knowledge_refs: refs,
+            })
+        };
 
         let reconcile_stage = self.prompt.stage_block("reconcile")?;
         let reconcile_json = reconcile_payload(&proposals, &summary_keys, &local_keys);
         self.ensure_stage_budget(&reconcile_json, "reconciliation")?;
-        let proposed_union: BTreeSet<String> = proposals
+        let mut proposed_union: BTreeSet<String> = proposals
             .iter()
             .flat_map(|proposal| proposal.knowledge_refs.iter().cloned())
             .collect();
-        let (merged, requests) = self
+        if let Some(salvage) = &salvage_page {
+            proposed_union.extend(salvage.knowledge_refs.iter().cloned());
+        }
+        let (mut merged, requests) = self
             .reconcile_stage(&reconcile_stage, &reconcile_json, &proposed_union)
             .await?;
         llm_request_count += requests;
+
+        if let Some(mut salvage) = salvage_page {
+            // Drop refs the model already merged into topical pages — a
+            // duplicate assignment would fail validate_merged below.
+            salvage.knowledge_refs.retain(|ref_id| {
+                !merged
+                    .iter()
+                    .any(|page| page.knowledge_refs.contains(ref_id))
+            });
+            if !salvage.knowledge_refs.is_empty() {
+                merged.push(salvage);
+            }
+        }
+
+        // Orphan sweep: refs the model invented into the final plan that are
+        // REAL library nodes but were never proposed become one deterministic
+        // page instead of failing reconciliation. Refs that are NOT library
+        // nodes stay rejected by validate_merged.
+        let mut unknown_in_merged: Vec<String> = Vec::new();
+        for page in &merged {
+            for ref_id in &page.knowledge_refs {
+                if !proposed_union.contains(ref_id)
+                    && base.nodes.keys().any(|k| k.as_str() == ref_id.as_str())
+                {
+                    unknown_in_merged.push(ref_id.clone());
+                }
+            }
+        }
+        let mut orphan_all: BTreeSet<String> = BTreeSet::from_iter(unknown_in_merged);
+        // Salvaged refs are already covered by their appended page; nodes the
+        // model merged into real pages are no longer orphans.
+        for page in &merged {
+            for ref_id in &page.knowledge_refs {
+                orphan_all.remove(ref_id);
+            }
+        }
+        if !orphan_all.is_empty() {
+            tracing::warn!(
+                count = orphan_all.len(),
+                "planner referenced nodes outside their cluster; salvaging them into a dedicated page"
+            );
+            let refs: Vec<String> = orphan_all.into_iter().collect();
+            let title = "Miscellaneous Knowledge".to_owned();
+            merged.push(RawPage {
+                title,
+                category: "concepts".to_owned(),
+                purpose: "Knowledge nodes whose assigning cluster could not be determined during planning.".to_owned(),
+                knowledge_refs: refs,
+            });
+        }
 
         let plan = self.finalize(merged, base)?;
         self.store_plan(&reconcile_key, &plan);
@@ -367,7 +487,11 @@ impl WikiPlanner {
         proposed: &BTreeSet<String>,
     ) -> Result<(Vec<RawPage>, u32)> {
         self.stage_round_validated::<RawPlanResponse, _>(stage, payload, |plan| {
-            validate_merged(&plan.pages, proposed)
+            let issues = validate_merged(&plan.pages, proposed);
+            if !issues.is_empty() {
+                eprintln!("DEBUG reconcile issues: {issues:?}");
+            }
+            issues
         })
         .await
         .map(|(response, count)| (response.pages, count))
