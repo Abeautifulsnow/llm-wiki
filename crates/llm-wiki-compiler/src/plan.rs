@@ -286,8 +286,6 @@ impl WikiPlanner {
         };
 
         let reconcile_stage = self.prompt.stage_block("reconcile")?;
-        let reconcile_json = reconcile_payload(&proposals, &summary_keys, &local_keys);
-        self.ensure_stage_budget(&reconcile_json, "reconciliation")?;
         let mut proposed_union: BTreeSet<String> = proposals
             .iter()
             .flat_map(|proposal| proposal.knowledge_refs.iter().cloned())
@@ -295,10 +293,71 @@ impl WikiPlanner {
         if let Some(salvage) = &salvage_page {
             proposed_union.extend(salvage.knowledge_refs.iter().cloned());
         }
-        let (mut merged, requests) = self
-            .reconcile_stage(&reconcile_stage, &reconcile_json, &proposed_union)
-            .await?;
-        llm_request_count += requests;
+
+        // Batched reconciliation (T1 Run 13: a 60-doc corpus produced a
+        // ~506K-token reconcile payload against a 32K budget — 16x over, and
+        // PRD §14 forbids truncation). When the single-shot payload exceeds
+        // the budget, proposals are split into budget-sized batches; each
+        // batch is reconciled independently (its output pages become the
+        // proposals of the next round), and a final round merges the batch
+        // results. Guarantees preserved per round: coverage validated against
+        // that batch's proposed set; DUPLICATE across batches is impossible
+        // because batches partition the proposals.
+        let mut merged: Vec<RawPage>;
+        let mut round_proposals: Vec<RawPage> = proposals;
+        let mut round_keys_summary: Vec<String> = summary_keys.clone();
+        let mut round_keys_local: Vec<String> = local_keys.clone();
+        let mut reconcile_requests = 0u32;
+        loop {
+            let reconcile_json =
+                reconcile_payload(&round_proposals, &round_keys_summary, &round_keys_local);
+            let single_round = reconcile_json.len() <= MAX_RECONCILE_PAYLOAD_BYTES;
+            self.ensure_stage_budget(&reconcile_json, "reconciliation")?;
+            let (round_merged, requests) = self
+                .reconcile_stage(&reconcile_stage, &reconcile_json, &proposed_union)
+                .await?;
+            reconcile_requests += requests;
+            if single_round {
+                merged = round_merged;
+                break;
+            }
+            // Batch the PROPOSALS (the dominant payload term) into
+            // budget-sized slices; the next round reconciles the merged pages
+            // of each batch. Summaries/keys shrink with each round because
+            // each batch yields fewer pages than it consumed proposals.
+            let batch_count = reconcile_json.len().div_ceil(MAX_RECONCILE_PAYLOAD_BYTES) + 1;
+            let per_batch = round_proposals.len().div_ceil(batch_count).max(1);
+            let mut next_round: Vec<RawPage> = Vec::new();
+            for batch in round_proposals.chunks(per_batch) {
+                let batch_json = reconcile_payload(batch, &round_keys_summary, &round_keys_local);
+                self.ensure_stage_budget(&batch_json, "reconciliation batch")?;
+                let batch_union: BTreeSet<String> = batch
+                    .iter()
+                    .flat_map(|proposal| proposal.knowledge_refs.iter().cloned())
+                    .collect();
+                let (batch_merged, requests) = self
+                    .reconcile_stage(&reconcile_stage, &batch_json, &batch_union)
+                    .await?;
+                reconcile_requests += requests;
+                next_round.extend(batch_merged);
+            }
+            round_proposals = next_round;
+            round_keys_summary = round_proposals
+                .iter()
+                .map(|_| format!("batch-{}", uuid_batch()))
+                .collect();
+            round_keys_local = round_proposals
+                .iter()
+                .map(|_| format!("batch-{}", uuid_batch()))
+                .collect();
+            if round_proposals.len() <= 1 {
+                // A single (merged) proposal cannot be subdivided further;
+                // the next loop iteration fits by construction.
+                merged = round_proposals;
+                break;
+            }
+        }
+        llm_request_count += reconcile_requests;
 
         if let Some(mut salvage) = salvage_page {
             // Drop refs the model already merged into topical pages — a
@@ -700,6 +759,20 @@ fn compact_payload(base: &KnowledgeBase, ids: &[KnowledgeNodeId], summary: &str)
 
 /// The single reconcile payload shared by the budget check and the actual
 /// request (PRD §14: estimate what you send, send what you estimated).
+/// Reconcile payload budget (bytes): payload length above this triggers
+/// batched reconciliation (T1 Run 13: a 60-doc corpus produced ~506K chars —
+/// ~126K tokens — against a 32K-token budget).
+const MAX_RECONCILE_PAYLOAD_BYTES: usize = 96_000;
+
+/// Stable unique tag for synthetic batch keys (avoids pulling a uuid dep).
+fn uuid_batch() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+    let pid = std::process::id();
+    format!("{pid:08x}{n:016x}")
+}
+
 fn reconcile_payload(
     proposals: &[RawPage],
     summary_keys: &[String],
