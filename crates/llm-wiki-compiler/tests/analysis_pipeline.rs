@@ -311,9 +311,10 @@ async fn hallucinated_section_id_is_repaired_once() {
         serde_json::json!([bogus, valid_claim(&id_a, "up to three times")]),
         serde_json::json!([]),
     );
-    // First response references a hallucinated id; the repair resends it
-    // unchanged — the claim must become a RejectedClaim, never knowledge,
-    // while the sibling claim stays verified.
+    // T1 Run 11 semantics: a hallucinated section_id whose EVIDENCE still
+    // locates in this unit's sections is honored by content (cross-section
+    // fallback), NOT rejected — the model's bookkeeping is wrong, not the
+    // fact. Both claims verify; no LLM repair (stage-2 issue, not stage-1).
     let llm = Arc::new(ScriptedLlm::new(vec![good.clone(), good]));
     let outcome = lenient_analyzer(llm.clone())
         .analyze_document(&doc, None)
@@ -322,11 +323,32 @@ async fn hallucinated_section_id_is_repaired_once() {
 
     assert_eq!(
         outcome.llm_request_count, 1,
-        "hallucinated ids are stage-2, not stage-1: no LLM repair, just a rejected record"
+        "hallucinated ids are stage-2, not stage-1: no LLM repair"
     );
-    assert_eq!(outcome.analysis.claims.len(), 1);
-    assert_eq!(outcome.rejected_claims.len(), 1);
-    assert!(outcome.rejected_claims[0]
+    assert_eq!(outcome.analysis.claims.len(), 2, "evidence honored over id");
+    assert!(outcome.rejected_claims.is_empty());
+
+    // A quote that locates NOWHERE still becomes a RejectedClaim citing the
+    // (now truthful) section-miss.
+    let unlocatable = serde_json::json!({
+        "text": "Fabricated.",
+        "section_id": "sec_01AAAAAAAAAAAAAAAAAAAAAAAA",
+        "evidence_text": "this sentence appears nowhere in the fixture",
+        "evidence_start": 0,
+    });
+    let bad = analysis_response(
+        "ok",
+        serde_json::json!([unlocatable, valid_claim(&id_a, "up to three times")]),
+        serde_json::json!([]),
+    );
+    let llm_b = Arc::new(ScriptedLlm::new(vec![bad.clone(), bad]));
+    let outcome_b = lenient_analyzer(llm_b)
+        .analyze_document(&doc, None)
+        .await
+        .unwrap();
+    assert_eq!(outcome_b.analysis.claims.len(), 1);
+    assert_eq!(outcome_b.rejected_claims.len(), 1);
+    assert!(outcome_b.rejected_claims[0]
         .reason
         .contains("SECTION_NOT_FOUND"));
 

@@ -41,7 +41,7 @@ use llm_wiki_storage::{
     TRIGGER_STRUCTURAL_CHANGE,
 };
 
-use crate::analysis::{AnalyzedDocument, DocumentAnalyzer};
+use crate::analysis::{AnalysisOutcome, AnalyzedDocument, DocumentAnalyzer};
 use crate::cache::{plan_cache_identity, CacheContext, CacheStats, LlmCache, StageCache};
 use crate::changeset::{
     diff_manifest, finalize_change_set, BuildFingerprint, ChangeSet, FileOutcome, RegisteredSource,
@@ -796,22 +796,77 @@ async fn build_full_pipeline(
         config.llm.max_output_tokens,
     )
     .with_cache(stage_cache.clone());
-    let mut llm_request_count = 0u32;
+    // ---- Document-parallel analysis (T1 finding #12) ----
+    // SQLite (Connection is !Sync) stays on this task: sections are
+    // registered serially first, then only the LLM calls run concurrently
+    // (bounded by `llm.max_concurrency`, PRD §27 — previously parsed but
+    // never enforced), and outcomes are persisted in document order.
+    let mut doc_inputs = Vec::with_capacity(parsed.len());
     for (file, source_id, parsed_doc) in &parsed {
         let sections = register_sections(conn, source_id, &parsed_doc.sections, Some(build_id))?;
-        let doc = AnalyzedDocument {
+        doc_inputs.push(AnalyzedDocument {
             source_id: source_id.clone(),
             rel_path: file.rel_path.clone(),
             content_hash: file.content_hash.clone(),
             language: parsed_doc.language.clone(),
             sections,
-        };
-        let outcome = analyzer.analyze_document(&doc, Some(build_id)).await?;
+        });
+    }
+    let analyzer = Arc::new(analyzer);
+    let doc_concurrency = config.llm.max_concurrency.max(1) as usize;
+    // ---- Document-parallel analysis (T1 finding #12) ----
+    // Bounded document-parallel prefetch, dependency-free: slide a window of
+    // `doc_concurrency` join handles (`llm.max_concurrency`, PRD §27 —
+    // previously parsed but never enforced). SQLite work (register/persist)
+    // never crosses a task boundary — Connection is !Sync — only the LLM
+    // calls run inside spawned tasks; results are persisted in document
+    // order so the wiki stays deterministic.
+    let mut llm_request_count = 0u32;
+    let mut doc_inputs = Vec::with_capacity(parsed.len());
+    for (file, source_id, parsed_doc) in &parsed {
+        let sections = register_sections(conn, source_id, &parsed_doc.sections, Some(build_id))?;
+        doc_inputs.push(AnalyzedDocument {
+            source_id: source_id.clone(),
+            rel_path: file.rel_path.clone(),
+            content_hash: file.content_hash.clone(),
+            language: parsed_doc.language.clone(),
+            sections,
+        });
+    }
+    let mut outcomes: Vec<(usize, AnalysisOutcome)> = Vec::with_capacity(doc_inputs.len());
+    let mut next_to_spawn = 0usize;
+    let mut join_set = tokio::task::JoinSet::new();
+    while next_to_spawn < doc_inputs.len() || !join_set.is_empty() {
+        let build_id_owned = build_id.clone();
+        while next_to_spawn < doc_inputs.len() && join_set.len() < doc_concurrency {
+            let analyzer = Arc::clone(&analyzer);
+            let doc = doc_inputs[next_to_spawn].clone();
+            let build_id_owned = build_id_owned.clone();
+            let index = next_to_spawn;
+            join_set.spawn(async move {
+                let outcome = analyzer
+                    .analyze_document(&doc, Some(&build_id_owned))
+                    .await?;
+                Ok::<_, WikiError>((index, outcome))
+            });
+            next_to_spawn += 1;
+        }
+        if let Some(joined) = join_set.join_next().await {
+            let (index, outcome) =
+                joined.map_err(|e| WikiError::Llm(format!("analysis task panicked: {e}")))??;
+            outcomes.push((index, outcome));
+        }
+    }
+    outcomes.sort_by_key(|(index, _)| *index);
+
+    // Deterministic persistence in document order.
+    for ((index, outcome), doc) in outcomes.iter().zip(doc_inputs.iter()) {
+        debug_assert_eq!(doc_inputs[*index].rel_path, doc.rel_path);
         llm_request_count += outcome.llm_request_count;
         persist_outcome(
             conn,
-            &doc,
-            &outcome,
+            doc,
+            outcome,
             &PersistOptions {
                 build_id: Some(build_id.clone()),
                 model: Some(provider.model().to_owned()),
@@ -1123,7 +1178,9 @@ async fn analyze_changed_sources(
         config.llm.max_output_tokens,
     )
     .with_cache(stage_cache);
-    let mut llm_request_count = 0u32;
+    // Same document-parallel pattern as the full pipeline: serial register,
+    // concurrent LLM, ordered persist.
+    let mut doc_inputs = Vec::with_capacity(changed_files.len());
     for index in changed_files {
         let file = &output.files[*index];
         let (source_id, _created) = upserted[*index].clone();
@@ -1140,19 +1197,49 @@ async fn analyze_changed_sources(
             );
         }
         let sections = register_sections(conn, &source_id, &parsed_doc.sections, Some(build_id))?;
-        let doc = AnalyzedDocument {
+        doc_inputs.push(AnalyzedDocument {
             source_id: source_id.clone(),
             rel_path: file.rel_path.clone(),
             content_hash: file.content_hash.clone(),
             language: parsed_doc.language.clone(),
             sections,
-        };
-        let outcome = analyzer.analyze_document(&doc, Some(build_id)).await?;
+        });
+    }
+    let analyzer = Arc::new(analyzer);
+    let doc_concurrency = config.llm.max_concurrency.max(1) as usize;
+    let mut outcomes: Vec<(usize, AnalysisOutcome)> = Vec::with_capacity(doc_inputs.len());
+    let mut next_to_spawn = 0usize;
+    let mut join_set = tokio::task::JoinSet::new();
+    while next_to_spawn < doc_inputs.len() || !join_set.is_empty() {
+        while next_to_spawn < doc_inputs.len() && join_set.len() < doc_concurrency {
+            let analyzer = Arc::clone(&analyzer);
+            let doc = doc_inputs[next_to_spawn].clone();
+            let build_id_owned = build_id.clone();
+            let index = next_to_spawn;
+            join_set.spawn(async move {
+                let outcome = analyzer
+                    .analyze_document(&doc, Some(&build_id_owned))
+                    .await?;
+                Ok::<_, WikiError>((index, outcome))
+            });
+            next_to_spawn += 1;
+        }
+        if let Some(joined) = join_set.join_next().await {
+            let (index, outcome) =
+                joined.map_err(|e| WikiError::Llm(format!("analysis task panicked: {e}")))??;
+            outcomes.push((index, outcome));
+        }
+    }
+    outcomes.sort_by_key(|(index, _)| *index);
+
+    let mut llm_request_count = 0u32;
+    for ((index, outcome), doc) in outcomes.iter().zip(doc_inputs.iter()) {
+        debug_assert_eq!(doc_inputs[*index].rel_path, doc.rel_path);
         llm_request_count += outcome.llm_request_count;
         persist_outcome(
             conn,
-            &doc,
-            &outcome,
+            doc,
+            outcome,
             &PersistOptions {
                 build_id: Some(build_id.clone()),
                 model: Some(provider.model().to_owned()),

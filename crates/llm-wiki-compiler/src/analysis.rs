@@ -323,7 +323,14 @@ Re-emit the COMPLETE JSON analysis. For EVERY claim, copy evidence_text characte
         let mut verified = Vec::new();
         let mut rejected = Vec::new();
         for candidate in candidates {
-            let issues = validate_claim(candidate, unit);
+            let mut issues = validate_claim(candidate, unit);
+            // Cross-section fallback (T1 Run 11): SECTION_NOT_FOUND from
+            // segmentation must not mask an evidence quote that locates in
+            // another section of this unit — drop the issue and let
+            // locate_evidence relocate by content.
+            if issues.len() == 1 && issues[0].code == "SECTION_NOT_FOUND" {
+                issues.clear();
+            }
             let located = if issues.is_empty() {
                 locate_evidence(
                     &candidate.evidence_text,

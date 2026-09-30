@@ -881,3 +881,170 @@ fn recovery_rollback_rebuilds_the_previous_generation_index() {
         "the rolled-back generation never serves search: {hits:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Document-parallel analysis (T1 finding #12): `llm.max_concurrency` must
+// bound the in-flight analysis requests (D1 red-test — dropping the window
+// must turn this red), and results must stay deterministic per document.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn analysis_respects_max_concurrency_and_stays_deterministic() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let workspace = fixture_workspace("parallel-analysis");
+    // Four independent docs; each unit's fake sleeps briefly so overlaps
+    // are observable.
+    let docs_dir = workspace.join("docs");
+    for name in ["alpha", "beta", "gamma", "delta"] {
+        std::fs::write(
+            docs_dir.join(format!("{name}.md")),
+            format!(
+                "# {name}
+
+The {name} scheduler retries failed tasks up to three times before giving up.
+
+## Delivery
+
+Events for {name} are delivered at least once and handlers stay idempotent.
+"
+            ),
+        )
+        .unwrap();
+    }
+
+    // Stage-routing provider (same shape as pipeline_llm) with an in-flight
+    // gauge wrapped around the ANALYSIS stage only — planning/compilation
+    // stages run after analysis, so their requests must never inflate the
+    // concurrency peak.
+    let inflight = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let inflight_h = Arc::clone(&inflight);
+    let peak_h = Arc::clone(&peak);
+    let proposed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let proposed_h = Arc::clone(&proposed);
+    let handler = Arc::new(move |request: &LlmRequest| -> Result<String, LlmError> {
+        if request.task_tag == "document-analysis" {
+            let now = inflight_h.fetch_add(1, Ordering::SeqCst) + 1;
+            peak_h.fetch_max(now, Ordering::SeqCst);
+            // Simulate network latency WITHOUT blocking the tokio worker
+            // thread (a sync sleep would serialize the join window and hide
+            // any concurrency): spin-yield until a sibling is also in
+            // flight, bounded so a serial implementation still terminates.
+
+            // Extract a verbatim line from the PROMPT itself (the prompt
+            // embeds the section content), so the evidence quote can never
+            // drift from the document — the exact failure the locator
+            // guards against.
+            let prompt = &request.prompt;
+            // Manifest embeds content as a JSON string ("content":"..."): take
+            // the first JSON-escaped line containing the marker phrase, then
+            // cut at the JSON string terminator. Unescaping is unnecessary —
+            // the locator folds punctuation, and the fixture body has none.
+            let quote = prompt
+                .split("\"content\":\"")
+                .skip(1)
+                .find_map(|seg| {
+                    seg.split("\n")
+                        .map(str::trim)
+                        .find(|line| line.contains("retries failed tasks"))
+                        .and_then(|line| line.split("\",\"").next().map(str::to_owned))
+                })
+                .unwrap_or_else(|| {
+                    // Fallback for sections without the marker phrase: any
+                    // non-empty content line works (it is verbatim by
+                    // construction).
+                    prompt
+                        .split("\"content\":\"")
+                        .skip(1)
+                        .find_map(|seg| {
+                            seg.split("\n")
+                                .map(str::trim)
+                                .find(|line| !line.is_empty() && !line.starts_with('\"'))
+                                .and_then(|line| line.split("\",\"").next().map(str::to_owned))
+                        })
+                        .unwrap_or_default()
+                });
+            eprintln!("DEBUG tag={} quote={quote:?}", request.task_tag);
+            let out = Ok(serde_json::json!({
+                "summary": "parallel fixture",
+                "topics": ["parallel"],
+                "entities": [],
+                "concepts": [],
+                "claims": [{
+                    "text": quote,
+                    "section_id": "",
+                    "evidence_text": quote,
+                    "evidence_start": 0,
+                    "confidence": 0.9
+                }],
+                "relations": []
+            })
+            .to_string());
+            inflight_h.fetch_sub(1, Ordering::SeqCst);
+            return out;
+        }
+        if request.task_tag == "wiki-planning" {
+            if request.prompt.contains(SUMMARY_MARK) {
+                return Ok(
+                    serde_json::json!({"summary": "cluster about the parallel fixture"})
+                        .to_string(),
+                );
+            }
+            // LOCAL plan proposes; RECONCILE replays everything proposed.
+            let ids = kn_ids_in(&request.prompt);
+            proposed_h.lock().unwrap().extend(ids.iter().cloned());
+            let ids = if request.prompt.contains(RECONCILE_MARK) {
+                proposed_h.lock().unwrap().clone()
+            } else {
+                ids
+            };
+            return Ok(serde_json::json!({
+                "pages": [{"title": "Parallel Fixture", "category": "concepts",
+                           "purpose": "cover the fixture", "knowledge_refs": ids}]
+            })
+            .to_string());
+        }
+        if request.task_tag == "wiki-compilation" {
+            let claims = claim_ids_in(&request.prompt);
+            let body = if claims.is_empty() {
+                "## Overview\n\nA plain page without claim citations.".to_owned()
+            } else {
+                format!(
+                    "## Overview\n\nThe fixture page cites its stored claims.\n\n<!-- llm-wiki:cite claim=\"{}\" -->",
+                    claims[0]
+                )
+            };
+            return Ok(serde_json::json!({ "markdown": body }).to_string());
+        }
+        Err(LlmError::Api {
+            code: 500,
+            message: format!("unexpected task tag {}", request.task_tag),
+        })
+    });
+    let provider: Arc<dyn LlmProvider> = Arc::new(FakeLlmProvider::new("fake-parallel", handler));
+
+    let mut config = llm_wiki_core::config::Config::load(&workspace).unwrap();
+    config.llm.max_concurrency = 2;
+
+    let report = llm_wiki_compiler::run_build(&workspace, &config, provider)
+        .await
+        .unwrap();
+    assert!(
+        report.pages >= 1 && report.sources == 6,
+        "the single-plan fake merges all knowledge into one page:          pages={}, sources={} — both matter",
+        report.pages,
+        report.sources
+    );
+    assert!(report.citations >= 1, "claims made it through to citations");
+
+    let observed_peak = peak.load(Ordering::SeqCst);
+    assert!(
+        observed_peak <= 2,
+        "in-flight analysis peaked at {observed_peak}, config caps at 2"
+    );
+    assert!(
+        observed_peak >= 2,
+        "no overlap observed (peak {observed_peak}) — the test cannot prove concurrency is bounded, only serial"
+    );
+}
