@@ -325,7 +325,7 @@ fn make_planner(config: PlannerConfig, responses: Vec<String>) -> (WikiPlanner, 
 fn make_compiler(config: CompilerConfig, responses: Vec<String>) -> WikiCompiler {
     let llm = Arc::new(ScriptedLlm::new(responses));
     let prompt = load_prompt("wiki-compilation", None).unwrap();
-    WikiCompiler::new(llm.clone(), prompt, config)
+    WikiCompiler::new(llm.clone(), prompt, config, 4)
 }
 
 fn planner_with(provider: Arc<dyn LlmProvider>, config: PlannerConfig) -> WikiPlanner {

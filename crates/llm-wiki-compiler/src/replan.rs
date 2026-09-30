@@ -877,6 +877,7 @@ async fn replan_execute(
             min_output_tokens: config.llm.max_output_tokens,
             ..CompilerConfig::default()
         },
+        config.llm.max_concurrency as usize,
     )
     .with_cache(stage_cache);
     let compiled = compiler
@@ -1326,14 +1327,17 @@ async fn replan_analyze_pending(
     if let Some(build_id) = build_id {
         update_build_status(conn, build_id, "ANALYZING")?;
     }
-    let analyzer = DocumentAnalyzer::new(
-        provider.clone(),
-        env.analysis_prompt.clone(),
-        config.analysis.section_target_tokens,
-        config.analysis.max_rejected_claim_ratio,
-        config.llm.max_output_tokens,
-    )
-    .with_cache(stage_cache);
+    let analyzer = Arc::new(
+        DocumentAnalyzer::new(
+            provider.clone(),
+            env.analysis_prompt.clone(),
+            config.analysis.section_target_tokens,
+            config.analysis.max_rejected_claim_ratio,
+            config.llm.max_output_tokens,
+            config.llm.max_concurrency,
+        )
+        .with_cache(stage_cache),
+    );
     let mut llm_request_count = 0u32;
     for (file, source_id, parsed_doc) in &parsed {
         let sections = register_sections(conn, source_id, &parsed_doc.sections, build_id)?;
@@ -1344,7 +1348,9 @@ async fn replan_analyze_pending(
             language: parsed_doc.language.clone(),
             sections,
         };
-        let outcome = analyzer.analyze_document(&doc, build_id).await?;
+        let outcome = Arc::clone(&analyzer)
+            .analyze_document(&doc, build_id)
+            .await?;
         llm_request_count += outcome.llm_request_count;
         crate::persist::persist_outcome(
             conn,

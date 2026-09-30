@@ -70,6 +70,17 @@ pub struct AnalysisOutcome {
     pub llm_request_count: u32,
 }
 
+/// Owned snapshot of the analysis dependencies for one spawned unit task
+/// (everything is Arc or cheap clone; no SQLite touches).
+#[derive(Clone)]
+struct UnitTask {
+    provider: Arc<dyn LlmProvider>,
+    prompt: PromptDocument,
+    max_rejected_claim_ratio: f32,
+    max_output_tokens: u32,
+    cache: Option<Arc<dyn StageCache>>,
+}
+
 pub struct DocumentAnalyzer {
     provider: Arc<dyn LlmProvider>,
     prompt: PromptDocument,
@@ -79,6 +90,10 @@ pub struct DocumentAnalyzer {
     /// models spend chain-of-thought from this same budget, so 4096 can be
     /// exhausted before any visible JSON is emitted.
     max_output_tokens: u32,
+    /// Global throttle across ALL units of ALL documents (PRD §27
+    /// `llm.max_concurrency`). Document windows borrow permits from this, so
+    /// total in-flight LLM calls never exceed the configured cap.
+    units_semaphore: Arc<tokio::sync::Semaphore>,
     /// §28 stage cache; only validated unit responses are stored.
     cache: Option<Arc<dyn StageCache>>,
 }
@@ -90,6 +105,7 @@ impl DocumentAnalyzer {
         section_target_tokens: u32,
         max_rejected_claim_ratio: f32,
         max_output_tokens: u32,
+        max_concurrency: u32,
     ) -> Self {
         Self {
             provider,
@@ -97,6 +113,7 @@ impl DocumentAnalyzer {
             section_target_tokens,
             max_rejected_claim_ratio,
             max_output_tokens,
+            units_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrency.max(1) as usize)),
             cache: None,
         }
     }
@@ -121,13 +138,41 @@ impl DocumentAnalyzer {
             ..Default::default()
         };
 
-        for unit in &units {
-            let unit_outcome = self.analyze_unit(unit, build_id).await?;
+        // Unit-parallel analysis (T1 perf follow-up to finding #12): units of
+        // one document are independent. The analyzer's shared semaphore — not
+        // the caller's document window — is the global throttle, so a big
+        // document cannot starve small ones. Results are aggregated in
+        // document order; nothing crosses into SQLite here.
+        let mut unit_outcomes: Vec<(usize, UnitOutcome)> = Vec::with_capacity(units.len());
+        let mut join_set = tokio::task::JoinSet::new();
+        for (order, unit) in units.into_iter().enumerate() {
+            let permit = self
+                .units_semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|e| WikiError::Llm(format!("analysis semaphore closed: {e}")))?;
+            let task = self.unit_task();
+            let build_id_owned = build_id.cloned();
+            join_set.spawn(async move {
+                let outcome = task.analyze_unit(&unit, build_id_owned.as_ref()).await;
+                (order, outcome, permit)
+            });
+        }
+        while let Some(joined) = join_set.join_next().await {
+            let (order, unit_outcome, _permit) =
+                joined.map_err(|e| WikiError::Llm(format!("analysis task panicked: {e}")))?;
+            unit_outcomes.push((order, unit_outcome?));
+        }
+        unit_outcomes.sort_by_key(|(order, _)| *order);
+        for unit_outcome in unit_outcomes.iter().map(|(_, outcome)| outcome) {
             outcome.llm_request_count += unit_outcome.llm_request_count;
-            outcome.rejected_claims.extend(unit_outcome.rejected_claims);
+            outcome
+                .rejected_claims
+                .extend(unit_outcome.rejected_claims.clone());
             outcome
                 .rejected_relations
-                .extend(unit_outcome.rejected_relations);
+                .extend(unit_outcome.rejected_relations.clone());
             if !unit_outcome.summary.is_empty() {
                 outcome
                     .analysis
@@ -135,18 +180,39 @@ impl DocumentAnalyzer {
                     .push_str(unit_outcome.summary.trim());
                 outcome.analysis.summary.push('\n');
             }
-            outcome.analysis.topics.extend(unit_outcome.topics);
-            outcome.analysis.entities.extend(unit_outcome.entities);
-            outcome.analysis.concepts.extend(unit_outcome.concepts);
-            outcome.analysis.claims.extend(unit_outcome.claims);
-            for relation in unit_outcome.verified_relations {
+            outcome
+                .analysis
+                .topics
+                .extend(unit_outcome.topics.iter().cloned());
+            outcome
+                .analysis
+                .entities
+                .extend(unit_outcome.entities.clone());
+            outcome
+                .analysis
+                .concepts
+                .extend(unit_outcome.concepts.clone());
+            outcome.analysis.claims.extend(unit_outcome.claims.clone());
+            for relation in &unit_outcome.verified_relations {
                 outcome.analysis.relations.push(relation.relation.clone());
-                outcome.verified_relations.push(relation);
+                outcome.verified_relations.push(relation.clone());
             }
         }
         Ok(outcome)
     }
 
+    fn unit_task(&self) -> UnitTask {
+        UnitTask {
+            provider: Arc::clone(&self.provider),
+            prompt: self.prompt.clone(),
+            max_rejected_claim_ratio: self.max_rejected_claim_ratio,
+            max_output_tokens: self.max_output_tokens,
+            cache: self.cache.clone(),
+        }
+    }
+}
+
+impl UnitTask {
     async fn analyze_unit(
         &self,
         unit: &AnalysisUnit,

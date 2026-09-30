@@ -71,10 +71,34 @@ pub struct CompiledGeneration {
     pub llm_request_count: u32,
 }
 
+/// Owned snapshot of the compiler dependencies for one spawned page task
+/// (everything Arc or cheap clone; no SQLite touches).
+#[derive(Clone)]
+struct CompileTask {
+    provider: Arc<dyn LlmProvider>,
+    prompt: PromptDocument,
+    config: CompilerConfig,
+    cache: Option<Arc<dyn StageCache>>,
+}
+
+impl From<&WikiCompiler> for CompileTask {
+    fn from(c: &WikiCompiler) -> Self {
+        Self {
+            provider: Arc::clone(&c.provider),
+            prompt: c.prompt.clone(),
+            config: c.config.clone(),
+            cache: c.cache.clone(),
+        }
+    }
+}
+
 pub struct WikiCompiler {
     provider: Arc<dyn LlmProvider>,
     prompt: PromptDocument,
     config: CompilerConfig,
+    /// In-flight LLM call cap for the page window (PRD §27
+    /// `llm.max_concurrency`).
+    max_concurrency: usize,
     /// §28 stage cache; only grounded, citation-valid responses are stored.
     cache: Option<Arc<dyn StageCache>>,
 }
@@ -84,11 +108,13 @@ impl WikiCompiler {
         provider: Arc<dyn LlmProvider>,
         prompt: PromptDocument,
         config: CompilerConfig,
+        max_concurrency: usize,
     ) -> Self {
         Self {
             provider,
             prompt,
             config,
+            max_concurrency,
             cache: None,
         }
     }
@@ -125,39 +151,62 @@ impl WikiCompiler {
         build_id: &BuildId,
         page_ids: &BTreeSet<WikiPageId>,
     ) -> Result<CompiledGeneration> {
-        let mut title_to_id: BTreeMap<String, WikiPageId> = BTreeMap::new();
+        let mut title_map: BTreeMap<String, WikiPageId> = BTreeMap::new();
+        let plan = Arc::new(plan.clone());
+        let base = Arc::new(base.clone());
         for page in &plan.pages {
             let folded = page.title.trim().to_lowercase();
-            if title_to_id
-                .insert(folded.clone(), page.id.clone())
-                .is_some()
-            {
+            if title_map.insert(folded.clone(), page.id.clone()).is_some() {
                 return Err(WikiError::Compilation(format!(
                     "plan contains duplicate page title '{}'; titles must be unique for WikiLink resolution",
                     folded
                 )));
             }
         }
+        let title_to_id = Arc::new(title_map);
 
-        let mut pages = Vec::new();
-        let mut llm_request_count = 0u32;
-        for page in &plan.pages {
-            if !page_ids.contains(&page.id) {
-                continue; // carried over verbatim by the caller (PRD §19)
+        // Page-parallel compilation (T1 perf): pages are independent; a
+        // JoinSet window bounds in-flight LLM calls and results are collected
+        // in plan order so the generation stays deterministic. `self` is
+        // cloned into each task (cheap: all fields Arc/Config).
+        let mut outcomes = Vec::new();
+        let mut next = 0usize;
+        let mut join_set = tokio::task::JoinSet::new();
+        while next < plan.pages.len() || !join_set.is_empty() {
+            while next < plan.pages.len() && join_set.len() < self.max_concurrency {
+                let page = plan.pages[next].clone();
+                if !page_ids.contains(&page.id) {
+                    next += 1;
+                    continue; // carried over verbatim by the caller (PRD §19)
+                }
+                let title_to_id = Arc::clone(&title_to_id);
+                let plan = Arc::clone(&plan);
+                let base = Arc::clone(&base);
+                let build_id = build_id.clone();
+                let this = CompileTask::from(self);
+                let page = page.clone();
+                join_set.spawn(async move {
+                    this.compile_page(&page, &plan, &base, &build_id, &title_to_id)
+                        .await
+                });
+                next += 1;
             }
-            let (record, requests) = self
-                .compile_page(page, plan, base, build_id, &title_to_id)
-                .await?;
-            llm_request_count += requests;
-            pages.push(record);
+            if let Some(joined) = join_set.join_next().await {
+                outcomes.push(joined.map_err(|e| {
+                    WikiError::Compilation(format!("compile task panicked: {e}"))
+                })??);
+            }
         }
+        let llm_request_count: u32 = outcomes.iter().map(|(_, r)| *r).sum();
+        let pages = outcomes.into_iter().map(|(record, _)| record).collect();
         Ok(CompiledGeneration {
             pages,
             llm_request_count,
         })
     }
+}
 
-    /// Length note: ~108 lines — the single-page pipeline (validate → repair → expand citations → resolve links); stages share local state and run in a fixed order.
+impl CompileTask {
     async fn compile_page(
         &self,
         page: &llm_wiki_core::model::WikiPagePlan,

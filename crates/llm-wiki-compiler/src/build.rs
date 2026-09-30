@@ -493,6 +493,7 @@ async fn compile_and_publish_incremental(
             min_output_tokens: config.llm.max_output_tokens,
             ..CompilerConfig::default()
         },
+        config.llm.max_concurrency as usize,
     )
     .with_cache(stage_cache);
     let compiled = compiler
@@ -788,14 +789,17 @@ async fn build_full_pipeline(
     // §28 stage cache: shared by analysis, planning and compilation; each
     // stage writes a response only after its own validation accepted it.
     let stage_cache: Arc<dyn StageCache> = cache.clone();
-    let analyzer = DocumentAnalyzer::new(
-        provider.clone(),
-        analysis_prompt.clone(),
-        config.analysis.section_target_tokens,
-        config.analysis.max_rejected_claim_ratio,
-        config.llm.max_output_tokens,
-    )
-    .with_cache(stage_cache.clone());
+    let analyzer = Arc::new(
+        DocumentAnalyzer::new(
+            provider.clone(),
+            analysis_prompt.clone(),
+            config.analysis.section_target_tokens,
+            config.analysis.max_rejected_claim_ratio,
+            config.llm.max_output_tokens,
+            config.llm.max_concurrency,
+        )
+        .with_cache(stage_cache.clone()),
+    );
     // ---- Document-parallel analysis (T1 finding #12) ----
     // SQLite (Connection is !Sync) stays on this task: sections are
     // registered serially first, then only the LLM calls run concurrently
@@ -839,12 +843,13 @@ async fn build_full_pipeline(
     while next_to_spawn < doc_inputs.len() || !join_set.is_empty() {
         let build_id_owned = build_id.clone();
         while next_to_spawn < doc_inputs.len() && join_set.len() < doc_concurrency {
-            let analyzer = Arc::clone(&analyzer);
             let doc = doc_inputs[next_to_spawn].clone();
             let build_id_owned = build_id_owned.clone();
             let index = next_to_spawn;
+            let doc_analyzer = Arc::clone(&analyzer);
             join_set.spawn(async move {
-                let outcome = analyzer
+                let outcome = doc_analyzer
+                    .clone()
                     .analyze_document(&doc, Some(&build_id_owned))
                     .await?;
                 Ok::<_, WikiError>((index, outcome))
@@ -904,6 +909,7 @@ async fn build_full_pipeline(
         provider.clone(),
         compilation_prompt.clone(),
         compiler_config,
+        config.llm.max_concurrency as usize,
     )
     .with_cache(stage_cache);
     let generation = compiler
@@ -1176,6 +1182,7 @@ async fn analyze_changed_sources(
         config.analysis.section_target_tokens,
         config.analysis.max_rejected_claim_ratio,
         config.llm.max_output_tokens,
+        config.llm.max_concurrency,
     )
     .with_cache(stage_cache);
     // Same document-parallel pattern as the full pipeline: serial register,

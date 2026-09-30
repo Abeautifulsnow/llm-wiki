@@ -157,6 +157,7 @@ fn analyzer(provider: Arc<dyn LlmProvider>) -> DocumentAnalyzer {
         6000,
         0.10,
         4096,
+        4,
     )
 }
 
@@ -169,6 +170,7 @@ fn lenient_analyzer(provider: Arc<dyn LlmProvider>) -> DocumentAnalyzer {
         6000,
         0.50,
         4096,
+        4,
     )
 }
 
@@ -202,6 +204,7 @@ async fn configured_max_output_tokens_reaches_the_analysis_request() {
         6000,
         0.10,
         12_345,
+        4,
     );
     analyzer.analyze_document(&doc, None).await.unwrap();
     let seen = seen.lock().unwrap().clone();
@@ -558,6 +561,7 @@ async fn oversized_section_is_segmented_and_evidence_spans_segments() {
         64,
         0.10,
         4096,
+        4,
     );
     let outcome = analyzer.analyze_document(&doc, None).await.unwrap();
 
