@@ -270,7 +270,8 @@ fn build_provider(llm: &LlmConfig) -> Result<Arc<dyn llm_wiki_llm::LlmProvider>,
                 llm.timeout_seconds,
                 2,
             )
-            .map_err(|e| WikiError::Llm(e.to_string()))?;
+            .map_err(|e| WikiError::Llm(e.to_string()))?
+            .with_thinking(&llm.thinking, &llm.thinking_effort);
             Ok(Arc::new(provider))
         }
         other => Err(WikiError::Config(format!(

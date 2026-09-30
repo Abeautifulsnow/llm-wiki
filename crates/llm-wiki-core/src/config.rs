@@ -69,6 +69,16 @@ pub struct LlmConfig {
     /// this when pointing at a thinking model.
     #[serde(default = "default_max_output_tokens")]
     pub max_output_tokens: u32,
+    /// Thinking control for reasoning-capable models: `auto` (default — send
+    /// nothing), `on`, `off`. Providers implement thinking differently; a
+    /// rejected parameter downgrades to auto for the whole build with a
+    /// warning in the log, never an error (T1 finding #5/#6).
+    #[serde(default)]
+    pub thinking: String,
+    /// Optional reasoning-effort hint (`low`/`medium`/`high`, OpenAI-style
+    /// `reasoning_effort`). Empty sends nothing. Same tolerant downgrade.
+    #[serde(default)]
+    pub thinking_effort: String,
     #[serde(default = "default_max_concurrency")]
     pub max_concurrency: u32,
     #[serde(default = "default_timeout_seconds")]
@@ -231,6 +241,8 @@ impl Default for LlmConfig {
             model: String::new(),
             api_key_env: default_api_key_env(),
             max_output_tokens: default_max_output_tokens(),
+            thinking: String::new(),
+            thinking_effort: String::new(),
             max_concurrency: default_max_concurrency(),
             timeout_seconds: default_timeout_seconds(),
         }

@@ -409,10 +409,12 @@ async fn unverifiable_evidence_becomes_rejected_record() {
 }
 
 #[tokio::test]
-async fn rejected_ratio_over_threshold_fails_the_unit() {
+async fn over_threshold_unit_repairs_once_with_reasons_then_succeeds() {
     let doc = fixture_doc();
     let id_a = doc.sections[0].section_id.clone();
-    let response = analysis_response(
+    // First response: 3 of 4 claims fabricated (75% > 10% threshold) —
+    // triggers the T1 second-chance repair with per-claim reasons.
+    let bad = analysis_response(
         "mostly fabricated",
         serde_json::json!([
             valid_claim(&id_a, "up to three times"),
@@ -422,7 +424,59 @@ async fn rejected_ratio_over_threshold_fails_the_unit() {
         ]),
         serde_json::json!([]),
     );
-    let llm = Arc::new(ScriptedLlm::new(vec![response]));
+    // Repair response: everything verifiable (both quotes from section A).
+    let good = analysis_response(
+        "verified only",
+        serde_json::json!([
+            valid_claim(&id_a, "up to three times"),
+            valid_claim(&id_a, "The plugin runtime retries"),
+        ]),
+        serde_json::json!([]),
+    );
+    let llm = Arc::new(ScriptedLlm::new(vec![bad, good]));
+    let outcome = analyzer(llm.clone())
+        .analyze_document(&doc, None)
+        .await
+        .unwrap();
+    assert_eq!(outcome.llm_request_count, 2, "one repair request");
+    assert_eq!(outcome.analysis.claims.len(), 2);
+    assert!(outcome.rejected_claims.is_empty());
+
+    // The repair request carried the per-claim rejection reasons.
+    let prompts = llm.prompts.lock().unwrap();
+    assert!(prompts[1].contains("evidence validation rejected 3 of 4 claims"));
+    assert!(
+        prompts[1].contains("EVIDENCE_NOT_IN_SECTION"),
+        "per-claim rejection reasons reach the repair prompt"
+    );
+    assert!(prompts[1].contains("character-for-character"));
+}
+
+#[tokio::test]
+async fn over_threshold_unit_fails_after_repair_still_rejects() {
+    let doc = fixture_doc();
+    let id_a = doc.sections[0].section_id.clone();
+    let bad = analysis_response(
+        "still fabricated",
+        serde_json::json!([
+            valid_claim(&id_a, "up to three times"),
+            valid_claim(&id_a, "fabricated one"),
+            valid_claim(&id_a, "fabricated two"),
+            valid_claim(&id_a, "fabricated three"),
+        ]),
+        serde_json::json!([]),
+    );
+    let bad_repair = analysis_response(
+        "still fabricated after repair",
+        serde_json::json!([
+            valid_claim(&id_a, "up to three times"),
+            valid_claim(&id_a, "fabricated one"),
+            valid_claim(&id_a, "fabricated two"),
+            valid_claim(&id_a, "fabricated three"),
+        ]),
+        serde_json::json!([]),
+    );
+    let llm = Arc::new(ScriptedLlm::new(vec![bad, bad_repair]));
     let err = analyzer(llm.clone())
         .analyze_document(&doc, None)
         .await
@@ -431,7 +485,10 @@ async fn rejected_ratio_over_threshold_fails_the_unit() {
         matches!(err, llm_wiki_core::WikiError::EvidenceValidation(_)),
         "{err}"
     );
-    assert!(err.to_string().contains("75%"));
+    assert!(
+        err.to_string().contains("even after evidence repair"),
+        "{err}"
+    );
 }
 
 #[tokio::test]
@@ -490,6 +547,6 @@ async fn oversized_section_is_segmented_and_evidence_spans_segments() {
     assert!(range.end <= doc.sections[0].range.end);
     assert_eq!(
         &long_section[range.start..range.end],
-        "Final sentence about the audit log entries."
+        "Final sentence about the audit log entries" // fold keeps alphanumeric bytes: trailing "." excluded
     );
 }

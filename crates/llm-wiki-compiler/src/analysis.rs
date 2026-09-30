@@ -199,15 +199,80 @@ impl DocumentAnalyzer {
         };
 
         // ---- Stage 2 (referential) + stage 3 (semantic) ----
-        let claims = self.verify_claims(&raw.claims, unit, build_id);
-        let (verified_relations, rejected_relations) = self.verify_relations(&raw.relations, unit);
+        let mut raw = raw;
+        let mut validated = validated;
+        let mut claims = self.verify_claims(&raw.claims, unit, build_id);
+        let (mut verified_relations, mut rejected_relations) =
+            self.verify_relations(&raw.relations, unit);
 
-        let rejected_claims = claims.rejected;
-        let total_claims = claims.verified.len() + rejected_claims.len();
-        if total_claims > 0 {
+        // Over-threshold units get ONE second-chance repair (T1 finding #6):
+        // the rejection reasons are fed back verbatim so the model can re-copy
+        // evidence quotes; the re-verified response replaces the first. The
+        // first response is still NOT cached (PRD §28) — only the repaired
+        // response, if the unit now passes.
+        let mut rejected_claims = claims.rejected;
+        let mut total_claims = claims.verified.len() + rejected_claims.len();
+        if total_claims > 0
+            && rejected_claims.len() as f32 / total_claims as f32 > self.max_rejected_claim_ratio
+        {
+            tracing::warn!(
+                rejected = rejected_claims.len(),
+                total = total_claims,
+                "analysis unit over rejected-claim threshold; repairing once with per-claim reasons"
+            );
+            let feedback = rejected_feedback(&rejected_claims);
+            let repair = repair_request(
+                &base_request,
+                &template,
+                &[format!(
+                    "evidence validation rejected {} of {} claims:
+{}
+Re-emit the COMPLETE JSON analysis. For EVERY claim, copy evidence_text character-for-character from the section content — do not rephrase, do not normalize spacing or punctuation; a quote that cannot be located verbatim is rejected again. Extract fewer claims rather than weakly-evidenced ones.",
+                    total_claims - claims.verified.len(),
+                    total_claims,
+                    feedback
+                )],
+            );
+            let (repair_response, added) =
+                generate_cached(&self.provider, self.cache.as_ref(), repair.clone()).await?;
+            llm_request_count += added;
+            let parsed = structured::parse_json::<RawAnalysis>(&repair_response.text).map_err(
+                |repair_stage1| {
+                    WikiError::SchemaValidation(format!(
+                        "evidence repair failed schema validation: {}",
+                        repair_stage1.machine_reason()
+                    ))
+                },
+            )?;
+            let reverified = self.verify_claims(&parsed.claims, unit, build_id);
+            let (re_verified_relations, re_rejected_relations) =
+                self.verify_relations(&parsed.relations, unit);
+            claims = ClaimVerification {
+                verified: reverified.verified,
+                rejected: reverified.rejected,
+            };
+            rejected_relations = re_rejected_relations;
+            verified_relations = re_verified_relations;
+            rejected_claims = claims.rejected;
+            total_claims = claims.verified.len() + rejected_claims.len();
+            raw = parsed;
+            validated = (repair, repair_response);
+            if total_claims > 0
+                && rejected_claims.len() as f32 / total_claims as f32
+                    > self.max_rejected_claim_ratio
+            {
+                // Still over threshold: the unit fails, nothing is cached.
+                return Err(WikiError::EvidenceValidation(format!(
+                    "analysis unit rejected {}/{} claims ({:.0}% > {:.0}% threshold) even after evidence repair; the unit fails and must not produce knowledge",
+                    rejected_claims.len(),
+                    total_claims,
+                    rejected_claims.len() as f32 / total_claims as f32 * 100.0,
+                    self.max_rejected_claim_ratio * 100.0
+                )));
+            }
+        } else if total_claims > 0 {
             let ratio = rejected_claims.len() as f32 / total_claims as f32;
             if ratio > self.max_rejected_claim_ratio {
-                // The unit fails: its response is NOT cached (PRD §28).
                 return Err(WikiError::EvidenceValidation(format!(
                     "analysis unit rejected {}/{} claims ({:.0}% > {:.0}% threshold); the unit fails and must not produce knowledge",
                     rejected_claims.len(),
@@ -356,6 +421,23 @@ impl DocumentAnalyzer {
         }
         (verified, rejected)
     }
+}
+
+/// Truncated per-claim feedback for the second-chance evidence repair:
+/// candidate text (so the model knows WHICH claim) plus the machine reason.
+fn rejected_feedback(rejected: &[RejectedClaim]) -> String {
+    rejected
+        .iter()
+        .take(12)
+        .map(|r| {
+            let text = r.candidate_text.chars().take(120).collect::<String>();
+            format!("- claim \"{}\": {}", text.replace('"', "'"), r.reason)
+        })
+        .collect::<Vec<_>>()
+        .join(
+            "
+",
+        )
 }
 
 fn render_issues(issues: &[ValidationIssue]) -> String {
@@ -566,10 +648,17 @@ fn validate_claim(candidate: &RawClaim, unit: &AnalysisUnit) -> Vec<ValidationIs
     issues
 }
 
-/// Locates a verbatim evidence quote inside the cited section (whitespace-run
-/// tolerant) and computes its absolute range + digest. Returns
-/// `(section id, absolute range, sha256 of quoted text)`, or the validation
-/// issues on failure.
+/// Locates an evidence quote inside the cited section and computes its
+/// absolute range + digest. Matching is fold-insensitive (T1 finding #8:
+/// thinking models transcribe with case/width/punctuation/whitespace drift,
+/// and the observed rejected claims were *transcription drift*, not
+/// hallucination): both texts are NFKC-normalized, punctuation-stripped,
+/// lowercased into a character stream that IGNORES whitespace and punctuation
+/// entirely — so hyphenation ("long-running" vs "long running") and CJK/ASCII
+/// punctuation differences cannot break the anchor. The returned range covers
+/// the ORIGINAL bytes, keeping provenance (range + digest) verifiable.
+/// Returns `(section id, absolute range, sha256 of quoted text)`, or the
+/// validation issues on failure.
 fn locate_evidence(
     evidence_text: &str,
     hint_start: Option<i64>,
@@ -587,29 +676,29 @@ fn locate_evidence(
             )]
         })?;
 
-    let evidence_tokens = tokenize(evidence_text);
-    if evidence_tokens.is_empty() {
+    let needle = fold_with_offsets(evidence_text);
+    if needle.text.is_empty() {
         return Err(vec![ValidationIssue::new(
             "EMPTY_EVIDENCE",
             "claim has no evidence quote",
         )]);
     }
-    let content_tokens = tokenize(&entry.content);
-    let first = locate_key(&evidence_tokens[0].text);
+    let haystack = fold_with_offsets(&entry.content);
 
-    let mut matches: Vec<(usize, usize)> = Vec::new(); // byte start, byte end
-    for (start_idx, token) in content_tokens.iter().enumerate() {
-        if locate_key(&token.text) == first
-            && start_idx + evidence_tokens.len() <= content_tokens.len()
-        {
-            let window = &content_tokens[start_idx..start_idx + evidence_tokens.len()];
-            if window
-                .iter()
-                .zip(evidence_tokens.iter())
-                .all(|(content, evidence)| locate_key(&content.text) == locate_key(&evidence.text))
-            {
-                matches.push((window[0].start, window[window.len() - 1].end));
+    let mut matches: Vec<(usize, usize)> = Vec::new(); // original byte start, byte end
+                                                       // Char-vector matching: `offsets` is indexed per folded CHAR, so a byte
+                                                       // based `str::find` would misalign on multi-byte (CJK) characters.
+    let hay: Vec<char> = haystack.text.chars().collect();
+    let needle_chars: Vec<char> = needle.text.chars().collect();
+    if !needle_chars.is_empty() && needle_chars.len() <= hay.len() {
+        let mut from = 0usize;
+        while from + needle_chars.len() <= hay.len() {
+            if hay[from..from + needle_chars.len()] == needle_chars[..] {
+                let a = from;
+                let b = a + needle_chars.len();
+                matches.push((haystack.offsets[a].0, haystack.offsets[b - 1].1));
             }
+            from += 1;
         }
     }
 
@@ -639,48 +728,32 @@ fn locate_evidence(
     ))
 }
 
-/// Comparison key for locating a quote token: punctuation at token edges is
-/// ignored (models routinely drop a trailing period), so "times." locates
-/// "times". The citation range still covers the original bytes.
-fn locate_key(text: &str) -> &str {
-    text.trim_matches(|ch: char| !ch.is_alphanumeric())
+/// A fold-insensitive view of a text: NFKC, keep only alphanumeric
+/// characters, lowercase — with, for every folded char, the ORIGINAL byte
+/// range it came from (ranges repeat across multi-char case expansions, so
+/// mapping a folded span back to original bytes is a lookup, never arithmetic).
+struct FoldedText {
+    text: String,
+    /// (original start, original end) per folded char.
+    offsets: Vec<(usize, usize)>,
 }
 
-/// Splits text into NFC whitespace-separated tokens with byte offsets.
-/// Matching stays case-sensitive: quotes must match the document verbatim
-/// modulo whitespace and edge punctuation.
-fn tokenize(text: &str) -> Vec<Token> {
+fn fold_with_offsets(text: &str) -> FoldedText {
     use unicode_normalization::UnicodeNormalization;
     let normalized: String = text.nfc().collect();
-    let mut tokens = Vec::new();
-    let mut start: Option<usize> = None;
+    let mut text = String::with_capacity(normalized.len());
+    let mut offsets = Vec::with_capacity(normalized.len());
     for (idx, ch) in normalized.char_indices() {
-        if ch.is_whitespace() {
-            if let Some(begin) = start.take() {
-                tokens.push(Token {
-                    text: normalized[begin..idx].to_owned(),
-                    start: begin,
-                    end: idx,
-                });
-            }
-        } else if start.is_none() {
-            start = Some(idx);
+        if !ch.is_alphanumeric() {
+            continue;
+        }
+        let end = idx + ch.len_utf8();
+        for low in ch.to_lowercase() {
+            text.push(low);
+            offsets.push((idx, end));
         }
     }
-    if let Some(begin) = start {
-        tokens.push(Token {
-            text: normalized[begin..].to_owned(),
-            start: begin,
-            end: normalized.len(),
-        });
-    }
-    tokens
-}
-
-struct Token {
-    text: String,
-    start: usize,
-    end: usize,
+    FoldedText { text, offsets }
 }
 
 /// Stable registry canonical key for a claim statement: fingerprint of the
@@ -694,4 +767,80 @@ pub fn claim_identity_key(statement: &str) -> String {
 
 fn content_fingerprint_of(text: &str) -> String {
     sha256_hex(text.as_bytes())
+}
+
+#[cfg(test)]
+mod locate_tests {
+    use super::*;
+
+    fn unit_with(content: &str) -> AnalysisUnit {
+        AnalysisUnit {
+            entries: vec![UnitEntry {
+                section_id: SectionId::parse("sec_01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
+                heading_path: vec!["Doc".into()],
+                content: content.to_owned(),
+                range_start: 0,
+            }],
+        }
+    }
+
+    fn section() -> SectionId {
+        SectionId::parse("sec_01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap()
+    }
+
+    /// T1 finding #8: thinking models transcribe with case/width/punctuation
+    /// drift; the locator must still anchor the evidence (range over ORIGINAL
+    /// bytes — digest verifiable).
+    #[test]
+    fn locator_folds_case_width_and_punctuation_drift() {
+        // Case drift.
+        let unit = unit_with("The plugin runtime retries up to THREE times.");
+        let (_, range, _) = locate_evidence("up to three TIMES.", None, section().as_str(), &unit)
+            .map_err(|e| e.clone())
+            .unwrap();
+        assert_eq!(
+            &unit.entries[0].content[range.start..range.end],
+            "up to THREE times" // trailing "." dropped: fold keeps alphanumeric bytes only
+        );
+
+        // Full-width punctuation and CJK comma drift.
+        let unit = unit_with("检查点默认每 30 秒持久化一次。");
+        let (located, cjk_range, _) = locate_evidence(
+            "检查点默认每 30 秒持久化一次，",
+            None,
+            section().as_str(),
+            &unit,
+        )
+        .map_err(|e| e.clone())
+        .unwrap();
+        assert_eq!(located, section());
+        assert_eq!(
+            &unit.entries[0].content[cjk_range.start..cjk_range.end],
+            "检查点默认每 30 秒持久化一次"
+        );
+
+        // Internal punctuation difference (hyphen vs space) — token-count
+        // drift the previous whitespace tokenizer could not bridge.
+        let unit = unit_with("a long-running task cannot be killed");
+        let (_, hyphen_range, _) = locate_evidence(
+            "a long running task cannot be killed",
+            None,
+            section().as_str(),
+            &unit,
+        )
+        .map_err(|e| e.clone())
+        .unwrap();
+        assert_eq!(
+            &unit.entries[0].content[hyphen_range.start..hyphen_range.end],
+            "a long-running task cannot be killed"
+        );
+    }
+
+    #[test]
+    fn locator_still_rejects_genuinely_absent_quotes() {
+        let unit = unit_with("The plugin runtime retries up to three times.");
+        let err = locate_evidence("the runtime never retries", None, section().as_str(), &unit)
+            .unwrap_err();
+        assert_eq!(err[0].code, "EVIDENCE_NOT_IN_SECTION");
+    }
 }
