@@ -15,6 +15,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use llm_wiki_core::error::{Result, WikiError};
+use llm_wiki_core::hash::sha256_hex;
 use llm_wiki_core::ids::{KnowledgeNodeId, SourceId, WikiPageId};
 use llm_wiki_core::model::{WikiPagePlan, WikiPlan};
 use llm_wiki_core::plan::{
@@ -285,7 +286,6 @@ impl WikiPlanner {
             })
         };
 
-        let reconcile_stage = self.prompt.stage_block("reconcile")?;
         let mut proposed_union: BTreeSet<String> = proposals
             .iter()
             .flat_map(|proposal| proposal.knowledge_refs.iter().cloned())
@@ -294,69 +294,9 @@ impl WikiPlanner {
             proposed_union.extend(salvage.knowledge_refs.iter().cloned());
         }
 
-        // Batched reconciliation (T1 Run 13: a 60-doc corpus produced a
-        // ~506K-token reconcile payload against a 32K budget — 16x over, and
-        // PRD §14 forbids truncation). When the single-shot payload exceeds
-        // the budget, proposals are split into budget-sized batches; each
-        // batch is reconciled independently (its output pages become the
-        // proposals of the next round), and a final round merges the batch
-        // results. Guarantees preserved per round: coverage validated against
-        // that batch's proposed set; DUPLICATE across batches is impossible
-        // because batches partition the proposals.
-        let mut merged: Vec<RawPage>;
-        let mut round_proposals: Vec<RawPage> = proposals;
-        let mut round_keys_summary: Vec<String> = summary_keys.clone();
-        let mut round_keys_local: Vec<String> = local_keys.clone();
-        let mut reconcile_requests = 0u32;
-        loop {
-            let reconcile_json =
-                reconcile_payload(&round_proposals, &round_keys_summary, &round_keys_local);
-            let single_round = reconcile_json.len() <= MAX_RECONCILE_PAYLOAD_BYTES;
-            self.ensure_stage_budget(&reconcile_json, "reconciliation")?;
-            let (round_merged, requests) = self
-                .reconcile_stage(&reconcile_stage, &reconcile_json, &proposed_union)
-                .await?;
-            reconcile_requests += requests;
-            if single_round {
-                merged = round_merged;
-                break;
-            }
-            // Batch the PROPOSALS (the dominant payload term) into
-            // budget-sized slices; the next round reconciles the merged pages
-            // of each batch. Summaries/keys shrink with each round because
-            // each batch yields fewer pages than it consumed proposals.
-            let batch_count = reconcile_json.len().div_ceil(MAX_RECONCILE_PAYLOAD_BYTES) + 1;
-            let per_batch = round_proposals.len().div_ceil(batch_count).max(1);
-            let mut next_round: Vec<RawPage> = Vec::new();
-            for batch in round_proposals.chunks(per_batch) {
-                let batch_json = reconcile_payload(batch, &round_keys_summary, &round_keys_local);
-                self.ensure_stage_budget(&batch_json, "reconciliation batch")?;
-                let batch_union: BTreeSet<String> = batch
-                    .iter()
-                    .flat_map(|proposal| proposal.knowledge_refs.iter().cloned())
-                    .collect();
-                let (batch_merged, requests) = self
-                    .reconcile_stage(&reconcile_stage, &batch_json, &batch_union)
-                    .await?;
-                reconcile_requests += requests;
-                next_round.extend(batch_merged);
-            }
-            round_proposals = next_round;
-            round_keys_summary = round_proposals
-                .iter()
-                .map(|_| format!("batch-{}", uuid_batch()))
-                .collect();
-            round_keys_local = round_proposals
-                .iter()
-                .map(|_| format!("batch-{}", uuid_batch()))
-                .collect();
-            if round_proposals.len() <= 1 {
-                // A single (merged) proposal cannot be subdivided further;
-                // the next loop iteration fits by construction.
-                merged = round_proposals;
-                break;
-            }
-        }
+        let (mut merged, reconcile_requests) = self
+            .reconcile_rounds(proposals, &summary_keys, &local_keys, &proposed_union)
+            .await?;
         llm_request_count += reconcile_requests;
 
         if let Some(mut salvage) = salvage_page {
@@ -422,6 +362,85 @@ impl WikiPlanner {
             flat_mode: false,
             plan_cache_hit: false,
         })
+    }
+
+    /// Batched reconciliation (T1 Run 13: a 60-doc corpus produced a
+    /// ~506K-token reconcile payload against a 32K budget — 16x over, and
+    /// PRD §14 forbids truncation). When the single-shot payload exceeds
+    /// the budget, proposals are split into budget-sized batches; each
+    /// batch is reconciled independently (its output pages become the
+    /// proposals of the next round), and a final round merges the batch
+    /// results. The full payload is NEVER estimated against the stage
+    /// budget nor sent — only what a request will actually carry is
+    /// validated (estimate what you send, send what you estimated).
+    /// Guarantees preserved per round: coverage validated against that
+    /// batch's proposed set; DUPLICATE across batches is impossible
+    /// because batches partition the proposals.
+    /// Length note: ~60 lines — the multi-round loop, symmetric with the
+    /// cluster staging inside plan_hierarchical.
+    async fn reconcile_rounds(
+        &self,
+        proposals: Vec<RawPage>,
+        summary_keys: &[String],
+        local_keys: &[String],
+        proposed_union: &BTreeSet<String>,
+    ) -> Result<(Vec<RawPage>, u32)> {
+        let reconcile_stage = self.prompt.stage_block("reconcile")?;
+        let mut round_proposals = proposals;
+        let mut round_keys_summary: Vec<String> = summary_keys.to_vec();
+        let mut round_keys_local: Vec<String> = local_keys.to_vec();
+        let mut reconcile_requests = 0u32;
+        let merged: Vec<RawPage>;
+        loop {
+            let reconcile_json =
+                reconcile_payload(&round_proposals, &round_keys_summary, &round_keys_local);
+            let single_round = reconcile_json.len() <= MAX_RECONCILE_PAYLOAD_BYTES;
+            if single_round {
+                self.ensure_stage_budget(&reconcile_json, "reconciliation")?;
+                let (round_merged, requests) = self
+                    .reconcile_stage(&reconcile_stage, &reconcile_json, proposed_union)
+                    .await?;
+                reconcile_requests += requests;
+                merged = round_merged;
+                break;
+            }
+            // Batch the PROPOSALS (the dominant payload term) into
+            // budget-sized slices; the next round reconciles the merged pages
+            // of each batch. Summaries/keys shrink with each round because
+            // each batch yields fewer pages than it consumed proposals.
+            let batch_count = reconcile_json.len().div_ceil(MAX_RECONCILE_PAYLOAD_BYTES) + 1;
+            let per_batch = round_proposals.len().div_ceil(batch_count).max(1);
+            let mut next_round: Vec<RawPage> = Vec::new();
+            for batch in round_proposals.chunks(per_batch) {
+                let batch_json = reconcile_payload(batch, &round_keys_summary, &round_keys_local);
+                self.ensure_stage_budget(&batch_json, "reconciliation batch")?;
+                let batch_union: BTreeSet<String> = batch
+                    .iter()
+                    .flat_map(|proposal| proposal.knowledge_refs.iter().cloned())
+                    .collect();
+                let (batch_merged, requests) = self
+                    .reconcile_stage(&reconcile_stage, &batch_json, &batch_union)
+                    .await?;
+                reconcile_requests += requests;
+                next_round.extend(batch_merged);
+            }
+            round_proposals = next_round;
+            round_keys_summary = round_proposals
+                .iter()
+                .map(|page| batch_key("batch-s", page))
+                .collect();
+            round_keys_local = round_proposals
+                .iter()
+                .map(|page| batch_key("batch-l", page))
+                .collect();
+            if round_proposals.len() <= 1 {
+                // A single (merged) proposal cannot be subdivided further;
+                // the next loop iteration fits by construction.
+                merged = round_proposals;
+                break;
+            }
+        }
+        Ok((merged, reconcile_requests))
     }
 
     /// Flat (non-hierarchical) mode: allowed only while the whole knowledge
@@ -764,13 +783,18 @@ fn compact_payload(base: &KnowledgeBase, ids: &[KnowledgeNodeId], summary: &str)
 /// ~126K tokens — against a 32K-token budget).
 const MAX_RECONCILE_PAYLOAD_BYTES: usize = 96_000;
 
-/// Stable unique tag for synthetic batch keys (avoids pulling a uuid dep).
-fn uuid_batch() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, Ordering::SeqCst) + 1;
-    let pid = std::process::id();
-    format!("{pid:08x}{n:016x}")
+/// Deterministic synthetic key for a batch-round page: derived from the
+/// page's own content, so identical proposals produce the identical prompt —
+/// and therefore the identical §28 cache key — in every process. Never built
+/// from PID or a process-local counter.
+fn batch_key(prefix: &str, page: &RawPage) -> String {
+    let canonical = serde_json::json!({
+        "title": page.title,
+        "category": page.category,
+        "purpose": page.purpose,
+        "knowledge_refs": page.knowledge_refs,
+    });
+    format!("{prefix}-{}", sha256_hex(canonical.to_string().as_bytes()))
 }
 
 fn reconcile_payload(
@@ -1014,6 +1038,23 @@ mod tests {
         // Three shares `a` with One only.
         assert_eq!(pages[2].related_pages, vec![pages[0].id.clone()]);
         let _ = b;
+    }
+
+    #[test]
+    fn batch_keys_derive_from_content_not_process_state() {
+        let page = RawPage {
+            title: "Merged".to_owned(),
+            category: "concepts".to_owned(),
+            purpose: "merged".to_owned(),
+            knowledge_refs: vec!["kn_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()],
+        };
+        // Same content → same key (identical prompts and cache keys across
+        // processes); the summary/local prefixes must differ.
+        assert_eq!(batch_key("batch-s", &page), batch_key("batch-s", &page));
+        assert_ne!(batch_key("batch-s", &page), batch_key("batch-l", &page));
+        let mut other = page.clone();
+        other.title = "Different".to_owned();
+        assert_ne!(batch_key("batch-s", &page), batch_key("batch-s", &other));
     }
 
     #[test]

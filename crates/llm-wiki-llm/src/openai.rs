@@ -59,6 +59,17 @@ impl ThinkingMode {
     }
 }
 
+/// True when the base URL points at a loopback host (localhost, 127.0.0.1,
+/// ::1): such endpoints are reached directly — a system proxy (http_proxy
+/// env) must never intercept them. Local gateways are a first-class target
+/// of this adapter.
+fn is_loopback_base_url(base_url: &str) -> bool {
+    match reqwest::Url::parse(base_url) {
+        Ok(url) => matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1")),
+        Err(_) => false,
+    }
+}
+
 impl OpenAiCompatibleProvider {
     /// Builds a provider. `api_key_env` is the config-declared env var name;
     /// a missing env var is only an error once a request actually needs it
@@ -76,8 +87,11 @@ impl OpenAiCompatibleProvider {
             Err(std::env::VarError::NotPresent) => None,
             Err(e) => return Err(LlmError::MissingApiKey(format!("{api_key_env}: {e}"))),
         };
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(timeout_seconds))
+        let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(timeout_seconds));
+        if is_loopback_base_url(base_url) {
+            builder = builder.no_proxy();
+        }
+        let client = builder
             .build()
             .map_err(|e| LlmError::Http(format!("client build: {e}")))?;
         Ok(Self {
@@ -226,9 +240,16 @@ impl LlmProvider for OpenAiCompatibleProvider {
         if request.json_mode {
             body["response_format"] = json!({ "type": "json_object" });
         }
-        let params_applied =
+        // Check the downgrade BEFORE applying: `apply_thinking_params`
+        // mutates the body as a side effect, so evaluating it first would
+        // re-send the rejected parameters on every later request — and with
+        // `params_applied == false` the downgrade retry below no longer
+        // fires, failing the build.
+        let params_applied = if self.thinking_downgraded.load(Ordering::SeqCst) {
+            false
+        } else {
             apply_thinking_params(&mut body, self.thinking, self.thinking_effort.as_deref())
-                && !self.thinking_downgraded.load(Ordering::SeqCst);
+        };
 
         // Fault-tolerant thinking controls (T1): providers implement them
         // differently or not at all. A rejection of the PARAMETIZED request
@@ -319,6 +340,75 @@ mod tests {
         let mut body = json!({ "model": "m" });
         assert!(apply_thinking_params(&mut body, ThinkingMode::On, None));
         assert_eq!(body["thinking"]["type"], "enabled");
+    }
+
+    /// Downgrade is permanent for the provider's lifetime: after the first
+    /// rejected request, EVERY later generate must go out WITHOUT the
+    /// thinking parameters — re-sending them would 400 again and, with the
+    /// retry guard disabled by the downgrade, fail the build.
+    #[tokio::test]
+    async fn downgraded_provider_never_sends_thinking_params_again() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            // Request 1: with thinking → 400; its retry without → 200.
+            // Request 2 (a later generate): MUST arrive without thinking.
+            for expect_thinking in [true, false, false] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = vec![0u8; 65536];
+                let n = stream.read(&mut buf).unwrap();
+                let raw = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let has_thinking = raw.contains("\"thinking\":{\"type\":\"disabled\"}");
+                assert_eq!(has_thinking, expect_thinking, "request body: {raw}");
+                let body = if expect_thinking {
+                    r#"{"error":{"message":"unknown parameter thinking","type":"invalid_request_error"}}"#
+                } else {
+                    r#"{"choices":[{"message":{"content":"{\"ok\":true}"},"finish_reason":"stop"}]}"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: {}
+Connection: close
+
+{}",
+                    body.len(),
+                    body
+                );
+                let response = if expect_thinking {
+                    response.replace("200 OK", "400 Bad Request")
+                } else {
+                    response
+                };
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let provider = OpenAiCompatibleProvider::new(
+            &format!("http://127.0.0.1:{port}"),
+            "m",
+            "UNUSED_VAR",
+            10,
+            0,
+        )
+        .unwrap()
+        .with_thinking("off", "");
+        let request = LlmRequest {
+            task_tag: "test".into(),
+            system: None,
+            prompt: "ping".into(),
+            temperature: 0.0,
+            max_output_tokens: 16,
+            json_mode: false,
+        };
+        provider.generate(request.clone()).await.unwrap();
+        // The second generate goes straight out without the thinking params.
+        provider.generate(request).await.unwrap();
+        assert!(provider.thinking_downgraded.load(Ordering::SeqCst));
+        server.join().unwrap();
     }
 
     #[test]

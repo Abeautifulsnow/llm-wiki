@@ -800,23 +800,6 @@ async fn build_full_pipeline(
         )
         .with_cache(stage_cache.clone()),
     );
-    // ---- Document-parallel analysis (T1 finding #12) ----
-    // SQLite (Connection is !Sync) stays on this task: sections are
-    // registered serially first, then only the LLM calls run concurrently
-    // (bounded by `llm.max_concurrency`, PRD §27 — previously parsed but
-    // never enforced), and outcomes are persisted in document order.
-    let mut doc_inputs = Vec::with_capacity(parsed.len());
-    for (file, source_id, parsed_doc) in &parsed {
-        let sections = register_sections(conn, source_id, &parsed_doc.sections, Some(build_id))?;
-        doc_inputs.push(AnalyzedDocument {
-            source_id: source_id.clone(),
-            rel_path: file.rel_path.clone(),
-            content_hash: file.content_hash.clone(),
-            language: parsed_doc.language.clone(),
-            sections,
-        });
-    }
-    let analyzer = Arc::new(analyzer);
     let doc_concurrency = config.llm.max_concurrency.max(1) as usize;
     // ---- Document-parallel analysis (T1 finding #12) ----
     // Bounded document-parallel prefetch, dependency-free: slide a window of

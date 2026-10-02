@@ -168,8 +168,11 @@ impl WikiCompiler {
         // Page-parallel compilation (T1 perf): pages are independent; a
         // JoinSet window bounds in-flight LLM calls and results are collected
         // in plan order so the generation stays deterministic. `self` is
-        // cloned into each task (cheap: all fields Arc/Config).
-        let mut outcomes = Vec::new();
+        // cloned into each task (cheap: all fields Arc/Config). JoinSet
+        // yields COMPLETION order, so every task carries its plan index and
+        // the outcomes are sorted back into plan order before they leave
+        // this function.
+        let mut outcomes: Vec<(usize, WikiPageRecord, u32)> = Vec::new();
         let mut next = 0usize;
         let mut join_set = tokio::task::JoinSet::new();
         while next < plan.pages.len() || !join_set.is_empty() {
@@ -185,20 +188,24 @@ impl WikiCompiler {
                 let build_id = build_id.clone();
                 let this = CompileTask::from(self);
                 let page = page.clone();
+                let index = next;
                 join_set.spawn(async move {
-                    this.compile_page(&page, &plan, &base, &build_id, &title_to_id)
-                        .await
+                    let (record, requests) = this
+                        .compile_page(&page, &plan, &base, &build_id, &title_to_id)
+                        .await?;
+                    Ok::<_, WikiError>((index, record, requests))
                 });
                 next += 1;
             }
             if let Some(joined) = join_set.join_next().await {
-                outcomes.push(joined.map_err(|e| {
-                    WikiError::Compilation(format!("compile task panicked: {e}"))
-                })??);
+                let (index, record, requests) = joined
+                    .map_err(|e| WikiError::Compilation(format!("compile task panicked: {e}")))??;
+                outcomes.push((index, record, requests));
             }
         }
-        let llm_request_count: u32 = outcomes.iter().map(|(_, r)| *r).sum();
-        let pages = outcomes.into_iter().map(|(record, _)| record).collect();
+        outcomes.sort_by_key(|(index, _, _)| *index);
+        let llm_request_count: u32 = outcomes.iter().map(|(_, _, r)| *r).sum();
+        let pages = outcomes.into_iter().map(|(_, record, _)| record).collect();
         Ok(CompiledGeneration {
             pages,
             llm_request_count,

@@ -673,6 +673,123 @@ async fn planner_subdivides_clusters_over_node_budget() {
     assert_eq!(outcome.llm_request_count, 9);
 }
 
+/// T1 Run 13 regression (FIX-001): a reconcile payload that exceeds
+/// `max_plan_input_tokens` (~40K estimated tokens against the 32K budget
+/// here) must be BATCHED, never budget-checked as a whole — the old order
+/// validated the full payload first and failed the build before the batch
+/// path could run. The fake provider derives every response from the node
+/// ids present in the prompt, so cluster/batch composition (registry ULIDs)
+/// cannot break the script; it also records each reconcile prompt to prove
+/// the full payload is never estimated or sent.
+#[tokio::test]
+async fn oversized_reconcile_payload_batches_before_budget_validation() {
+    let mut conn = open_in_memory().unwrap();
+    let seeded = seed_knowledge(&mut conn);
+    let known = [
+        seeded.entity.clone(),
+        seeded.concept.clone(),
+        seeded.claim_a.clone(),
+        seeded.claim_b.clone(),
+    ];
+
+    // (prompt chars, huge-purpose markers present, node ids present)
+    let reconcile_prompts: Arc<Mutex<Vec<(usize, usize, usize)>>> = Arc::default();
+    let capture = reconcile_prompts.clone();
+    let ids_for_handler = known.clone();
+    let handler = Arc::new(move |request: &LlmRequest| {
+        let prompt = &request.prompt;
+        if prompt.contains(SUMMARY_MARK) {
+            return Ok(summary_response("s"));
+        }
+        if prompt.contains(LOCAL_MARK) {
+            // One singleton cluster per node: propose one page whose huge
+            // purpose (40K chars × 4 ≈ 160K chars ≈ 40K estimated tokens)
+            // pushes the combined reconcile payload far past the 32K budget
+            // and past the 96KB single-round byte ceiling.
+            let refs: Vec<String> = ids_for_handler
+                .iter()
+                .filter(|id| prompt.contains(id.as_str()))
+                .cloned()
+                .collect();
+            let node = refs[0].clone();
+            let purpose = format!("BIGPURPOSE-{node} {}", "p".repeat(40_000));
+            return Ok(plan_response(vec![serde_json::json!({
+                "title": format!("Page {node}"),
+                "category": "concepts",
+                "purpose": purpose,
+                "knowledge_refs": refs,
+            })]));
+        }
+        if prompt.contains(RECONCILE_MARK) {
+            let refs: Vec<String> = ids_for_handler
+                .iter()
+                .filter(|id| prompt.contains(id.as_str()))
+                .cloned()
+                .collect();
+            let markers = ids_for_handler
+                .iter()
+                .filter(|id| prompt.contains(&format!("BIGPURPOSE-{id}")))
+                .count();
+            capture
+                .lock()
+                .unwrap()
+                .push((prompt.chars().count(), markers, refs.len()));
+            // Merge whatever THIS request proposed into one page covering
+            // exactly those refs (echo ⇒ coverage holds per batch).
+            return Ok(plan_response(vec![serde_json::json!({
+                "title": "Merged",
+                "category": "concepts",
+                "purpose": "merged",
+                "knowledge_refs": refs,
+            })]));
+        }
+        Err(LlmError::Api {
+            code: 500,
+            message: "no stage matched".into(),
+        })
+    });
+    let provider = FakeLlmProvider::new("fake-batched", handler);
+
+    // max_cluster_nodes = 1 → four singleton clusters, mirroring
+    // planner_subdivides_clusters_over_node_budget.
+    let config = PlannerConfig {
+        max_cluster_nodes: 1,
+        ..PlannerConfig::default()
+    };
+    let prompt = load_prompt("wiki-planning", None).unwrap();
+    let wiki_planner = WikiPlanner::new(Arc::new(provider), prompt, config);
+    let outcome = wiki_planner.plan(&seeded.base, 4).await.unwrap();
+
+    // 4 summaries + 4 locals + 2 batches + 1 final single-round reconcile,
+    // no repairs anywhere.
+    assert_eq!(outcome.llm_request_count, 11);
+    assert_eq!(outcome.plan.pages.len(), 1);
+    assert_eq!(
+        outcome.plan.pages[0].knowledge_refs.len(),
+        4,
+        "full coverage survives batching"
+    );
+
+    let captured = reconcile_prompts.lock().unwrap().clone();
+    assert_eq!(captured.len(), 3, "two batches + one final round");
+    // The full 4-proposal payload (~160K chars) was never estimated or sent:
+    // every reconcile request carried at most one batch (2 proposals).
+    for (chars, markers, _) in &captured {
+        assert!(*markers <= 2, "a request carried {markers} proposals");
+        assert!(
+            *chars < 110_000,
+            "request of {chars} chars was not batch-sized"
+        );
+    }
+    // The two batch rounds partitioned the four singleton proposals 2 + 2.
+    assert_eq!(captured[0].1, 2);
+    assert_eq!(captured[1].1, 2);
+    assert_eq!(
+        captured[2].1, 0,
+        "final round sees the merged pages, not the huge purposes"
+    );
+}
+
 #[tokio::test]
 async fn flat_mode_fails_with_actionable_error_over_budget() {
     let mut conn = open_in_memory().unwrap();
@@ -916,6 +1033,71 @@ async fn compiler_ungrounded_body_triggers_single_repair() {
         .await
         .unwrap();
     assert_eq!(generation.llm_request_count, 3);
+}
+
+/// FIX-004 regression: JoinSet yields COMPLETION order, so a page whose LLM
+/// call is slow must not reorder the generation — pages come back in plan
+/// order regardless of when their tasks finish.
+struct DelayingLlm {
+    inner: FakeLlmProvider,
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for DelayingLlm {
+    fn model(&self) -> &str {
+        self.inner.model()
+    }
+
+    fn provider_name(&self) -> &str {
+        self.inner.provider_name()
+    }
+
+    async fn generate(&self, request: LlmRequest) -> Result<llm_wiki_llm::LlmResponse, LlmError> {
+        if request.prompt.contains("Slow Page") {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        self.inner.generate(request).await
+    }
+}
+
+#[tokio::test]
+async fn compiler_returns_pages_in_plan_order_despite_completion_order() {
+    use llm_wiki_core::ids::WikiPageId;
+    let mut conn = open_in_memory().unwrap();
+    let seeded = seed_knowledge(&mut conn);
+    let mk = |title: &str| WikiPagePlan {
+        id: WikiPageId::generate(),
+        slug: title.to_lowercase().replace(' ', "-"),
+        title: title.to_owned(),
+        category: "concepts".into(),
+        purpose: "overview".into(),
+        knowledge_refs: vec![KnowledgeNodeId::parse(seeded.entity.clone()).unwrap()],
+        source_refs: vec![],
+        related_pages: vec![],
+    };
+    let plan = llm_wiki_core::model::WikiPlan {
+        pages: vec![mk("Slow Page"), mk("Fast B"), mk("Fast C")],
+    };
+
+    let inner = FakeLlmProvider::fixed(
+        "fake-slow",
+        compile_response("## Overview\n\nGrounded overview text."),
+    );
+    let prompt = load_prompt("wiki-compilation", None).unwrap();
+    let compiler = WikiCompiler::new(
+        Arc::new(DelayingLlm { inner }),
+        prompt,
+        CompilerConfig::default(),
+        4,
+    );
+
+    let generation = compiler
+        .compile_plan(&plan, &seeded.base, &BuildId::generate())
+        .await
+        .unwrap();
+    assert_eq!(generation.llm_request_count, 3);
+    let titles: Vec<&str> = generation.pages.iter().map(|p| p.title.as_str()).collect();
+    assert_eq!(titles, vec!["Slow Page", "Fast B", "Fast C"]);
 }
 
 // ---------------------------------------------------------------------------
