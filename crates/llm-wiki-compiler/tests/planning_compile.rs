@@ -790,6 +790,197 @@ async fn oversized_reconcile_payload_batches_before_budget_validation() {
     );
 }
 
+/// #C02 regression: a degenerate reconcile that echoes one page per proposal
+/// (huge purposes keep every round over the single-round ceiling) must fail
+/// closed after MAX_RECONCILE_ROUNDS instead of looping forever.
+#[tokio::test]
+async fn non_converging_reconcile_fails_closed_after_the_round_cap() {
+    let mut conn = open_in_memory().unwrap();
+    let seeded = seed_knowledge(&mut conn);
+    let known = [
+        seeded.entity.clone(),
+        seeded.concept.clone(),
+        seeded.claim_a.clone(),
+        seeded.claim_b.clone(),
+    ];
+
+    let known_for_handler = known.clone();
+    let handler = Arc::new(move |request: &LlmRequest| {
+        let prompt = &request.prompt;
+        if prompt.contains(SUMMARY_MARK) {
+            return Ok(summary_response("s"));
+        }
+        if prompt.contains(LOCAL_MARK) {
+            let refs: Vec<String> = known_for_handler
+                .iter()
+                .filter(|id| prompt.contains(id.as_str()))
+                .cloned()
+                .collect();
+            let node = refs[0].clone();
+            return Ok(plan_response(vec![serde_json::json!({
+                "title": format!("Page {node}"),
+                "category": "concepts",
+                "purpose": format!("BIGPURPOSE-{node} {}", "p".repeat(40_000)),
+                "knowledge_refs": refs,
+            })]));
+        }
+        if prompt.contains(RECONCILE_MARK) {
+            // Degenerate echo: one page per BIGPURPOSE marker, purposes kept
+            // huge so every round stays over the single-round ceiling and the
+            // proposal count never shrinks.
+            let pages: Vec<serde_json::Value> = known_for_handler
+                .iter()
+                .filter(|id| prompt.contains(&format!("BIGPURPOSE-{id}")))
+                .map(|id| {
+                    serde_json::json!({
+                        "title": format!("Page {id}"),
+                        "category": "concepts",
+                        "purpose": format!("BIGPURPOSE-{id} {}", "p".repeat(40_000)),
+                        "knowledge_refs": [id.clone()],
+                    })
+                })
+                .collect();
+            return Ok(plan_response(pages));
+        }
+        Err(LlmError::Api {
+            code: 500,
+            message: "no stage matched".into(),
+        })
+    });
+    let provider = Arc::new(FakeLlmProvider::new("fake-echo", handler));
+
+    // max_cluster_nodes = 1 → four singleton clusters, each proposing one
+    // huge-purpose page.
+    let config = PlannerConfig {
+        max_cluster_nodes: 1,
+        ..PlannerConfig::default()
+    };
+    let prompt = load_prompt("wiki-planning", None).unwrap();
+    let planner = WikiPlanner::new(provider.clone(), prompt, config);
+    let error = planner.plan(&seeded.base, 4).await.unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("did not converge"),
+        "actionable: {message}"
+    );
+
+    // Bounded work: 4 summaries + 4 locals + at most MAX_RECONCILE_ROUNDS
+    // reconcile rounds of 2 batched requests — then it stops.
+    let requests = provider.request_count();
+    assert!(
+        requests <= 4 + 4 + 8 * 2,
+        "the reconcile loop ran away: {requests} requests"
+    );
+}
+
+/// FIX-007 regression: cluster staging must run CONCURRENTLY. Cluster-stage
+/// requests pair up on a tokio Barrier — a serial planner deadlocks the pair
+/// and plan() times out. The single reconcile request passes through
+/// unpaired.
+struct BarrierLlm {
+    barrier: Arc<tokio::sync::Barrier>,
+}
+
+/// Every `kn_…` id occurring in the prompt, first-occurrence order.
+fn kn_ids_in(prompt: &str) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    let mut rest = prompt;
+    while let Some(pos) = rest.find("kn_") {
+        let tail = &rest[pos..];
+        let end = tail
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(tail.len());
+        let id = tail[..end].to_owned();
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+        rest = &tail[end..];
+    }
+    ids
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for BarrierLlm {
+    fn model(&self) -> &str {
+        "fake-barrier"
+    }
+
+    fn provider_name(&self) -> &str {
+        "fake-barrier"
+    }
+
+    async fn generate(&self, request: LlmRequest) -> Result<llm_wiki_llm::LlmResponse, LlmError> {
+        let prompt = request.prompt;
+        let text = if prompt.contains(RECONCILE_MARK) {
+            plan_response(vec![proposal("Merged", "concepts", &kn_ids_in(&prompt))])
+        } else if prompt.contains(SUMMARY_MARK) {
+            self.barrier.wait().await;
+            summary_response("s")
+        } else if prompt.contains(LOCAL_MARK) {
+            self.barrier.wait().await;
+            plan_response(vec![proposal(
+                "Cluster Page",
+                "concepts",
+                &kn_ids_in(&prompt),
+            )])
+        } else {
+            return Err(LlmError::Api {
+                code: 500,
+                message: "no stage matched".into(),
+            });
+        };
+        Ok(llm_wiki_llm::LlmResponse {
+            text,
+            model: "fake-barrier".to_owned(),
+            input_tokens: 0,
+            output_tokens: 0,
+            finish_reason: Some("stop".to_owned()),
+        })
+    }
+}
+
+#[tokio::test]
+async fn planner_clusters_stage_concurrently() {
+    let mut conn = open_in_memory().unwrap();
+    let seeded = seed_knowledge(&mut conn);
+
+    // Two clusters (relation pair + claims pair): both summary→local chains
+    // must overlap. A serial planner deadlocks the barrier pair → timeout.
+    let config = PlannerConfig {
+        max_concurrency: 2,
+        ..PlannerConfig::default()
+    };
+    let planner = WikiPlanner::new(
+        Arc::new(BarrierLlm {
+            barrier: Arc::new(tokio::sync::Barrier::new(2)),
+        }),
+        load_prompt("wiki-planning", None).unwrap(),
+        config,
+    );
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        planner.plan(&seeded.base, 4),
+    )
+    .await
+    .expect("planner deadlocked: cluster staging did not run concurrently")
+    .unwrap();
+
+    assert_eq!(
+        outcome.llm_request_count, 5,
+        "2 summaries + 2 locals + 1 reconcile"
+    );
+    assert_eq!(
+        outcome.plan.pages.len(),
+        1,
+        "reconcile merged both proposals"
+    );
+    assert_eq!(
+        outcome.plan.pages[0].knowledge_refs.len(),
+        4,
+        "full node coverage survives the concurrent staging"
+    );
+}
+
 #[tokio::test]
 async fn flat_mode_fails_with_actionable_error_over_budget() {
     let mut conn = open_in_memory().unwrap();

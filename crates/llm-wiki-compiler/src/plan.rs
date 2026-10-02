@@ -40,6 +40,10 @@ pub struct PlannerConfig {
     /// Per-request output ceiling (config `[llm] max_output_tokens`): thinking
     /// models spend chain-of-thought from this same budget.
     pub max_output_tokens: u32,
+    /// In-flight LLM call cap for the cluster window (PRD §27
+    /// `llm.max_concurrency`): independent clusters run their summary→local
+    /// chains concurrently; cluster order is restored deterministically.
+    pub max_concurrency: usize,
 }
 
 impl Default for PlannerConfig {
@@ -50,6 +54,7 @@ impl Default for PlannerConfig {
             max_plan_input_tokens: 32_000,
             language: "the sources' language".to_owned(),
             max_output_tokens: 4096,
+            max_concurrency: 4,
         }
     }
 }
@@ -150,7 +155,11 @@ impl WikiPlanner {
         }
     }
 
-    /// Length note: ~94 lines — the three-layer stage scheduler (summary → local → reconcile), symmetric with plan_flat and driven by PlanCacheKeys.
+    /// Length note: ~185 lines — the three-layer stage scheduler (summary →
+    /// local → reconcile): cluster staging is delegated to
+    /// [`PlannerTask::run_cluster`], the reconcile loop to
+    /// [`Self::reconcile_rounds`]; what remains is orchestration, salvage
+    /// bookkeeping and the orphan sweep.
     async fn plan_hierarchical(
         &self,
         base: &KnowledgeBase,
@@ -192,76 +201,51 @@ impl WikiPlanner {
             });
         }
 
+        // Cluster-parallel staging (T1 perf / audit FIX-007): clusters are
+        // independent; each task runs its summary→local chain while a
+        // JoinSet window bounds in-flight LLM calls (`max_concurrency`,
+        // PRD §27). JoinSet yields COMPLETION order, so every task carries
+        // its cluster index and outcomes are sorted back into cluster
+        // order — proposals and salvaged refs stay deterministic.
+        let task = PlannerTask::from(self);
+        let base = Arc::new(base.clone());
+        let concurrency = self.config.max_concurrency.max(1);
+        let mut cluster_outcomes: Vec<(usize, Vec<RawPage>, Vec<String>, u32)> =
+            Vec::with_capacity(clusters.len());
+        let mut next = 0usize;
+        let mut join_set = tokio::task::JoinSet::new();
+        while next < clusters.len() || !join_set.is_empty() {
+            while next < clusters.len() && join_set.len() < concurrency {
+                let index = next;
+                let task = task.clone();
+                let base = Arc::clone(&base);
+                let nodes = clusters[next].nodes.clone();
+                let summary_stage = summary_stage.clone();
+                let local_stage = local_stage.clone();
+                join_set.spawn(async move {
+                    let (pages, orphans, requests) = task
+                        .run_cluster(&base, &nodes, &summary_stage, &local_stage)
+                        .await?;
+                    Ok::<_, WikiError>((index, pages, orphans, requests))
+                });
+                next += 1;
+            }
+            if let Some(joined) = join_set.join_next().await {
+                let (index, pages, orphans, requests) = joined.map_err(|e| {
+                    WikiError::Planning(format!("planner cluster task panicked: {e}"))
+                })??;
+                cluster_outcomes.push((index, pages, orphans, requests));
+            }
+        }
+        cluster_outcomes.sort_by_key(|(index, ..)| *index);
+
         let mut proposals: Vec<RawPage> = Vec::new();
         let mut llm_request_count = 0u32;
         let mut orphan_refs: Vec<String> = Vec::new();
-
-        for (cluster, _summary_key) in clusters.iter().zip(summary_keys.iter()) {
-            let payload = node_payload(base, &cluster.nodes);
-            self.ensure_stage_budget(&payload, "cluster summary")?;
-            let (raw_summary, requests) = self
-                .stage_round::<RawSummary>(&summary_stage, &payload)
-                .await?;
+        for (_, pages, orphans, requests) in cluster_outcomes {
             llm_request_count += requests;
-
-            let compact = compact_payload(base, &cluster.nodes, &raw_summary.summary);
-            self.ensure_stage_budget(&compact, "local plan")?;
-            let allowed: BTreeSet<String> = cluster
-                .nodes
-                .iter()
-                .map(|node_id| node_id.as_str().to_owned())
-                .collect();
-            // Cross-cluster salvage (T1 Run 8/11-12): models attribute
-            // nodes to a neighboring cluster's id space. The validator closure
-            // strips refs that are REAL library nodes from other clusters into
-            // the orphan pool (they re-enter as a dedicated page after
-            // reconciliation); refs that are not library nodes still count as
-            // UNKNOWN_NODE_REF and go through the normal repair path.
-            let orphans: Arc<std::sync::Mutex<Vec<String>>> =
-                Arc::new(std::sync::Mutex::new(Vec::new()));
-            let orphans_v = Arc::clone(&orphans);
-            let validate = |plan: &RawPlanResponse| -> Vec<String> {
-                let mut issues = Vec::new();
-                let mut salvaged: Vec<String> = Vec::new();
-                let mut seen: BTreeSet<&str> = BTreeSet::new();
-                if plan.pages.is_empty() {
-                    issues.push("EMPTY_PLAN: no pages proposed".to_owned());
-                }
-                for page in &plan.pages {
-                    if page.title.trim().is_empty() {
-                        issues.push("EMPTY_TITLE: page title is empty".to_owned());
-                    }
-                    if page.knowledge_refs.is_empty() {
-                        issues.push(format!(
-                            "EMPTY_REFS: page '{}' has no knowledge_refs",
-                            page.title
-                        ));
-                    }
-                    for ref_id in &page.knowledge_refs {
-                        if allowed.contains(ref_id) {
-                            if !seen.insert(ref_id.as_str()) {
-                                issues.push(format!(
-                                    "DUPLICATE_NODE_ASSIGNMENT: '{ref_id}' assigned to multiple pages"
-                                ));
-                            }
-                        } else if base.nodes.keys().any(|k| k.as_str() == ref_id.as_str()) {
-                            salvaged.push(ref_id.clone());
-                        } else {
-                            issues.push(format!(
-                                "UNKNOWN_NODE_REF: '{ref_id}' is not a node of this cluster"
-                            ));
-                        }
-                    }
-                }
-                orphans_v.lock().unwrap().extend(salvaged);
-                issues
-            };
-            let (raw_local, requests) = self
-                .stage_round_validated::<RawPlanResponse, _>(&local_stage, &compact, validate)
-                .await?;
-            llm_request_count += requests;
-            orphan_refs.extend(orphans.lock().unwrap().drain(..));
-            proposals.extend(raw_local.pages);
+            orphan_refs.extend(orphans);
+            proposals.extend(pages);
         }
 
         // Salvaged cross-cluster nodes BYPASS reconciliation: they form one
@@ -349,7 +333,7 @@ impl WikiPlanner {
             });
         }
 
-        let plan = self.finalize(merged, base)?;
+        let plan = self.finalize(merged, &base)?;
         self.store_plan(&reconcile_key, &plan);
         Ok(PlanOutcome {
             plan,
@@ -385,20 +369,30 @@ impl WikiPlanner {
         local_keys: &[String],
         proposed_union: &BTreeSet<String>,
     ) -> Result<(Vec<RawPage>, u32)> {
-        let reconcile_stage = self.prompt.stage_block("reconcile")?;
+        let task = PlannerTask::from(self);
         let mut round_proposals = proposals;
         let mut round_keys_summary: Vec<String> = summary_keys.to_vec();
         let mut round_keys_local: Vec<String> = local_keys.to_vec();
         let mut reconcile_requests = 0u32;
         let merged: Vec<RawPage>;
+        let mut rounds = 0usize;
         loop {
+            rounds += 1;
+            if rounds > MAX_RECONCILE_ROUNDS {
+                // #C02 fail-closed: convergence relies on every batched round
+                // merging its batches into fewer pages. A degenerate model
+                // that echoes one page per proposal would loop forever.
+                return Err(WikiError::Planning(format!(
+                    "reconciliation did not converge after {MAX_RECONCILE_ROUNDS} rounds; the model keeps returning one page per proposal — narrow the corpus or raise max_plan_input_tokens (PRD §14 forbids truncation)"
+                )));
+            }
             let reconcile_json =
                 reconcile_payload(&round_proposals, &round_keys_summary, &round_keys_local);
             let single_round = reconcile_json.len() <= MAX_RECONCILE_PAYLOAD_BYTES;
             if single_round {
-                self.ensure_stage_budget(&reconcile_json, "reconciliation")?;
-                let (round_merged, requests) = self
-                    .reconcile_stage(&reconcile_stage, &reconcile_json, proposed_union)
+                task.ensure_stage_budget(&reconcile_json, "reconciliation")?;
+                let (round_merged, requests) = task
+                    .reconcile_stage(&reconcile_json, proposed_union)
                     .await?;
                 reconcile_requests += requests;
                 merged = round_merged;
@@ -413,14 +407,13 @@ impl WikiPlanner {
             let mut next_round: Vec<RawPage> = Vec::new();
             for batch in round_proposals.chunks(per_batch) {
                 let batch_json = reconcile_payload(batch, &round_keys_summary, &round_keys_local);
-                self.ensure_stage_budget(&batch_json, "reconciliation batch")?;
+                task.ensure_stage_budget(&batch_json, "reconciliation batch")?;
                 let batch_union: BTreeSet<String> = batch
                     .iter()
                     .flat_map(|proposal| proposal.knowledge_refs.iter().cloned())
                     .collect();
-                let (batch_merged, requests) = self
-                    .reconcile_stage(&reconcile_stage, &batch_json, &batch_union)
-                    .await?;
+                let (batch_merged, requests) =
+                    task.reconcile_stage(&batch_json, &batch_union).await?;
                 reconcile_requests += requests;
                 next_round.extend(batch_merged);
             }
@@ -489,7 +482,8 @@ impl WikiPlanner {
             .iter()
             .map(|node_id| node_id.as_str().to_owned())
             .collect();
-        let (raw_local, requests) = self
+        let task = PlannerTask::from(self);
+        let (raw_local, requests) = task
             .stage_round_validated::<RawPlanResponse, _>(&local_stage, &payload, |plan| {
                 validate_proposals(&plan.pages, &allowed)
             })
@@ -556,36 +550,6 @@ impl WikiPlanner {
         }
     }
 
-    /// Global reconciliation consumes sorted summary/local-plan keys and node
-    /// id references only (PRD §14: never the claim corpus).
-    async fn reconcile_stage(
-        &self,
-        stage: &PromptDocument,
-        payload: &str,
-        proposed: &BTreeSet<String>,
-    ) -> Result<(Vec<RawPage>, u32)> {
-        self.stage_round_validated::<RawPlanResponse, _>(stage, payload, |plan| {
-            let issues = validate_merged(&plan.pages, proposed);
-            if !issues.is_empty() {
-                eprintln!("DEBUG reconcile issues: {issues:?}");
-            }
-            issues
-        })
-        .await
-        .map(|(response, count)| (response.pages, count))
-    }
-
-    fn ensure_stage_budget(&self, payload: &str, stage: &str) -> Result<()> {
-        let estimated = estimate_tokens(payload);
-        if estimated > self.config.max_plan_input_tokens {
-            return Err(WikiError::Planning(format!(
-                "{stage} payload is ~{estimated} tokens, above max_plan_input_tokens = {}; clusters must be subdivided further (PRD §14 forbids truncation)",
-                self.config.max_plan_input_tokens
-            )));
-        }
-        Ok(())
-    }
-
     /// Turns validated merged pages into `WikiPagePlan`s: app-assigned
     /// `WikiPageId`s, unique titles/slugs, source refs from claim anchors and
     /// overlap-based `related_pages`.
@@ -629,8 +593,139 @@ impl WikiPlanner {
         attach_related_pages(&mut pages);
         Ok(WikiPlan { pages })
     }
+}
 
-    // -- LLM plumbing -------------------------------------------------------
+/// Owned snapshot of the planner dependencies for one spawned cluster task
+/// (everything Arc or cheap clone; no SQLite touches). The request plumbing —
+/// budget gate, stage rounds, reconciliation — lives here so the serial paths
+/// (flat plan, reconcile rounds) and the spawned cluster tasks share one
+/// implementation.
+#[derive(Clone)]
+struct PlannerTask {
+    provider: Arc<dyn LlmProvider>,
+    prompt: PromptDocument,
+    config: PlannerConfig,
+    /// §28 request-level cache for summary/local/reconcile responses.
+    cache: Option<Arc<dyn StageCache>>,
+}
+
+impl From<&WikiPlanner> for PlannerTask {
+    fn from(planner: &WikiPlanner) -> Self {
+        Self {
+            provider: Arc::clone(&planner.provider),
+            prompt: planner.prompt.clone(),
+            config: planner.config.clone(),
+            cache: planner.cache.clone(),
+        }
+    }
+}
+
+impl PlannerTask {
+    fn ensure_stage_budget(&self, payload: &str, stage: &str) -> Result<()> {
+        let estimated = estimate_tokens(payload);
+        if estimated > self.config.max_plan_input_tokens {
+            return Err(WikiError::Planning(format!(
+                "{stage} payload is ~{estimated} tokens, above max_plan_input_tokens = {}; clusters must be subdivided further (PRD §14 forbids truncation)",
+                self.config.max_plan_input_tokens
+            )));
+        }
+        Ok(())
+    }
+
+    /// Global reconciliation consumes sorted summary/local-plan keys and node
+    /// id references only (PRD §14: never the claim corpus).
+    async fn reconcile_stage(
+        &self,
+        payload: &str,
+        proposed: &BTreeSet<String>,
+    ) -> Result<(Vec<RawPage>, u32)> {
+        let stage = self.prompt.stage_block("reconcile")?;
+        self.stage_round_validated::<RawPlanResponse, _>(&stage, payload, |plan| {
+            let issues = validate_merged(&plan.pages, proposed);
+            if !issues.is_empty() {
+                eprintln!("DEBUG reconcile issues: {issues:?}");
+            }
+            issues
+        })
+        .await
+        .map(|(response, count)| (response.pages, count))
+    }
+
+    /// One cluster of the hierarchical plan: summary → local plan (PRD §14).
+    /// Returns the cluster's page proposals, the salvaged cross-cluster node
+    /// refs and the LLM request count.
+    async fn run_cluster(
+        &self,
+        base: &KnowledgeBase,
+        nodes: &[KnowledgeNodeId],
+        summary_stage: &PromptDocument,
+        local_stage: &PromptDocument,
+    ) -> Result<(Vec<RawPage>, Vec<String>, u32)> {
+        let payload = node_payload(base, nodes);
+        self.ensure_stage_budget(&payload, "cluster summary")?;
+        let (raw_summary, requests) = self
+            .stage_round::<RawSummary>(summary_stage, &payload)
+            .await?;
+
+        let compact = compact_payload(base, nodes, &raw_summary.summary);
+        self.ensure_stage_budget(&compact, "local plan")?;
+        let allowed: BTreeSet<String> = nodes
+            .iter()
+            .map(|node_id| node_id.as_str().to_owned())
+            .collect();
+        // Cross-cluster salvage (T1 Run 8/11-12): models attribute
+        // nodes to a neighboring cluster's id space. The validator closure
+        // strips refs that are REAL library nodes from other clusters into
+        // the orphan pool (they re-enter as a dedicated page after
+        // reconciliation); refs that are not library nodes still count as
+        // UNKNOWN_NODE_REF and go through the normal repair path.
+        let orphans: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let orphans_v = Arc::clone(&orphans);
+        let validate = |plan: &RawPlanResponse| -> Vec<String> {
+            let mut issues = Vec::new();
+            let mut salvaged: Vec<String> = Vec::new();
+            let mut seen: BTreeSet<&str> = BTreeSet::new();
+            if plan.pages.is_empty() {
+                issues.push("EMPTY_PLAN: no pages proposed".to_owned());
+            }
+            for page in &plan.pages {
+                if page.title.trim().is_empty() {
+                    issues.push("EMPTY_TITLE: page title is empty".to_owned());
+                }
+                if page.knowledge_refs.is_empty() {
+                    issues.push(format!(
+                        "EMPTY_REFS: page '{}' has no knowledge_refs",
+                        page.title
+                    ));
+                }
+                for ref_id in &page.knowledge_refs {
+                    if allowed.contains(ref_id) {
+                        if !seen.insert(ref_id.as_str()) {
+                            issues.push(format!(
+                                "DUPLICATE_NODE_ASSIGNMENT: '{ref_id}' assigned to multiple pages"
+                            ));
+                        }
+                    } else if base.nodes.keys().any(|k| k.as_str() == ref_id.as_str()) {
+                        salvaged.push(ref_id.clone());
+                    } else {
+                        issues.push(format!(
+                            "UNKNOWN_NODE_REF: '{ref_id}' is not a node of this cluster"
+                        ));
+                    }
+                }
+            }
+            orphans_v.lock().unwrap().extend(salvaged);
+            issues
+        };
+        let (raw_local, repair_requests) = self
+            .stage_round_validated::<RawPlanResponse, _>(local_stage, &compact, validate)
+            .await?;
+        // Bind before the tail expression: a MutexGuard temporary in tail
+        // position would outlive `orphans` (E0597).
+        let salvaged: Vec<String> = orphans.lock().unwrap().drain(..).collect();
+        Ok((raw_local.pages, salvaged, requests + repair_requests))
+    }
 
     /// One shape-only round: request → parse; a shape failure repairs once.
     async fn stage_round<T>(&self, stage: &PromptDocument, payload: &str) -> Result<(T, u32)>
@@ -782,6 +877,12 @@ fn compact_payload(base: &KnowledgeBase, ids: &[KnowledgeNodeId], summary: &str)
 /// batched reconciliation (T1 Run 13: a 60-doc corpus produced ~506K chars —
 /// ~126K tokens — against a 32K-token budget).
 const MAX_RECONCILE_PAYLOAD_BYTES: usize = 96_000;
+
+/// Reconciliation must converge: every batched round merges its batches into
+/// strictly fewer pages (each batch yields fewer pages than it consumed
+/// proposals). PRD §14 fail-closed: a degenerate model that keeps echoing one
+/// page per proposal stops here instead of looping forever.
+const MAX_RECONCILE_ROUNDS: usize = 8;
 
 /// Deterministic synthetic key for a batch-round page: derived from the
 /// page's own content, so identical proposals produce the identical prompt —

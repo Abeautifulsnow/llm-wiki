@@ -14,8 +14,9 @@
 //! added+modified sources → deterministic mapping onto the CURRENT generation
 //! → partial compile + verbatim carry-over. Changes that cannot be localized
 //! deterministically stop at REPLAN_REQUIRED (trigger recorded in
-//! `plan_decisions`, migration 0006). With no changes, the existing cached
-//! full pipeline runs unchanged (§37.3 determinism, 0 new requests).
+//! `plan_decisions`, migration 0006). With no changes and an intact active
+//! generation, the build is a true no-op: the active generation is returned
+//! unchanged (no new generation, no index rebuild, 0 requests — §37.3).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -31,13 +32,13 @@ use llm_wiki_llm::LlmProvider;
 use llm_wiki_markdown::parse_document;
 use llm_wiki_source::{ScanDiagnostic, ScanOutput, Scanner, SourceManifest};
 use llm_wiki_storage::{
-    apply_section_matches, finish_build, get_active_build_id, insert_plan_decision,
-    latest_completed_build, list_source_active_node_sections, list_sources, load_active_sections,
-    load_generation_pages, load_generation_view, load_knowledge_base, load_plan_input,
-    mark_removed, mark_stale_builds_interrupted, open, persist_generation, retire_source_knowledge,
-    start_build, update_build_status, upsert_sources_batch, BuildDraft, GenerationPageView,
-    GenerationStats, PlanDecision, SourceRecord, SourceUpsert, WikiPageRecord, OUTCOME_FAST_PATH,
-    OUTCOME_LOCAL_UPDATE, OUTCOME_REPLAN_REQUIRED, TRIGGER_FINGERPRINT_CHANGED,
+    apply_section_matches, finish_build, generation_stats, get_active_build_id,
+    insert_plan_decision, latest_completed_build, list_source_active_node_sections, list_sources,
+    load_active_sections, load_generation_pages, load_generation_view, load_knowledge_base,
+    load_plan_input, mark_removed, mark_stale_builds_interrupted, open, persist_generation,
+    retire_source_knowledge, start_build, update_build_status, upsert_sources_batch, BuildDraft,
+    GenerationPageView, GenerationStats, PlanDecision, SourceRecord, SourceUpsert, WikiPageRecord,
+    OUTCOME_FAST_PATH, OUTCOME_LOCAL_UPDATE, OUTCOME_REPLAN_REQUIRED, TRIGGER_FINGERPRINT_CHANGED,
     TRIGGER_STRUCTURAL_CHANGE,
 };
 
@@ -257,8 +258,11 @@ pub async fn run_build(
     .await;
 
     match result {
-        Ok((stats, sources, llm_request_count, incremental)) => {
-            let published_path = PublishPaths::new(&wiki_dir).generation_dir(&build_id);
+        Ok((stats, sources, llm_request_count, incremental, fast_path)) => {
+            // The no-change fast path keeps the ACTIVE generation published:
+            // the report points at its directory, not the (empty) audit build.
+            let published_build = fast_path.as_ref().unwrap_or(&build_id);
+            let published_path = PublishPaths::new(&wiki_dir).generation_dir(published_build);
             Ok(BuildReport {
                 build_id,
                 sources,
@@ -626,7 +630,13 @@ async fn build_inner(
     compilation_prompt: &PromptDocument,
     analysis_prompt_version: &str,
     fingerprint_json: &str,
-) -> Result<(GenerationStats, usize, u32, Option<IncrementalSummary>)> {
+) -> Result<(
+    GenerationStats,
+    usize,
+    u32,
+    Option<IncrementalSummary>,
+    Option<BuildId>,
+)> {
     // ---- Scan (§8) + §19.1 ChangeSet (before the upsert overwrites hashes).
     let (output, file_outcomes, deleted_ids) =
         scan_and_diff(conn, root, wiki_dir, build_id, config, cache)?;
@@ -649,18 +659,45 @@ async fn build_inner(
         fingerprint_guard(conn, build_id, fingerprint_json)?;
     }
 
-    if incremental_enabled && active_build.is_some() && !scan_has_changes {
-        // §37.3 fast path: no source changes — the cached full pipeline runs
-        // and everything cache-hits (0 new LLM requests, identical manifest).
-        record_decision(
-            conn,
-            build_id,
-            None,
-            OUTCOME_FAST_PATH,
-            None,
-            0,
-            "no source changes since the last build; cached pipeline".to_owned(),
-        )?;
+    if incremental_enabled && !scan_has_changes {
+        if let Some(active) = active_build.as_ref() {
+            // §37.3 fast path (audit FIX-006): nothing changed and the active
+            // generation is intact on disk — return it unchanged instead of
+            // re-running the whole cached pipeline. The started build row
+            // stays a pure audit record (FAST_PATH decision, COMPLETED
+            // status); the pointer, generation files, FTS and graph are
+            // untouched. O(scan) + one stats query + one directory check.
+            let active_dir = PublishPaths::new(wiki_dir).generation_dir(active);
+            if active_dir.is_dir() {
+                record_decision(
+                    conn,
+                    build_id,
+                    None,
+                    OUTCOME_FAST_PATH,
+                    None,
+                    0,
+                    "no source changes since the last build; returning the active generation unchanged (no new generation, no index rebuild)".to_owned(),
+                )?;
+                let stats = generation_stats(conn, active)?;
+                // finish_build overwrites the fingerprint column, so the
+                // value recorded at start_build must be restated here.
+                finish_build(conn, build_id, "COMPLETED", Some(fingerprint_json), None)?;
+                tracing::info!(
+                    build = %build_id,
+                    active = %active,
+                    "fast path: no source changes; the active generation stays published"
+                );
+                return Ok((stats, output.files.len(), 0, None, Some(active.clone())));
+            }
+            // Unhealthy state: the pointer names a generation whose files are
+            // gone. Fall through to the full pipeline, which rebuilds and
+            // republishes from scratch (self-healing).
+            tracing::warn!(
+                build = %build_id,
+                active = %active,
+                "active generation directory is missing; running the full pipeline to republish"
+            );
+        }
     }
 
     // ---- §19 incremental pipeline when the workspace actually changed. ----
@@ -722,7 +759,7 @@ async fn build_inner(
         &output,
     )
     .await
-    .map(|(stats, sources, count)| (stats, sources, count, None))
+    .map(|(stats, sources, count)| (stats, sources, count, None, None))
 }
 
 /// The V0.1 full pipeline: upsert ALL sources, parse + analyze everything,
@@ -872,6 +909,7 @@ async fn build_full_pipeline(
         max_cluster_nodes: config.planning.max_cluster_nodes as usize,
         max_plan_input_tokens: config.analysis.max_plan_input_tokens as u64,
         max_output_tokens: config.llm.max_output_tokens,
+        max_concurrency: config.llm.max_concurrency.max(1) as usize,
         ..PlannerConfig::default()
     };
     let planner = WikiPlanner::new(provider.clone(), planning_prompt.clone(), planner_config)
@@ -942,7 +980,13 @@ async fn build_incremental(
     deleted_ids: Vec<SourceId>,
     prev_build_id: &BuildId,
     prev_pages: Vec<GenerationPageView>,
-) -> Result<(GenerationStats, usize, u32, Option<IncrementalSummary>)> {
+) -> Result<(
+    GenerationStats,
+    usize,
+    u32,
+    Option<IncrementalSummary>,
+    Option<BuildId>,
+)> {
     // Previous knowledge state BEFORE this build touches anything: the
     // mapping compares it against the post-build state (§19.2).
     let prev_kb = load_knowledge_base(conn)?;
@@ -1037,7 +1081,7 @@ async fn build_incremental(
         obsolete = summary.obsolete,
         "incremental build published"
     );
-    Ok((stats, sources, llm_request_count, Some(summary)))
+    Ok((stats, sources, llm_request_count, Some(summary), None))
 }
 
 /// §19.3 deleted sources: retire their knowledge and mark them removed in the

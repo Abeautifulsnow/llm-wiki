@@ -204,6 +204,23 @@ pub fn load_generation_pages(conn: &Connection, build_id: &BuildId) -> Result<Ve
     Ok(out)
 }
 
+/// Cheap counts of one persisted generation — the no-change fast path
+/// (§37.3) reports the ACTIVE generation without loading its content.
+pub fn generation_stats(conn: &Connection, build_id: &BuildId) -> Result<GenerationStats> {
+    let count = |sql: &str| -> Result<i64> {
+        conn.query_row(sql, params![build_id.as_str()], |r| r.get(0))
+            .map_err(|e| WikiError::Storage(format!("generation_stats: {e}")))
+    };
+    let pages = count("SELECT COUNT(*) FROM wiki_pages WHERE build_id = ?1")?;
+    let citations = count("SELECT COUNT(*) FROM page_citations WHERE build_id = ?1")?;
+    let links = count("SELECT COUNT(*) FROM page_links WHERE build_id = ?1")?;
+    Ok(GenerationStats {
+        pages: pages as usize,
+        citations: citations as usize,
+        links: links as usize,
+    })
+}
+
 /// Loads the full lint view of one generation: pages with citations, links
 /// (outbound and inbound) and persisted knowledge refs (PRD §36).
 pub fn load_generation_view(

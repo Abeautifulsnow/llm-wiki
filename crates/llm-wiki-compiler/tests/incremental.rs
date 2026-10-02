@@ -455,27 +455,85 @@ async fn modified_source_recompiles_only_its_page_and_carries_the_rest() {
 async fn unchanged_rebuild_takes_the_fast_path_and_records_it() {
     let workspace = fixture_workspace("fast-path");
     let config = llm_wiki_core::config::Config::load(&workspace).unwrap();
+    let wiki_dir = workspace.join("wiki");
     let provider = incremental_llm();
 
-    let _first = llm_wiki_compiler::run_build(&workspace, &config, provider.clone())
+    let first = llm_wiki_compiler::run_build(&workspace, &config, provider.clone())
         .await
         .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(5));
+    let fts_before: i64 = conn_of(&workspace)
+        .query_row("SELECT COUNT(*) FROM wiki_fts", [], |r| r.get(0))
+        .unwrap();
     let second = llm_wiki_compiler::run_build(&workspace, &config, provider)
         .await
         .unwrap();
 
     assert_eq!(
         second.llm_request_count, 0,
-        "every request must be answered from the §28 cache"
+        "the fast path issues no requests"
     );
+    // FIX-006: the pipeline never ran — not even §28 cache lookups.
+    assert_eq!(second.cache.hits, 0);
+    assert_eq!(second.cache.misses, 0);
     assert!(second.incremental.is_none(), "fast path is not incremental");
+    // The ACTIVE generation is returned: pointer unmoved, no new generation
+    // directory, and the report points at the still-published generation.
+    assert_eq!(
+        pointer_of(&wiki_dir).as_deref(),
+        Some(first.build_id.as_str())
+    );
+    assert_eq!(second.published_path, first.published_path);
+    assert!(
+        !PublishPaths::new(&wiki_dir)
+            .generation_dir(&second.build_id)
+            .exists(),
+        "the no-op build must not create a generation"
+    );
+    // FTS was not rebuilt.
+    let fts_after: i64 = conn_of(&workspace)
+        .query_row("SELECT COUNT(*) FROM wiki_fts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(fts_after, fts_before, "the index is untouched");
     let conn = conn_of(&workspace);
     let decisions = list_plan_decisions(&conn, &second.build_id).unwrap();
     assert_eq!(decisions.len(), 1);
     assert_eq!(decisions[0].outcome, OUTCOME_FAST_PATH);
     assert_eq!(decisions[0].trigger, None);
     assert_eq!(build_status(&conn, &second.build_id), "COMPLETED");
+}
+
+/// FIX-006 health condition: when the active generation's files are gone
+/// (pointer intact, directory deleted), the fast path must NOT return the
+/// missing generation — the full pipeline republishes from scratch.
+#[tokio::test]
+async fn missing_active_generation_directory_falls_back_to_the_full_pipeline() {
+    let workspace = fixture_workspace("fast-path-selfheal");
+    let config = llm_wiki_core::config::Config::load(&workspace).unwrap();
+    let wiki_dir = workspace.join("wiki");
+    let provider = incremental_llm();
+
+    let first = llm_wiki_compiler::run_build(&workspace, &config, provider.clone())
+        .await
+        .unwrap();
+    let paths = PublishPaths::new(&wiki_dir);
+    std::fs::remove_dir_all(paths.generation_dir(&first.build_id)).unwrap();
+
+    let second = llm_wiki_compiler::run_build(&workspace, &config, provider)
+        .await
+        .unwrap();
+    assert!(
+        paths.generation_dir(&second.build_id).is_dir(),
+        "the full pipeline republished the generation"
+    );
+    assert_eq!(
+        pointer_of(&wiki_dir).as_deref(),
+        Some(second.build_id.as_str())
+    );
+    assert_eq!(
+        build_status(&conn_of(&workspace), &second.build_id),
+        "COMPLETED"
+    );
 }
 
 // ---------------------------------------------------------------------------

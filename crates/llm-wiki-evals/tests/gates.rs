@@ -27,7 +27,12 @@ async fn v01_release_gates_pass_over_the_fixture_corpus() {
         load_fixtures(&evals).expect("eval fixtures load and meet §37.3 minimums");
 
     let workspace = eval_workspace("gates");
-    let config = Config::load(&workspace).unwrap();
+    let mut config = Config::load(&workspace).unwrap();
+    // FIX-006: an unchanged incremental rebuild is a true no-op returning the
+    // active generation — the §37.3 gates need TWO real generations to
+    // evaluate the rebuild-determinism gate, so both builds run the full
+    // (§28-cache-absorbed) pipeline.
+    config.build.incremental = false;
     let db_path = workspace.join(".llm-wiki").join("state.db");
 
     let provider = eval_llm(&dataset, &expected_pages);

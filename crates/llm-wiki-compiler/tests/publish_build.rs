@@ -617,6 +617,13 @@ async fn second_build_keeps_both_generations_and_advances_the_pointer() {
         .unwrap();
     // ULID ids order chronologically at millisecond resolution.
     std::thread::sleep(std::time::Duration::from_millis(5));
+    // FIX-006: an unchanged rebuild is a true no-op (the active generation
+    // stays published), so the pointer only advances via a real change.
+    std::fs::write(
+        workspace.join("docs").join("guide").join("runtime.md"),
+        "# Runtime\n\nThe scheduler retries failed tasks up to three times before giving up.\n\n## Delivery\n\nEvents are delivered exactly once in v2 and handlers must stay idempotent.\n",
+    )
+    .unwrap();
     let second = llm_wiki_compiler::run_build(&workspace, &config, pipeline_llm())
         .await
         .unwrap();
@@ -647,7 +654,14 @@ async fn llm_failure_marks_build_failed_and_keeps_previous_generation_visible() 
         .unwrap();
     let visible_before = read_visible_wiki(&wiki_dir);
 
-    // Second build: the provider explodes on the first analysis request.
+    // Second build over a REAL change (FIX-006: an unchanged rebuild is a
+    // no-op that never reaches the provider): the provider explodes on the
+    // first analysis request.
+    std::fs::write(
+        workspace.join("docs").join("guide").join("runtime.md"),
+        "# Runtime\n\nThe scheduler retries failed tasks up to three times before giving up.\n\n## Delivery\n\nEvents are delivered exactly once in v2 and handlers must stay idempotent.\n",
+    )
+    .unwrap();
     let failing: Arc<dyn LlmProvider> = Arc::new(FakeLlmProvider::new(
         "fake-failing",
         Arc::new(|_request: &LlmRequest| {
@@ -698,15 +712,16 @@ fn replan_required_maps_to_the_replan_terminal_status() {
     assert!(err.to_string().contains("replan --dry-run"));
 }
 
-/// §37.3 Rebuild Determinism (V0.1 DoD #16): a second build over completely
-/// unchanged sources issues ZERO new LLM requests (the §28 cache absorbs
-/// analysis, planning and compilation) and produces an identical structured
-/// manifest — page IDs, knowledge refs, citation mapping and links (§45: page
-/// identity is persisted by the planner's plan-identity cache).
+/// §37.3 Rebuild Determinism (V0.1 DoD #16) under the FIX-006 fast path: a
+/// second build over completely unchanged sources is a TRUE no-op — it
+/// returns the ACTIVE generation with zero new LLM requests, zero cache
+/// traffic (the pipeline never runs), no new generation and the pointer
+/// unmoved.
 #[tokio::test]
 async fn second_identical_build_consumes_zero_new_llm_requests_and_keeps_the_manifest() {
     let workspace = fixture_workspace("determinism");
     let config = llm_wiki_core::config::Config::load(&workspace).unwrap();
+    let wiki_dir = workspace.join("wiki");
     let db_path = workspace.join(".llm-wiki").join("state.db");
 
     let first = llm_wiki_compiler::run_build(&workspace, &config, pipeline_llm())
@@ -717,6 +732,80 @@ async fn second_identical_build_consumes_zero_new_llm_requests_and_keeps_the_man
         "first build really calls the model"
     );
     assert!(first.cache.misses > 0, "first build populates the cache");
+
+    let conn = conn_of(&db_path);
+    let manifest_of = |build: &BuildId| -> Vec<String> {
+        let mut view = load_generation_view(&conn, build).unwrap();
+        view.sort_by(|a, b| a.slug.cmp(&b.slug));
+        view.into_iter()
+            .map(|page| {
+                let citations: Vec<String> = page
+                    .citations
+                    .iter()
+                    .map(|c| {
+                        format!(
+                            "{}/{}/{}/{}/{}",
+                            c.claim_node_id,
+                            c.source_id,
+                            c.range.start,
+                            c.range.end,
+                            c.evidence_digest
+                        )
+                    })
+                    .collect();
+                let links: Vec<String> = page
+                    .links
+                    .iter()
+                    .map(|l| format!("{}/{}", l.to_page_id, l.target_title))
+                    .collect();
+                format!(
+                    "{}|{}|{}|{:?}|{:?}|{:?}",
+                    page.page_id, page.slug, page.title, page.knowledge_refs, citations, links
+                )
+            })
+            .collect()
+    };
+    let manifest_first = manifest_of(&first.build_id);
+
+    let second = llm_wiki_compiler::run_build(&workspace, &config, pipeline_llm())
+        .await
+        .unwrap();
+    assert_eq!(
+        second.llm_request_count, 0,
+        "the fast path issues no LLM requests"
+    );
+    // FIX-006: the pipeline never ran — not even §28 cache lookups.
+    assert_eq!(second.cache.hits, 0);
+    assert_eq!(second.cache.misses, 0);
+    // The ACTIVE generation is returned unchanged.
+    assert_eq!(second.published_path, first.published_path);
+    assert_eq!(
+        pointer_of(&wiki_dir).as_deref(),
+        Some(first.build_id.as_str())
+    );
+    assert_eq!(build_status(&conn, &second.build_id), "COMPLETED");
+    assert_eq!(
+        manifest_of(&first.build_id),
+        manifest_first,
+        "the published manifest is untouched"
+    );
+}
+
+/// §37.3 cache absorption on the FULL pipeline (`build.incremental = false`):
+/// an identical rebuild re-uses every §28 cached response — zero new LLM
+/// requests — and the plan-identity cache preserves page IDs, so the
+/// structured manifest is identical.
+#[tokio::test]
+async fn full_rebuild_absorbs_every_request_in_the_cache_and_keeps_the_manifest() {
+    let workspace = fixture_workspace("determinism-full");
+    let mut config = llm_wiki_core::config::Config::load(&workspace).unwrap();
+    config.build.incremental = false;
+    let db_path = workspace.join(".llm-wiki").join("state.db");
+
+    let first = llm_wiki_compiler::run_build(&workspace, &config, pipeline_llm())
+        .await
+        .unwrap();
+    assert!(first.llm_request_count > 0);
 
     let second = llm_wiki_compiler::run_build(&workspace, &config, pipeline_llm())
         .await
