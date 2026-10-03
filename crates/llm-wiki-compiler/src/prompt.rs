@@ -10,6 +10,7 @@ use llm_wiki_markdown::frontmatter::strip_and_parse;
 const EMBEDDED_DOCUMENT_ANALYSIS: &str = include_str!("../../../prompts/document-analysis.md");
 const EMBEDDED_WIKI_PLANNING: &str = include_str!("../../../prompts/wiki-planning.md");
 const EMBEDDED_WIKI_COMPILATION: &str = include_str!("../../../prompts/wiki-compilation.md");
+const EMBEDDED_WIKI_SEMANTIC_LINT: &str = include_str!("../../../prompts/wiki-semantic-lint.md");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptDocument {
@@ -72,6 +73,7 @@ impl PromptDocument {
                 "document-analysis" => Self::parse(EMBEDDED_DOCUMENT_ANALYSIS),
                 "wiki-planning" => Self::parse(EMBEDDED_WIKI_PLANNING),
                 "wiki-compilation" => Self::parse(EMBEDDED_WIKI_COMPILATION),
+                "wiki-semantic-lint" => Self::parse(EMBEDDED_WIKI_SEMANTIC_LINT),
                 other => Err(WikiError::Config(format!(
                     "unknown prompt '{other}' and no file override provided"
                 ))),

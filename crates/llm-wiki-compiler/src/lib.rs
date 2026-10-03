@@ -17,6 +17,7 @@ pub mod plan;
 pub mod prompt;
 pub mod publish;
 pub mod replan;
+pub mod semantic_lint;
 
 pub use analysis::{
     AnalysisOutcome, AnalysisSection, AnalyzedDocument, DocumentAnalyzer, VerifiedRelation,
@@ -40,3 +41,4 @@ pub use publish::{
     RecoveryReport, RENAME_ATTEMPTS, RENAME_RETRY_DELAY,
 };
 pub use replan::{plan_diff, replan, PlanDiff, ReplanReport};
+pub use semantic_lint::{run_semantic_lint, SemanticFinding, SemanticFindingKind, SemanticReport};

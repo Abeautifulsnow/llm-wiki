@@ -168,6 +168,12 @@ pub(crate) fn prepare_pipeline_env(
                     compilation_prompt.name.clone(),
                     compilation_prompt.fingerprint_tag(),
                 ),
+                // Semantic lint (§36 advisory): shares the §28 cache space;
+                // the extra entry never changes other task tags' keys.
+                (
+                    "wiki-semantic-lint".to_owned(),
+                    "wiki-semantic-lint@1".to_owned(),
+                ),
             ]),
             schema_version: SCHEMA_VERSION.to_owned(),
             parser_version: llm_wiki_markdown::PARSER_VERSION.to_owned(),

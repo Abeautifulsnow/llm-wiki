@@ -60,7 +60,14 @@ enum Command {
     Doctor,
     /// Lint the currently published generation (PRD §36): citation integrity,
     /// links, orphans, unsupported sections, duplicates, hand edits.
-    Lint,
+    Lint {
+        /// Also run the LLM-judged semantic review (audit FIX-019):
+        /// contradictions, superseded facts, weak synthesis and coverage
+        /// gaps. Advisory only — findings never change the exit code. Costs
+        /// model calls (§28-cached).
+        #[arg(long)]
+        semantic: bool,
+    },
 }
 
 fn main() {
@@ -93,7 +100,7 @@ fn run(command: Command) -> Result<(), WikiError> {
         Command::Status => status(&workspace),
         Command::Search { query } => search(&workspace, &query),
         Command::Doctor => doctor(&workspace),
-        Command::Lint => lint(&workspace),
+        Command::Lint { semantic } => lint(&workspace, semantic),
     }
 }
 
@@ -534,7 +541,7 @@ fn warn_diagnostic(diagnostic: &ScanDiagnostic) {
 /// deterministic order; any Error-severity finding exits with the dedicated
 /// lint code (11), warnings alone exit 0. A never-built workspace is not an
 /// error.
-fn lint(workspace: &Path) -> Result<(), WikiError> {
+fn lint(workspace: &Path, semantic: bool) -> Result<(), WikiError> {
     let config = load_config(workspace)?;
     let Some(report) = llm_wiki_compiler::run_lint(workspace, &config)? else {
         println!("nothing published — nothing to lint");
@@ -557,11 +564,51 @@ fn lint(workspace: &Path) -> Result<(), WikiError> {
 
     let (errors, warnings) = (report.errors(), report.warnings());
     println!("{errors} error(s), {warnings} warning(s)");
-    if errors > 0 {
+    let exit = if errors > 0 {
         Err(WikiError::Lint { errors, warnings })
     } else {
         Ok(())
+    };
+
+    // Semantic review (audit FIX-019): advisory, printed after the
+    // structural report, never affecting the exit code.
+    if semantic {
+        let provider = build_provider(&config.llm)?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| WikiError::Llm(format!("cannot start async runtime: {e}")))?;
+        let semantic_report = runtime.block_on(llm_wiki_compiler::run_semantic_lint(
+            workspace, &config, provider,
+        ))?;
+        if let Some(semantic_report) = semantic_report {
+            println!("semantic review (advisory):");
+            let mut current_kind: Option<llm_wiki_compiler::SemanticFindingKind> = None;
+            for finding in &semantic_report.findings {
+                if current_kind != Some(finding.kind) {
+                    println!("  {}:", finding.kind.label());
+                    current_kind = Some(finding.kind);
+                }
+                let claims = if finding.claim_ids.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", finding.claim_ids.join(", "))
+                };
+                println!("    {}{claims}: {}", finding.page_slug, finding.message);
+            }
+            println!(
+                "  {} page(s) reviewed, {} finding(s), skipped: {}",
+                semantic_report.pages_reviewed,
+                semantic_report.findings.len(),
+                if semantic_report.skipped_pages.is_empty() {
+                    "none".to_owned()
+                } else {
+                    semantic_report.skipped_pages.join(", ")
+                }
+            );
+        }
     }
+    exit
 }
 
 fn status(workspace: &Path) -> Result<(), WikiError> {
