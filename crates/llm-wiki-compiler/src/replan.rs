@@ -36,7 +36,7 @@ use llm_wiki_storage::{
     MAP_KIND_SPLIT, OUTCOME_REPLAN_DRY_RUN, OUTCOME_REPLAN_EXECUTED, OUTCOME_REPLAN_REQUIRED,
 };
 
-use crate::analysis::{AnalyzedDocument, DocumentAnalyzer};
+use crate::analysis::{AnalysisOutcome, AnalyzedDocument, DocumentAnalyzer};
 use crate::build::{
     normalized_rel_of, prepare_pipeline_env, record_decision, register_sections,
     terminal_status_for, warn_diagnostic, PipelineEnv,
@@ -1357,24 +1357,57 @@ async fn replan_analyze_pending(
         )
         .with_cache(stage_cache),
     );
+    // Document-parallel analysis, same contract as build_full_pipeline
+    // (audit Phase 2: replan's changed-source analysis must match the build
+    // pipeline's concurrency — it previously ran the documents serially).
+    // SQLite work stays on this task; only the LLM calls run inside the
+    // bounded JoinSet window, and outcomes persist in document order so the
+    // knowledge state stays deterministic.
     let mut llm_request_count = 0u32;
+    let mut doc_inputs = Vec::with_capacity(parsed.len());
     for (file, source_id, parsed_doc) in &parsed {
         let sections = register_sections(conn, source_id, &parsed_doc.sections, build_id)?;
-        let doc = AnalyzedDocument {
+        doc_inputs.push(AnalyzedDocument {
             source_id: source_id.clone(),
             rel_path: file.rel_path.clone(),
             content_hash: file.content_hash.clone(),
             language: parsed_doc.language.clone(),
             sections,
-        };
-        let outcome = Arc::clone(&analyzer)
-            .analyze_document(&doc, build_id)
-            .await?;
+        });
+    }
+    let doc_concurrency = config.llm.max_concurrency.max(1) as usize;
+    let mut outcomes: Vec<(usize, AnalysisOutcome)> = Vec::with_capacity(doc_inputs.len());
+    let mut next_to_spawn = 0usize;
+    let mut join_set = tokio::task::JoinSet::new();
+    while next_to_spawn < doc_inputs.len() || !join_set.is_empty() {
+        while next_to_spawn < doc_inputs.len() && join_set.len() < doc_concurrency {
+            let doc = doc_inputs[next_to_spawn].clone();
+            let build_id_owned = build_id.cloned();
+            let index = next_to_spawn;
+            let doc_analyzer = Arc::clone(&analyzer);
+            join_set.spawn(async move {
+                let outcome = doc_analyzer
+                    .clone()
+                    .analyze_document(&doc, build_id_owned.as_ref())
+                    .await?;
+                Ok::<_, WikiError>((index, outcome))
+            });
+            next_to_spawn += 1;
+        }
+        if let Some(joined) = join_set.join_next().await {
+            let (index, outcome) =
+                joined.map_err(|e| WikiError::Llm(format!("analysis task panicked: {e}")))??;
+            outcomes.push((index, outcome));
+        }
+    }
+    outcomes.sort_by_key(|(index, _)| *index);
+    for ((index, outcome), doc) in outcomes.iter().zip(doc_inputs.iter()) {
+        debug_assert_eq!(doc_inputs[*index].rel_path, doc.rel_path);
         llm_request_count += outcome.llm_request_count;
         crate::persist::persist_outcome(
             conn,
-            &doc,
-            &outcome,
+            doc,
+            outcome,
             &crate::persist::PersistOptions {
                 build_id: build_id.cloned(),
                 model: Some(provider.model().to_owned()),

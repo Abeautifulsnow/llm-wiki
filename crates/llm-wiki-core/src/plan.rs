@@ -124,9 +124,42 @@ impl KnowledgeBase {
     }
 }
 
-/// Token estimate shared with the markdown crate's segmentation (chars/4+1).
+/// Script-aware text→token estimate, shared with the markdown crate's
+/// segmentation (audit FIX-017: chars/4 systematically undercounts CJK —
+/// Chinese runs cost roughly 1 token per 1.5 characters even on modern
+/// tokenizers, against chars/4's one-per-four). CJK-wide characters weigh a
+/// rounded-up 2/3 token each; every other character keeps the chars/4 Latin
+/// rule. Both terms round UP: overestimating a payload fails closed early,
+/// underestimating it fails at the provider mid-build.
 pub fn estimate_tokens(text: &str) -> u64 {
-    text.chars().count() as u64 / 4 + 1
+    let mut wide = 0u64;
+    let mut narrow = 0u64;
+    for c in text.chars() {
+        if is_cjk_wide(c) {
+            wide += 1;
+        } else {
+            narrow += 1;
+        }
+    }
+    (wide * 2).div_ceil(3) + narrow.div_ceil(4) + u64::from(text.is_empty())
+}
+
+/// CJK-wide scripts that tokenizers charge about one token per character or
+/// worse: Han (incl. extensions and compatibility forms), kana, hangul, CJK
+/// punctuation and fullwidth forms.
+fn is_cjk_wide(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x1100..=0x11FF // Hangul Jamo
+            | 0x3000..=0x303F // CJK symbols and punctuation
+            | 0x3040..=0x30FF // Hiragana + Katakana
+            | 0x3130..=0x318F // Hangul Compatibility Jamo
+            | 0x3400..=0x4DBF // CJK Extension A
+            | 0x4E00..=0x9FFF // CJK Unified Ideographs
+            | 0xAC00..=0xD7AF // Hangul Syllables
+            | 0xF900..=0xFAFF // CJK Compatibility Ideographs
+            | 0xFF00..=0xFFEF // Fullwidth and halfwidth forms
+    )
 }
 
 /// A cluster of knowledge nodes handed to one summary/local-plan request.
@@ -138,8 +171,9 @@ pub struct Cluster {
 
 /// Deterministic clustering (PRD §14): union-find over active relations,
 /// claims grouped by top-level source directory of their anchors. Clusters
-/// exceeding `max_cluster_nodes` or the token budget are split at the sorted
-/// midpoint — subdivision, never truncation.
+/// exceeding `max_cluster_nodes` or the token budget are subdivided —
+/// preferring source-directory locality, falling back to the sorted midpoint
+/// — never truncated.
 pub fn cluster_knowledge(
     base: &KnowledgeBase,
     max_cluster_nodes: usize,
@@ -236,7 +270,12 @@ pub fn cluster_knowledge(
 }
 
 /// Splits `members` (sorted) until every cluster fits the node-count and
-/// token budgets. Midpoint splits keep the result deterministic.
+/// token budgets. Splitting prefers semantic locality (audit FIX-016
+/// Level 1): members are first grouped by the top-level source directory of
+/// their anchors, so a source-directory community is never cut just because
+/// it straddles the ID midpoint. A group that still exceeds the budgets (or
+/// an anchor-less / single-directory member set where grouping makes no
+/// progress) falls back to the deterministic sorted-midpoint split.
 fn subdivide(
     members: Vec<KnowledgeNodeId>,
     base: &KnowledgeBase,
@@ -251,6 +290,39 @@ fn subdivide(
         // A single oversized node cannot be subdivided further; it is handed
         // to the stage alone (the stage fails if it exceeds its own budget).
         return vec![Cluster { nodes: members }];
+    }
+    // Semantic grouping first. Nodes anchored in several directories keep
+    // their joined key (they stay with their own multi-directory group
+    // instead of being torn apart); anchor-less nodes form their own group.
+    let mut by_dir: BTreeMap<String, Vec<KnowledgeNodeId>> = BTreeMap::new();
+    for id in &members {
+        let mut dirs: Vec<String> = base.nodes[id]
+            .anchors
+            .iter()
+            .map(|anchor| top_level_dir(&anchor.rel_path))
+            .collect();
+        dirs.sort();
+        dirs.dedup();
+        let key = if dirs.is_empty() {
+            String::new()
+        } else {
+            dirs.join("\u{1f}")
+        };
+        by_dir.entry(key).or_default().push(id.clone());
+    }
+    if by_dir.len() >= 2 {
+        // Groups are built in member order (sorted) per directory key, so
+        // each group's internal order stays sorted and deterministic.
+        let mut out = Vec::new();
+        for (_, group) in by_dir {
+            out.extend(subdivide(
+                group,
+                base,
+                max_cluster_nodes,
+                max_payload_tokens,
+            ));
+        }
+        return out;
     }
     let mid = members.len().div_ceil(2);
     let mut out = subdivide(
@@ -371,6 +443,25 @@ mod tests {
     const A: &str = "kn_01ARZ3NDEKTSV4RRFFQ69G5FAV";
     const B: &str = "kn_01BX5ZZKBKACTAV9WEVGEMMVRZ";
     const C: &str = "kn_01CZZZZZZZZZZZZZZZZZZZZZZZ";
+    const D: &str = "kn_01DZZZZZZZZZZZZZZZZZZZZZZZ";
+
+    #[test]
+    fn token_estimate_is_script_aware() {
+        // 100 Han chars: ~67 tokens (was 25 under chars/4) — audit FIX-017.
+        assert_eq!(estimate_tokens(&"检".repeat(100)), 67);
+        // Latin rule unchanged: 400 chars → 100 tokens.
+        assert_eq!(estimate_tokens(&"a".repeat(400)), 100);
+        // Mixed scripts: both ceiling terms add up (2 + 2).
+        assert_eq!(
+            estimate_tokens(&format!("{}{}", "检".repeat(3), "a".repeat(8))),
+            4
+        );
+        // Empty text still estimates 1 (rounding floor).
+        assert_eq!(estimate_tokens(""), 1);
+        // Fullwidth forms and CJK punctuation count as wide: 5 wide chars
+        // → ceil(10/3) = 4 tokens.
+        assert_eq!(estimate_tokens("ＳＳＯ，。"), 4);
+    }
 
     #[test]
     fn relations_join_nodes_into_one_cluster() {
@@ -426,6 +517,54 @@ mod tests {
         let total: usize = clusters.iter().map(|c| c.nodes.len()).sum();
         assert_eq!(total, 3, "subdivision keeps every node");
         assert!(clusters.iter().all(|c| c.nodes.len() <= 2));
+    }
+
+    #[test]
+    fn oversized_clusters_split_by_source_directory_first() {
+        // Audit FIX-016 Level 1: an oversized cluster whose members span two
+        // top-level source directories splits along directory lines, never
+        // across them — even when the ID-sorted midpoint would.
+        let anchor_at = |path: &str| PlanAnchor {
+            source_id: SourceId::generate(),
+            rel_path: path.to_owned(),
+            section_id: None,
+            heading_path: Vec::new(),
+            range: SourceRange { start: 0, end: 10 },
+            evidence_digest: "d".into(),
+            source_hash: "h".into(),
+        };
+        // Node ids INTERLEAVE the two directories (A=plugin, B=guides,
+        // C=plugin, D=guides), so the ID-sorted midpoint split would cut
+        // across both directory communities — the semantic grouping must
+        // not.
+        let mut a = node(A, "claim", "a");
+        a.anchors = vec![anchor_at("plugin/arch.md")];
+        let mut b = node(B, "claim", "b");
+        b.anchors = vec![anchor_at("guides/intro.md")];
+        let mut c = node(C, "claim", "c");
+        c.anchors = vec![anchor_at("plugin/security.md")];
+        let mut d = node(D, "claim", "d");
+        d.anchors = vec![anchor_at("guides/advanced.md")];
+        let base = base_with(vec![a, b, c, d], vec![]);
+
+        // max_cluster_nodes = 2: the four-node cluster is over budget and
+        // must first split along plugin/ vs guides/, then stay intact.
+        let clusters = cluster_knowledge(&base, 2, 1_000_000);
+        assert_eq!(clusters.len(), 2, "{clusters:?}");
+        for cluster in &clusters {
+            let dirs: Vec<&str> = cluster
+                .nodes
+                .iter()
+                .map(|node| match node.as_str() {
+                    A | C => "plugin",
+                    _ => "guides",
+                })
+                .collect();
+            assert!(
+                dirs.windows(2).all(|window| window[0] == window[1]),
+                "a split crossed a directory boundary: {clusters:?}"
+            );
+        }
     }
 
     #[test]

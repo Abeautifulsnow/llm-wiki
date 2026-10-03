@@ -10,10 +10,10 @@ use llm_wiki_core::model::SourceRange;
 use crate::parser::SectionOutput;
 
 /// Rough text→token estimate used for packing decisions only (never for
-/// citation semantics): ~4 characters per token.
-pub fn estimate_tokens(text: &str) -> u64 {
-    (text.chars().count() as u64) / 4 + 1
-}
+/// citation semantics). Single implementation lives in the core crate so the
+/// segmentation and the planning budgets can never drift apart (audit
+/// FIX-017): script-aware, CJK charged ~1 token per 1.5 chars.
+pub use llm_wiki_core::plan::estimate_tokens;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SectionSegment {
