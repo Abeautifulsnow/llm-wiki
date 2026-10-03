@@ -1018,8 +1018,14 @@ Events for {name} are delivered at least once and handlers stay idempotent.
             peak_h.fetch_max(now, Ordering::SeqCst);
             // Simulate network latency WITHOUT blocking the tokio worker
             // thread (a sync sleep would serialize the join window and hide
-            // any concurrency): spin-yield until a sibling is also in
-            // flight, bounded so a serial implementation still terminates.
+            // any concurrency): spin until a sibling is also in flight,
+            // bounded so a serial implementation still terminates (its peak
+            // stays 1 and the overlap assertion below fails — the red test).
+            let mut spins = 0u32;
+            while inflight_h.load(Ordering::SeqCst) < 2 && spins < 2_000_000 {
+                std::hint::spin_loop();
+                spins += 1;
+            }
 
             // Extract a verbatim line from the PROMPT itself (the prompt
             // embeds the section content), so the evidence quote can never

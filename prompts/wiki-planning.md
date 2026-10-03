@@ -43,7 +43,9 @@ Return JSON:
 <!-- stage: reconcile -->
 
 Below are local page proposals from all clusters (with their local plan
-hashes), sorted deterministically. Merge them into the final global wiki plan:
+hashes), sorted deterministically. Each proposal carries its originating
+cluster's summary (`cluster_summary`) when available — use it as global
+context for the merge. Merge them into the final global wiki plan:
 - Merge proposals that describe the same topic (union their knowledge_refs).
 - Keep distinct topics distinct; do not force everything into one page.
 - Do not drop knowledge: every node id proposed somewhere must appear in

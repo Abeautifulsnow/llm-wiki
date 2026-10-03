@@ -12,12 +12,17 @@
 //! `entity:kn_…`) so the three id spaces cannot collide inside the single
 //! TEXT primary key the PRD specifies.
 //!
-//! Edges: `links_to` from the ACTIVE build's `page_links`, plus every ACTIVE
-//! analysis `relations.relation_type` carried through VERBATIM between
-//! graph-present endpoints. Endpoints outside the §17 vocabulary (claims,
-//! topics) are COUNTED as skipped in [`GraphStats`] — filtered, never
-//! silently mixed in. `defined_in` has no analysis-side producer yet and is
-//! deliberately absent rather than fabricated.
+//! Edges: `links_to` from the ACTIVE build's `page_links`, `contains` from
+//! each ACTIVE page to the entity/concept nodes in its persisted
+//! `knowledge_refs` (the page ↔ semantic bridge, audit FIX-009 — this is
+//! what lets a page search hit expand into the semantic component), plus
+//! every ACTIVE analysis `relations.relation_type` carried through VERBATIM
+//! between graph-present endpoints. Endpoints outside the §17 vocabulary
+//! (claims, topics) are COUNTED as skipped in [`GraphStats`] for relations —
+//! filtered, never silently mixed in; `contains` skips claim/topic refs
+//! silently because pages citing claims are the NORM, not a filter event.
+//! `defined_in` has no analysis-side producer yet and is deliberately absent
+//! rather than fabricated.
 //!
 //! The rebuild is NOT config-gated: `config.search.graph` gates the
 //! query-side consumption only (`llm-wiki-search::SqliteGraphExploration` →
@@ -31,6 +36,8 @@ use rusqlite::{params, Connection, Transaction};
 use llm_wiki_core::error::{Result, WikiError};
 use llm_wiki_core::ids::{BuildId, WikiPageId};
 
+use crate::wiki::parse_knowledge_refs;
+
 fn db(e: rusqlite::Error) -> WikiError {
     WikiError::Storage(e.to_string())
 }
@@ -39,6 +46,8 @@ pub const NODE_TYPE_PAGE: &str = "wiki_page";
 pub const NODE_TYPE_ENTITY: &str = "entity";
 pub const NODE_TYPE_CONCEPT: &str = "concept";
 pub const RELATION_LINKS_TO: &str = "links_to";
+/// The page ↔ semantic bridge edge (audit FIX-009): page → entity/concept.
+pub const RELATION_CONTAINS: &str = "contains";
 
 /// §22 graph-expansion defaults: hybrid retrieval expands at most one hop
 /// and at most ten nodes ("防止上下文爆炸"). The query-side expansion uses
@@ -96,6 +105,7 @@ pub fn rebuild_graph(tx: &Transaction, build_id: &BuildId) -> Result<GraphStats>
     let registry_nodes = insert_registry_nodes(tx)?;
     nodes += registry_nodes.len();
     edges += insert_links_to_edges(tx, build_id)?;
+    edges += insert_contains_edges(tx, build_id, &registry_nodes)?;
     let skipped_edges = insert_relation_edges(tx, &registry_nodes, &mut edges)?;
 
     Ok(GraphStats {
@@ -213,6 +223,59 @@ fn insert_links_to_edges(tx: &Transaction, build_id: &BuildId) -> Result<usize> 
             ])
             .map_err(db)?;
         inserted += 1;
+    }
+    Ok(inserted)
+}
+
+/// Phase 3.5: the page ↔ semantic bridge (audit FIX-009) — one `contains`
+/// edge from each ACTIVE page to every entity/concept in its persisted
+/// `knowledge_refs`. Claim/topic refs are the NORM on pages (every citation
+/// is a claim), so out-of-vocabulary refs are skipped SILENTLY here — they
+/// are §17 filtering by design, not relation-skip events worth counting.
+/// Returns the edges inserted.
+fn insert_contains_edges(
+    tx: &Transaction,
+    build_id: &BuildId,
+    registry_nodes: &BTreeMap<String, String>,
+) -> Result<usize> {
+    let mut stmt = tx
+        .prepare(
+            "SELECT page_id, knowledge_refs_json FROM wiki_pages
+             WHERE build_id = ?1 ORDER BY page_id",
+        )
+        .map_err(|e| WikiError::Storage(format!("prepare graph page refs: {e}")))?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map(params![build_id.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| WikiError::Storage(format!("graph page refs: {e}")))?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(db)?;
+    drop(stmt);
+    let mut insert_edge = tx
+        .prepare(
+            "INSERT INTO graph_edges (id, source_id, relation_type, target_id)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .map_err(|e| WikiError::Storage(format!("prepare graph contains insert: {e}")))?;
+    let mut inserted = 0usize;
+    for (page_id, refs_json) in rows {
+        for node_id in parse_knowledge_refs(&refs_json)? {
+            // Only §17-vocabulary endpoints bridge; the page id namespace
+            // keeps edge ids unique per (page, node) pair.
+            let Some(target) = registry_nodes.get(node_id.as_str()) else {
+                continue;
+            };
+            insert_edge
+                .execute(params![
+                    format!("contains:{page_id}:{node_id}"),
+                    format!("page:{page_id}"),
+                    RELATION_CONTAINS,
+                    target,
+                ])
+                .map_err(db)?;
+            inserted += 1;
+        }
     }
     Ok(inserted)
 }
@@ -644,6 +707,58 @@ mod tests {
         let capped = graph_expand_from_page(&conn, &overview, 1).unwrap();
         assert_eq!(capped.len(), 1);
         assert_eq!(capped[0].label, "Identity & Access");
+    }
+
+    #[test]
+    fn pages_bridge_into_the_semantic_component_via_contains() {
+        let (conn, overview, _, ids) = published_conn();
+        // Give the overview page a knowledge ref on the entity (and one on
+        // the claim, which must stay OUT of the §17 graph). The fixture
+        // pages carry no refs, so the rebuild adds exactly one bridge edge.
+        let refs_json = format!("[\"{}\", \"{}\"]", ids[0], ids[2]);
+        conn.execute(
+            "UPDATE wiki_pages SET knowledge_refs_json = ?1 WHERE slug = 'overview'",
+            params![refs_json],
+        )
+        .unwrap();
+        let build = get_active_build_id(&conn).unwrap().unwrap();
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            rebuild_graph(&tx, &build).unwrap();
+            tx.commit().unwrap();
+        }
+
+        // A page search hit now expands across the bridge (audit FIX-009):
+        // the two links_to neighbors + the contained entity.
+        let out = graph_expand_from_page(&conn, &overview, EXPAND_MAX_NODES).unwrap();
+        assert_eq!(out.len(), 3, "links_to + one contains edge: {out:?}");
+        let contains: Vec<_> = out
+            .iter()
+            .filter(|n| n.relation == RELATION_CONTAINS)
+            .collect();
+        assert_eq!(contains.len(), 1);
+        assert_eq!(contains[0].node_id, format!("entity:{}", ids[0]));
+        assert_eq!(contains[0].node_type, NODE_TYPE_ENTITY);
+        assert_eq!(contains[0].direction, NeighborDirection::Outgoing);
+
+        // The bridge is traversable from the semantic side too: the entity
+        // reaches the page as an incoming `contains` edge (plus its concept
+        // relation).
+        let entity_node = format!("entity:{}", ids[0]);
+        let semantic = graph_expand(&conn, &entity_node, EXPAND_MAX_NODES).unwrap();
+        assert!(semantic
+            .iter()
+            .any(|n| n.node_type == NODE_TYPE_PAGE && n.relation == RELATION_CONTAINS));
+
+        // The claim ref produced NO edge: claims never enter the §17 graph.
+        let edges: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM graph_edges WHERE relation_type = 'contains'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(edges, 1);
     }
 
     #[test]

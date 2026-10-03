@@ -234,6 +234,19 @@ fn match_pass(
     }
 }
 
+/// Identity continues only when the continuation covers BOTH sides: at least
+/// half the old page's nodes survive into the new page AND at least half the
+/// new page's nodes come from that old page (audit FIX-014: a 1-node overlap
+/// must never carry a 100-node page's `WikiPageId`). Inclusive halves, integer
+/// math; the overlap itself must be non-empty.
+fn continuation_covers(
+    old_set: &BTreeSet<KnowledgeNodeId>,
+    new_set: &BTreeSet<KnowledgeNodeId>,
+) -> bool {
+    let intersection = new_set.intersection(old_set).count();
+    intersection > 0 && 2 * intersection >= old_set.len() && 2 * intersection >= new_set.len()
+}
+
 /// Classifies one new plan page (§19.2 fixed order): split successors are
 /// handled by the caller; the remaining classes are merge (≥2 flowing old
 /// pages, dominant first), unchanged/modified (mutual best match), created.
@@ -263,7 +276,8 @@ fn classify_new_page(
             .cmp(&overlap_a)
             .then_with(|| old_pages[a].slug.cmp(&old_pages[b].slug))
     });
-    if predecessors.len() >= 2 {
+    if predecessors.len() >= 2 && continuation_covers(&old_refs[predecessors[0]], &new_refs[index])
+    {
         let dominant = predecessors[0];
         diff.merged.push(MergeOutcome {
             continued: ContinuedPage {
@@ -280,9 +294,13 @@ fn classify_new_page(
         });
         return;
     }
-    // Mutual best match with the primary: the identity continues.
+    // Mutual best match with the primary, and the continuation covers both
+    // sides: the identity continues. A weak-overlap match (the audit's
+    // degenerate case) falls through to a fresh id instead.
     if let Some(primary) = pass.best_old[index] {
-        if pass.flows_to[primary] == Some(index) {
+        if pass.flows_to[primary] == Some(index)
+            && continuation_covers(&old_refs[primary], &new_refs[index])
+        {
             let identical = new_refs[index] == old_refs[primary]
                 && page.title.trim() == old_pages[primary].title.trim()
                 && page.category == old_pages[primary].category;
@@ -1698,5 +1716,23 @@ mod tests {
         assert_eq!(diff.retired.len(), 1);
         assert_eq!(diff.retired[0].lost_refs, refs(&[C1]));
         assert_eq!(diff.recompile_count(), 0);
+    }
+
+    #[test]
+    fn continuation_requires_half_coverage_on_both_sides() {
+        let four: BTreeSet<KnowledgeNodeId> = refs(&[C1, C2, C3, C4]).into_iter().collect();
+        let two: BTreeSet<KnowledgeNodeId> = refs(&[C1, C2]).into_iter().collect();
+        let one: BTreeSet<KnowledgeNodeId> = refs(&[C1]).into_iter().collect();
+        let unrelated: BTreeSet<KnowledgeNodeId> = refs(&[C9]).into_iter().collect();
+
+        // Audit FIX-014 degenerate case: a 1-node overlap must never carry a
+        // 4-node page's WikiPageId (1/4 old coverage).
+        assert!(!continuation_covers(&four, &one));
+        // Inclusive halves continue: 2/2 and 2/4.
+        assert!(continuation_covers(&two, &two));
+        assert!(continuation_covers(&four, &two));
+        // No overlap continues nothing, and neither do empty ref sets.
+        assert!(!continuation_covers(&four, &unrelated));
+        assert!(!continuation_covers(&BTreeSet::new(), &BTreeSet::new()));
     }
 }

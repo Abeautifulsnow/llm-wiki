@@ -368,7 +368,7 @@ fn knowledge_refs_json(refs: &[KnowledgeNodeId]) -> Result<String> {
     .map_err(|e| WikiError::Storage(format!("serialize knowledge refs: {e}")))
 }
 
-fn parse_knowledge_refs(json: &str) -> Result<Vec<KnowledgeNodeId>> {
+pub(crate) fn parse_knowledge_refs(json: &str) -> Result<Vec<KnowledgeNodeId>> {
     let raw: Vec<String> = serde_json::from_str(json)
         .map_err(|e| WikiError::Storage(format!("parse knowledge refs: {e}")))?;
     Ok(raw

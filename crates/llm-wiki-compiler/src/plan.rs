@@ -79,6 +79,10 @@ pub struct PlanOutcome {
     pub plan_cache_hit: bool,
 }
 
+/// One cluster's concurrent staging result: (cluster index, page proposals,
+/// salvaged cross-cluster refs, cluster summary text, LLM request count).
+type ClusterOutcome = (usize, Vec<RawPage>, Vec<String>, String, u32);
+
 pub struct WikiPlanner {
     provider: Arc<dyn LlmProvider>,
     prompt: PromptDocument,
@@ -210,8 +214,7 @@ impl WikiPlanner {
         let task = PlannerTask::from(self);
         let base = Arc::new(base.clone());
         let concurrency = self.config.max_concurrency.max(1);
-        let mut cluster_outcomes: Vec<(usize, Vec<RawPage>, Vec<String>, u32)> =
-            Vec::with_capacity(clusters.len());
+        let mut cluster_outcomes: Vec<ClusterOutcome> = Vec::with_capacity(clusters.len());
         let mut next = 0usize;
         let mut join_set = tokio::task::JoinSet::new();
         while next < clusters.len() || !join_set.is_empty() {
@@ -223,18 +226,18 @@ impl WikiPlanner {
                 let summary_stage = summary_stage.clone();
                 let local_stage = local_stage.clone();
                 join_set.spawn(async move {
-                    let (pages, orphans, requests) = task
+                    let (pages, orphans, summary, requests) = task
                         .run_cluster(&base, &nodes, &summary_stage, &local_stage)
                         .await?;
-                    Ok::<_, WikiError>((index, pages, orphans, requests))
+                    Ok::<_, WikiError>((index, pages, orphans, summary, requests))
                 });
                 next += 1;
             }
             if let Some(joined) = join_set.join_next().await {
-                let (index, pages, orphans, requests) = joined.map_err(|e| {
+                let (index, pages, orphans, summary, requests) = joined.map_err(|e| {
                     WikiError::Planning(format!("planner cluster task panicked: {e}"))
                 })??;
-                cluster_outcomes.push((index, pages, orphans, requests));
+                cluster_outcomes.push((index, pages, orphans, summary, requests));
             }
         }
         cluster_outcomes.sort_by_key(|(index, ..)| *index);
@@ -242,9 +245,15 @@ impl WikiPlanner {
         let mut proposals: Vec<RawPage> = Vec::new();
         let mut llm_request_count = 0u32;
         let mut orphan_refs: Vec<String> = Vec::new();
-        for (_, pages, orphans, requests) in cluster_outcomes {
+        // Cluster origin per proposal (proposals extend in cluster order) and
+        // the cluster summary texts — the reconcile context (FIX-015).
+        let mut proposal_clusters: Vec<usize> = Vec::new();
+        let mut cluster_summaries: Vec<String> = vec![String::new(); clusters.len()];
+        for (index, pages, orphans, summary, requests) in cluster_outcomes {
             llm_request_count += requests;
             orphan_refs.extend(orphans);
+            proposal_clusters.extend(std::iter::repeat_n(index, pages.len()));
+            cluster_summaries[index] = summary;
             proposals.extend(pages);
         }
 
@@ -278,8 +287,21 @@ impl WikiPlanner {
             proposed_union.extend(salvage.knowledge_refs.iter().cloned());
         }
 
+        // Each proposal carries its originating cluster's summary into the
+        // reconcile context (audit FIX-015: the global merge sees cluster-level
+        // semantics, not just keys).
+        let proposal_summaries: Vec<String> = proposal_clusters
+            .iter()
+            .map(|&cluster| cluster_summaries[cluster].clone())
+            .collect();
         let (mut merged, reconcile_requests) = self
-            .reconcile_rounds(proposals, &summary_keys, &local_keys, &proposed_union)
+            .reconcile_rounds(
+                proposals,
+                &summary_keys,
+                &local_keys,
+                &proposed_union,
+                &proposal_summaries,
+            )
             .await?;
         llm_request_count += reconcile_requests;
 
@@ -296,42 +318,11 @@ impl WikiPlanner {
             }
         }
 
-        // Orphan sweep: refs the model invented into the final plan that are
-        // REAL library nodes but were never proposed become one deterministic
-        // page instead of failing reconciliation. Refs that are NOT library
-        // nodes stay rejected by validate_merged.
-        let mut unknown_in_merged: Vec<String> = Vec::new();
-        for page in &merged {
-            for ref_id in &page.knowledge_refs {
-                if !proposed_union.contains(ref_id)
-                    && base.nodes.keys().any(|k| k.as_str() == ref_id.as_str())
-                {
-                    unknown_in_merged.push(ref_id.clone());
-                }
-            }
-        }
-        let mut orphan_all: BTreeSet<String> = BTreeSet::from_iter(unknown_in_merged);
-        // Salvaged refs are already covered by their appended page; nodes the
-        // model merged into real pages are no longer orphans.
-        for page in &merged {
-            for ref_id in &page.knowledge_refs {
-                orphan_all.remove(ref_id);
-            }
-        }
-        if !orphan_all.is_empty() {
-            tracing::warn!(
-                count = orphan_all.len(),
-                "planner referenced nodes outside their cluster; salvaging them into a dedicated page"
-            );
-            let refs: Vec<String> = orphan_all.into_iter().collect();
-            let title = "Miscellaneous Knowledge".to_owned();
-            merged.push(RawPage {
-                title,
-                category: "concepts".to_owned(),
-                purpose: "Knowledge nodes whose assigning cluster could not be determined during planning.".to_owned(),
-                knowledge_refs: refs,
-            });
-        }
+        // NOTE: no orphan sweep here (audit FIX-008 follow-up) — the sweep
+        // was dead code by construction: validate_merged already rejects any
+        // ref outside `proposed_union`, so a REAL library node in `merged`
+        // that was never proposed cannot exist. Cross-cluster salvage above
+        // is the only path for unproposed-but-real refs.
 
         let plan = self.finalize(merged, &base)?;
         self.store_plan(&reconcile_key, &plan);
@@ -368,11 +359,15 @@ impl WikiPlanner {
         summary_keys: &[String],
         local_keys: &[String],
         proposed_union: &BTreeSet<String>,
+        proposal_summaries: &[String],
     ) -> Result<(Vec<RawPage>, u32)> {
         let task = PlannerTask::from(self);
         let mut round_proposals = proposals;
         let mut round_keys_summary: Vec<String> = summary_keys.to_vec();
         let mut round_keys_local: Vec<String> = local_keys.to_vec();
+        // Summaries exist only for the FIRST round's cluster-originated
+        // proposals; batch-merged pages carry no origin cluster.
+        let mut round_summaries: Option<&[String]> = Some(proposal_summaries);
         let mut reconcile_requests = 0u32;
         let merged: Vec<RawPage>;
         let mut rounds = 0usize;
@@ -386,8 +381,12 @@ impl WikiPlanner {
                     "reconciliation did not converge after {MAX_RECONCILE_ROUNDS} rounds; the model keeps returning one page per proposal — narrow the corpus or raise max_plan_input_tokens (PRD §14 forbids truncation)"
                 )));
             }
-            let reconcile_json =
-                reconcile_payload(&round_proposals, &round_keys_summary, &round_keys_local);
+            let reconcile_json = reconcile_payload(
+                &round_proposals,
+                &round_keys_summary,
+                &round_keys_local,
+                round_summaries,
+            );
             let single_round = reconcile_json.len() <= MAX_RECONCILE_PAYLOAD_BYTES;
             if single_round {
                 task.ensure_stage_budget(&reconcile_json, "reconciliation")?;
@@ -405,8 +404,18 @@ impl WikiPlanner {
             let batch_count = reconcile_json.len().div_ceil(MAX_RECONCILE_PAYLOAD_BYTES) + 1;
             let per_batch = round_proposals.len().div_ceil(batch_count).max(1);
             let mut next_round: Vec<RawPage> = Vec::new();
+            let mut offset = 0usize;
             for batch in round_proposals.chunks(per_batch) {
-                let batch_json = reconcile_payload(batch, &round_keys_summary, &round_keys_local);
+                // Summaries slice in lockstep with the proposal chunk.
+                let end = offset + batch.len();
+                let batch_summaries = round_summaries.map(|all| &all[offset..end]);
+                offset = end;
+                let batch_json = reconcile_payload(
+                    batch,
+                    &round_keys_summary,
+                    &round_keys_local,
+                    batch_summaries,
+                );
                 task.ensure_stage_budget(&batch_json, "reconciliation batch")?;
                 let batch_union: BTreeSet<String> = batch
                     .iter()
@@ -418,6 +427,7 @@ impl WikiPlanner {
                 next_round.extend(batch_merged);
             }
             round_proposals = next_round;
+            round_summaries = None;
             round_keys_summary = round_proposals
                 .iter()
                 .map(|page| batch_key("batch-s", page))
@@ -590,7 +600,7 @@ impl WikiPlanner {
             });
         }
 
-        attach_related_pages(&mut pages);
+        attach_related_pages(&mut pages, base);
         Ok(WikiPlan { pages })
     }
 }
@@ -653,14 +663,15 @@ impl PlannerTask {
 
     /// One cluster of the hierarchical plan: summary → local plan (PRD §14).
     /// Returns the cluster's page proposals, the salvaged cross-cluster node
-    /// refs and the LLM request count.
+    /// refs, the cluster summary text (reconcile context, audit FIX-015) and
+    /// the LLM request count.
     async fn run_cluster(
         &self,
         base: &KnowledgeBase,
         nodes: &[KnowledgeNodeId],
         summary_stage: &PromptDocument,
         local_stage: &PromptDocument,
-    ) -> Result<(Vec<RawPage>, Vec<String>, u32)> {
+    ) -> Result<(Vec<RawPage>, Vec<String>, String, u32)> {
         let payload = node_payload(base, nodes);
         self.ensure_stage_budget(&payload, "cluster summary")?;
         let (raw_summary, requests) = self
@@ -724,7 +735,12 @@ impl PlannerTask {
         // Bind before the tail expression: a MutexGuard temporary in tail
         // position would outlive `orphans` (E0597).
         let salvaged: Vec<String> = orphans.lock().unwrap().drain(..).collect();
-        Ok((raw_local.pages, salvaged, requests + repair_requests))
+        Ok((
+            raw_local.pages,
+            salvaged,
+            raw_summary.summary,
+            requests + repair_requests,
+        ))
     }
 
     /// One shape-only round: request → parse; a shape failure repairs once.
@@ -902,6 +918,7 @@ fn reconcile_payload(
     proposals: &[RawPage],
     summary_keys: &[String],
     local_keys: &[String],
+    proposal_summaries: Option<&[String]>,
 ) -> String {
     let clusters: Vec<serde_json::Value> = local_keys
         .iter()
@@ -917,13 +934,22 @@ fn reconcile_payload(
         .iter()
         .enumerate()
         .map(|(index, proposal)| {
-            serde_json::json!({
+            let mut value = serde_json::json!({
                 "index": index,
                 "title": proposal.title,
                 "category": proposal.category,
                 "purpose": proposal.purpose,
                 "knowledge_refs": proposal.knowledge_refs,
-            })
+            });
+            // Cluster-level context for the global merge (audit FIX-015);
+            // batch-round pages have no origin cluster and carry none.
+            if let Some(summary) = proposal_summaries
+                .and_then(|summaries| summaries.get(index))
+                .filter(|summary| !summary.is_empty())
+            {
+                value["cluster_summary"] = serde_json::json!(summary);
+            }
+            value
         })
         .collect();
     serde_json::json!({ "clusters": clusters, "proposals": pages }).to_string()
@@ -1043,25 +1069,61 @@ fn dedupe_slug(slug: &str, seen: &mut BTreeSet<String>) -> String {
     candidate
 }
 
-/// Pages sharing at least one knowledge node become related (deterministic:
-/// overlap count desc, then page id asc), capped to keep pages tidy.
-fn attach_related_pages(pages: &mut [WikiPagePlan]) {
+/// Pages become related through the knowledge graph, never through shared
+/// nodes: the planner's DUPLICATE_NODE_ASSIGNMENT rule keeps page ref sets
+/// disjoint, so node overlap can never fire (audit FIX-008). Deterministic
+/// signals: (1) knowledge relation adjacency between the pages' nodes
+/// (undirected), (2) shared sources among the pages' node anchors. Score =
+/// 2 × adjacency edges + 1 × shared sources, score desc then page id asc,
+/// capped to keep pages tidy.
+fn attach_related_pages(pages: &mut [WikiPagePlan], base: &KnowledgeBase) {
     const MAX_RELATED: usize = 8;
-    let refs: Vec<BTreeSet<KnowledgeNodeId>> = pages
-        .iter()
-        .map(|page| page.knowledge_refs.iter().cloned().collect())
-        .collect();
+    const ADJACENCY_WEIGHT: usize = 2;
     let ids: Vec<WikiPageId> = pages.iter().map(|page| page.id.clone()).collect();
+    let sources: Vec<BTreeSet<SourceId>> = pages
+        .iter()
+        .map(|page| page.source_refs.iter().cloned().collect())
+        .collect();
+    // Undirected relation-edge count between page pairs, via node → page
+    // ownership (ref sets are disjoint across pages by validation).
+    let adjacency: BTreeMap<(usize, usize), usize> = {
+        let node_page: BTreeMap<&str, usize> = pages
+            .iter()
+            .enumerate()
+            .flat_map(|(index, page)| {
+                page.knowledge_refs
+                    .iter()
+                    .map(move |node_id| (node_id.as_str(), index))
+            })
+            .collect();
+        let mut adjacency: BTreeMap<(usize, usize), usize> = BTreeMap::new();
+        for relation in &base.relations {
+            let (Some(a), Some(b)) = (
+                node_page.get(relation.source.as_str()).copied(),
+                node_page.get(relation.target.as_str()).copied(),
+            ) else {
+                continue;
+            };
+            if a == b {
+                continue; // intra-page: not a relation BETWEEN pages
+            }
+            *adjacency.entry((a.min(b), a.max(b))).or_insert(0) += 1;
+        }
+        adjacency
+    };
+
     for (index, page) in pages.iter_mut().enumerate() {
         let mut related: Vec<(usize, &WikiPageId)> = ids
             .iter()
             .enumerate()
             .filter(|(other, _)| *other != index)
-            .map(|(other, page_id)| {
-                let overlap = refs[index].intersection(&refs[other]).count();
-                (overlap, page_id)
+            .filter_map(|(other, page_id)| {
+                let pair = (index.min(other), index.max(other));
+                let adjacency_edges = adjacency.get(&pair).copied().unwrap_or(0);
+                let shared_sources = sources[index].intersection(&sources[other]).count();
+                let score = ADJACENCY_WEIGHT * adjacency_edges + shared_sources;
+                (score > 0).then_some((score, page_id))
             })
-            .filter(|(overlap, _)| *overlap > 0)
             .collect();
         related.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
         page.related_pages = related
@@ -1104,12 +1166,14 @@ struct RawPlanResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use llm_wiki_core::plan::PlanRelation;
 
     #[test]
-    fn related_pages_follow_overlap_then_id() {
+    fn related_pages_follow_relation_adjacency_then_id() {
         let a = KnowledgeNodeId::parse("kn_01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
         let b = KnowledgeNodeId::parse("kn_01BX5ZZKBKACTAV9WEVGEMMVRZ").unwrap();
-        let shared = KnowledgeNodeId::parse("kn_01CZZZZZZZZZZZZZZZZZZZZZZZ").unwrap();
+        let c = KnowledgeNodeId::parse("kn_01CZZZZZZZZZZZZZZZZZZZZZZZ").unwrap();
+        let isolated = KnowledgeNodeId::parse("kn_01DZZZZZZZZZZZZZZZZZZZZZZZ").unwrap();
         let mk = |id: &str, title: &str, refs: Vec<KnowledgeNodeId>| WikiPagePlan {
             id: WikiPageId::parse(id).unwrap(),
             slug: title.to_lowercase(),
@@ -1121,24 +1185,101 @@ mod tests {
             related_pages: vec![],
         };
         let mut pages = vec![
+            mk("wp_01ARZ3NDEKTSV4RRFFQ69G5FAV", "One", vec![a.clone()]),
+            mk("wp_01BX5ZZKBKACTAV9WEVGEMMVRZ", "Two", vec![b.clone()]),
             mk(
-                "wp_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-                "One",
-                vec![shared.clone(), a.clone()],
+                "wp_01CZZZZZZZZZZZZZZZZZZZZZZA",
+                "Three",
+                vec![c.clone(), isolated],
             ),
-            mk("wp_01BX5ZZKBKACTAV9WEVGEMMVRZ", "Two", vec![shared.clone()]),
-            mk("wp_01CZZZZZZZZZZZZZZZZZZZZZZA", "Three", vec![a]),
         ];
-        attach_related_pages(&mut pages);
-        // One: shares `shared` with Two and `a` with Three (tie → id order).
+        // Audit FIX-008: page ref sets are disjoint by validation, so
+        // relatedness comes from knowledge relation adjacency. One→Two and
+        // One→Three are adjacent; Two and Three are not related to each other.
+        let base = KnowledgeBase {
+            nodes: BTreeMap::new(),
+            relations: vec![
+                PlanRelation {
+                    source: a.clone(),
+                    relation_type: "uses".into(),
+                    target: b.clone(),
+                },
+                PlanRelation {
+                    source: a,
+                    relation_type: "uses".into(),
+                    target: c,
+                },
+            ],
+        };
+        attach_related_pages(&mut pages, &base);
+        // One: adjacent to Two and Three (1 edge each → tie → id order).
         assert_eq!(
             pages[0].related_pages,
             vec![pages[1].id.clone(), pages[2].id.clone()]
         );
         assert_eq!(pages[1].related_pages, vec![pages[0].id.clone()]);
-        // Three shares `a` with One only.
         assert_eq!(pages[2].related_pages, vec![pages[0].id.clone()]);
-        let _ = b;
+    }
+
+    #[test]
+    fn related_pages_follow_shared_sources_without_relations() {
+        let a = KnowledgeNodeId::parse("kn_01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+        let b = KnowledgeNodeId::parse("kn_01BX5ZZKBKACTAV9WEVGEMMVRZ").unwrap();
+        let source = SourceId::generate();
+        let mk = |id: &str, title: &str, refs: Vec<KnowledgeNodeId>| WikiPagePlan {
+            id: WikiPageId::parse(id).unwrap(),
+            slug: title.to_lowercase(),
+            title: title.to_owned(),
+            category: "concepts".into(),
+            purpose: "p".into(),
+            knowledge_refs: refs,
+            source_refs: vec![source.clone()],
+            related_pages: vec![],
+        };
+        let mut pages = vec![
+            mk("wp_01ARZ3NDEKTSV4RRFFQ69G5FAV", "One", vec![a]),
+            mk("wp_01BX5ZZKBKACTAV9WEVGEMMVRZ", "Two", vec![b]),
+        ];
+        let base = KnowledgeBase {
+            nodes: BTreeMap::new(),
+            relations: vec![],
+        };
+        // No relation edges — the shared source anchor still relates them.
+        attach_related_pages(&mut pages, &base);
+        assert_eq!(pages[0].related_pages, vec![pages[1].id.clone()]);
+        assert_eq!(pages[1].related_pages, vec![pages[0].id.clone()]);
+    }
+
+    #[test]
+    fn reconcile_payload_carries_cluster_summaries() {
+        let proposal = |title: &str| RawPage {
+            title: title.to_owned(),
+            category: "concepts".to_owned(),
+            purpose: "p".to_owned(),
+            knowledge_refs: vec!["kn_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()],
+        };
+        let proposals = vec![proposal("One"), proposal("Two")];
+        let keys = vec!["s1".to_owned(), "s2".to_owned()];
+
+        // First round: each proposal carries its cluster's summary.
+        let payload = reconcile_payload(
+            &proposals,
+            &keys,
+            &keys,
+            Some(&["summary one".into(), "".into()]),
+        );
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            value["proposals"][0]["cluster_summary"], "summary one",
+            "the proposal's cluster summary rides into the reconcile context"
+        );
+        // An empty summary (unknown origin) adds no field.
+        assert!(value["proposals"][1].get("cluster_summary").is_none());
+
+        // Batch rounds: no summaries at all.
+        let payload = reconcile_payload(&proposals, &keys, &keys, None);
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert!(value["proposals"][0].get("cluster_summary").is_none());
     }
 
     #[test]
