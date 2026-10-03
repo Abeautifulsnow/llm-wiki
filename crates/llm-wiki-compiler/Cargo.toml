@@ -10,6 +10,7 @@ repository.workspace = true
 llm-wiki-core = { workspace = true }
 llm-wiki-llm = { workspace = true }
 llm-wiki-markdown = { workspace = true }
+llm-wiki-search = { workspace = true }
 llm-wiki-source = { workspace = true }
 llm-wiki-storage = { workspace = true }
 chrono = { workspace = true }

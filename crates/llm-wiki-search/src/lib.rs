@@ -17,6 +17,12 @@ use llm_wiki_storage::graph::{graph_expand_from_page, GraphNeighbor};
 use llm_wiki_storage::search_index::{self, SearchTokenizer};
 use tokio::task::spawn_blocking;
 
+pub mod context;
+
+pub use context::{
+    build_context, chunks_tokens, AssembledContext, ContextBudget, ContextChunk, ContextNeighbor,
+};
+
 /// Marks crate purpose.
 pub const V0_2_SCOPE: &str = "FTS with language-aware analyzers, rank fusion, graph expansion";
 

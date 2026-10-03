@@ -3,6 +3,8 @@
 //! transaction. Filesystem generations (§35) are the visible artifact; these
 //! rows are the machine state backing lint/search.
 
+use std::collections::BTreeMap;
+
 use rusqlite::{params, Connection};
 
 use llm_wiki_core::error::{Result, WikiError};
@@ -202,6 +204,37 @@ pub fn load_generation_pages(conn: &Connection, build_id: &BuildId) -> Result<Ve
         });
     }
     Ok(out)
+}
+
+/// `page_id → distinct source rel_paths` (sorted) for one generation — the
+/// source-diversity signal for the context builder (§19.3). Pages without
+/// citations map to an empty vector.
+pub fn generation_page_sources(
+    conn: &Connection,
+    build_id: &BuildId,
+) -> Result<BTreeMap<String, Vec<String>>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT pc.page_id, src.rel_path FROM page_citations pc
+             JOIN sources src ON src.source_id = pc.source_id
+             WHERE pc.build_id = ?1
+             ORDER BY pc.page_id, src.rel_path",
+        )
+        .map_err(|e| WikiError::Storage(format!("prepare generation page sources: {e}")))?;
+    let rows = stmt
+        .query_map(params![build_id.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| WikiError::Storage(format!("generation page sources: {e}")))?;
+    let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for row in rows {
+        let (page_id, rel_path) = row.map_err(db)?;
+        let entry = map.entry(page_id).or_default();
+        if entry.last() != Some(&rel_path) {
+            entry.push(rel_path);
+        }
+    }
+    Ok(map)
 }
 
 /// Cheap counts of one persisted generation — the no-change fast path

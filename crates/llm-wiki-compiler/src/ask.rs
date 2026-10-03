@@ -31,8 +31,7 @@ use llm_wiki_core::plan::{estimate_tokens, KnowledgeBase, PlanAnchor};
 use llm_wiki_llm::structured;
 use llm_wiki_llm::LlmProvider;
 use llm_wiki_storage::{
-    insert_insight, load_knowledge_base, search_index, InsightCitation, InsightRecord,
-    PageCitationRecord,
+    insert_insight, load_knowledge_base, InsightCitation, InsightRecord, PageCitationRecord,
 };
 
 use crate::build::prepare_pipeline_env;
@@ -82,15 +81,19 @@ pub async fn run_ask(
     let pages = load_generation_view_pages(&conn, &build_id)?;
     let base: KnowledgeBase = load_knowledge_base(&conn)?;
 
-    // ---- Retrieval: FTS over the active generation, top sections. ----
-    let fts_query = fts_expression(query);
-    let hits = search_index(&conn, &fts_query, RETRIEVAL_HITS)?;
-    if hits.is_empty() {
-        return Err(WikiError::Index(format!(
-            "no wiki section matches {query:?}; the published generation may not cover this topic"
-        )));
-    }
-    let hit_slugs: BTreeSet<&str> = hits.iter().map(|hit| hit.slug.as_str()).collect();
+    // ---- Retrieval: the Context Builder assembles sections under the
+    // budgets (§19.3) — page/source diversity, token ceiling, graph
+    // neighborhood. The synthesis budget derives from max_input_tokens. ----
+    let context_budget = llm_wiki_search::ContextBudget {
+        max_tokens: config.analysis.max_input_tokens as u64,
+        ..llm_wiki_search::ContextBudget::default()
+    };
+    let assembled = llm_wiki_search::build_context(&conn, query, &context_budget)?;
+    let hit_slugs: BTreeSet<&str> = assembled
+        .chunks
+        .iter()
+        .map(|chunk| chunk.slug.as_str())
+        .collect();
 
     // ---- Context claims: the claims cited by the hit pages (deduped), with
     // their stored statements and source paths. Only these ids are citable. ----
@@ -123,7 +126,7 @@ pub async fn run_ask(
         }
     }
 
-    let context = context_payload(&hits, &claims);
+    let context = context_payload(&assembled, &claims);
 
     // Fail closed on budget overshoot (§14: never truncate, never send).
     let env = prepare_pipeline_env(&workspace_root.join(".llm-wiki"), config, &provider)?;
@@ -219,33 +222,32 @@ fn load_generation_view_pages(
     llm_wiki_storage::load_generation_view(conn, build_id)
 }
 
-/// The OR-of-quoted-terms MATCH expression over the shared tokenizer's
-/// tokens (mirrors `llm-wiki-search::TextAnalyzer::fts_query`; kept local so
-/// the compiler does not depend on the search crate).
-fn fts_expression(text: &str) -> String {
-    let tokenizer = llm_wiki_storage::default_tokenizer();
-    let mut seen = BTreeSet::new();
-    let mut terms = Vec::new();
-    for token in tokenizer.analyze(text) {
-        if seen.insert(token.clone()) {
-            terms.push(format!("\"{}\"", token.replace('"', "\"\"")));
-        }
-    }
-    terms.join(" OR ")
-}
-
 fn context_payload(
-    hits: &[llm_wiki_storage::SearchIndexRow],
+    assembled: &llm_wiki_search::AssembledContext,
     claims: &[(String, String, String)],
 ) -> String {
-    let sections: Vec<serde_json::Value> = hits
+    let sections: Vec<serde_json::Value> = assembled
+        .chunks
         .iter()
-        .map(|hit| {
+        .map(|chunk| {
             serde_json::json!({
-                "page": hit.title,
-                "slug": hit.slug,
-                "headings": hit.heading_path,
-                "snippet": hit.snippet,
+                "page": chunk.title,
+                "slug": chunk.slug,
+                "headings": chunk.heading_path,
+                "snippet": chunk.snippet,
+                "sources": chunk.sources,
+            })
+        })
+        .collect();
+    let related: Vec<serde_json::Value> = assembled
+        .neighbors
+        .iter()
+        .map(|neighbor| {
+            serde_json::json!({
+                "via_page": neighbor.from_slug,
+                "relation": neighbor.relation,
+                "node": neighbor.label,
+                "kind": neighbor.node_type,
             })
         })
         .collect();
@@ -255,7 +257,12 @@ fn context_payload(
             serde_json::json!({ "id": id, "statement": statement, "source": source })
         })
         .collect();
-    serde_json::json!({ "sections": sections, "claims": claim_values }).to_string()
+    serde_json::json!({
+        "sections": sections,
+        "related_graph_nodes": related,
+        "claims": claim_values,
+    })
+    .to_string()
 }
 
 /// One synthesis round: shape → single repair (PRD §11). Model errors
@@ -346,7 +353,3 @@ fn validate_answer(
     }
     issues
 }
-
-/// Retrieval width for one ask (§22-style cap; the Context Builder of the
-/// full hybrid stack will own its own budget later).
-const RETRIEVAL_HITS: usize = 8;

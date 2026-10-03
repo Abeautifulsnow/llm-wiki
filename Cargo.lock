@@ -773,6 +773,7 @@ dependencies = [
  "llm-wiki-core",
  "llm-wiki-llm",
  "llm-wiki-markdown",
+ "llm-wiki-search",
  "llm-wiki-source",
  "llm-wiki-storage",
  "rusqlite",
@@ -845,6 +846,7 @@ dependencies = [
  "async-trait",
  "llm-wiki-core",
  "llm-wiki-storage",
+ "rusqlite",
  "tokio",
 ]
 

@@ -13,4 +13,5 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
+rusqlite = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
