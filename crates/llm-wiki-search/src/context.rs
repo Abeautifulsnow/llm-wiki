@@ -13,11 +13,88 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use llm_wiki_core::error::{Result, WikiError};
+use llm_wiki_core::hash::sha256_hex;
 use llm_wiki_core::ids::WikiPageId;
 use llm_wiki_core::plan::estimate_tokens;
 use llm_wiki_storage::{
     generation_page_sources, get_active_build_id, graph_expand_from_page, search_index, Connection,
 };
+
+/// The semantic text of one context section — the object the Vector layer
+/// embeds and hashes. ONE definition so the embed backfill, the hybrid query
+/// path and the candidate resolution can never drift.
+pub fn context_section_text(title: &str, heading_path: &[String], body: &str) -> String {
+    format!("{title}\n{}\n{body}", heading_path.join(" > "))
+}
+
+/// The content hash identifying a context section's text
+/// ([`context_section_text`], sha256).
+pub fn context_section_hash(title: &str, heading_path: &[String], body: &str) -> String {
+    sha256_hex(context_section_text(title, heading_path, body).as_bytes())
+}
+
+/// One section of the ACTIVE generation with its identity hash — the row
+/// set the Vector layer embeds and searches over.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContextSection {
+    pub text_hash: String,
+    pub page_id: WikiPageId,
+    pub slug: String,
+    pub title: String,
+    pub heading_path: Vec<String>,
+    pub body: String,
+}
+
+/// Loads the ACTIVE generation's context sections (hash computed here —
+/// one definition, see [`context_section_hash`]).
+pub fn active_context_sections(conn: &Connection) -> Result<Vec<ContextSection>> {
+    let Some(active) = get_active_build_id(conn)? else {
+        return Err(WikiError::Index(
+            "nothing published; run build first".into(),
+        ));
+    };
+    let mut stmt = conn
+        .prepare(
+            "SELECT page_id, slug, title, heading_path_json, body
+             FROM wiki_page_text WHERE build_id = ?1 ORDER BY page_id, text_id",
+        )
+        .map_err(|e| WikiError::Storage(format!("prepare context sections: {e}")))?;
+    let rows = stmt
+        .query_map([active.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(|e| WikiError::Storage(format!("context sections: {e}")))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (page_id, slug, title, heading_json, body) =
+            row.map_err(|e| WikiError::Storage(e.to_string()))?;
+        let heading_path: Vec<String> = serde_json::from_str(&heading_json).unwrap_or_default();
+        out.push(ContextSection {
+            text_hash: context_section_hash(&title, &heading_path, &body),
+            page_id: WikiPageId::from_validated(page_id),
+            slug,
+            title,
+            heading_path,
+            body,
+        });
+    }
+    Ok(out)
+}
+
+/// A Vector-layer candidate (§19.3): one context-section text hash plus a
+/// similarity score (larger is better — cosine). Fusion merges these with
+/// the lexical hits; resolution (snippet, page info) happens here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorCandidate {
+    pub text_hash: String,
+    pub score: f32,
+}
 
 /// Budget and diversity controls for one context assembly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,8 +132,9 @@ pub struct ContextChunk {
     pub title: String,
     pub heading_path: Vec<String>,
     pub snippet: String,
-    /// bm25 rank (smaller is better), kept for downstream ordering/display.
-    pub rank: f64,
+    /// RRF-fused retrieval score (larger is better) over the lexical and
+    /// vector candidate lists.
+    pub score: f32,
     /// Distinct source paths backing this page (empty for uncited pages).
     pub sources: Vec<String>,
 }
@@ -94,6 +172,7 @@ pub fn build_context(
     conn: &Connection,
     query: &str,
     budget: &ContextBudget,
+    vector: &[VectorCandidate],
 ) -> Result<AssembledContext> {
     let Some(active) = get_active_build_id(conn)? else {
         return Err(WikiError::Index(
@@ -105,20 +184,96 @@ pub fn build_context(
     // rank-best candidates share pages or sources. The shared analyzer keeps
     // query and index normalization from drifting (PRD §20).
     let fts_query = crate::TextAnalyzer.fts_query(query);
-    let mut candidates = search_index(conn, &fts_query, budget.max_chunks * 3)?;
-    if candidates.is_empty() {
+    let lexical = search_index(conn, &fts_query, budget.max_chunks * 3)?;
+
+    // ---- Fusion (§19.3 rank fusion): Reciprocal Rank Fusion over the
+    // lexical and vector candidate lists. RRF needs only the ORDER of each
+    // list, so bm25 and cosine never have to be comparable. Identity =
+    // (page_id, heading path) — the context-section identity. ----
+    const RRF_K: f64 = 60.0;
+    struct Candidate {
+        section: ContextSection,
+        snippet: String,
+        lexical_rank: Option<usize>,
+        vector_rank: Option<usize>,
+    }
+    let mut by_key: BTreeMap<(String, String), Candidate> = BTreeMap::new();
+    for (rank, hit) in lexical.iter().enumerate() {
+        let snippet = hit.snippet.clone();
+        let key = (
+            hit.page_id.as_str().to_owned(),
+            hit.heading_path.join("\u{1f}"),
+        );
+        by_key
+            .entry(key)
+            .or_insert_with(|| Candidate {
+                section: ContextSection {
+                    text_hash: String::new(),
+                    page_id: hit.page_id.clone(),
+                    slug: hit.slug.clone(),
+                    title: hit.title.clone(),
+                    heading_path: hit.heading_path.clone(),
+                    body: String::new(),
+                },
+                snippet,
+                lexical_rank: Some(rank),
+                vector_rank: None,
+            })
+            .lexical_rank = Some(rank);
+    }
+    if !vector.is_empty() {
+        let sections = active_context_sections(conn)?;
+        let mut by_hash: BTreeMap<&str, &ContextSection> = BTreeMap::new();
+        for section in &sections {
+            by_hash.insert(section.text_hash.as_str(), section);
+        }
+        for (rank, candidate) in vector.iter().enumerate() {
+            let Some(section) = by_hash.get(candidate.text_hash.as_str()) else {
+                // A stale or foreign hash (other model, pre-embed generation):
+                // skipped, never guessed about.
+                tracing::debug!(hash = %candidate.text_hash, "vector candidate without a matching context section; skipped");
+                continue;
+            };
+            let snippet = excerpt(&section.body);
+            let key = (
+                section.page_id.as_str().to_owned(),
+                section.heading_path.join("\u{1f}"),
+            );
+            by_key
+                .entry(key)
+                .or_insert_with(|| Candidate {
+                    section: (*section).clone(),
+                    snippet,
+                    lexical_rank: None,
+                    vector_rank: Some(rank),
+                })
+                .vector_rank = Some(rank);
+        }
+    }
+    let mut fused: Vec<(f64, &Candidate)> = by_key
+        .values()
+        .map(|candidate| {
+            let mut score = 0.0;
+            if let Some(rank) = candidate.lexical_rank {
+                score += 1.0 / (RRF_K + rank as f64);
+            }
+            if let Some(rank) = candidate.vector_rank {
+                score += 1.0 / (RRF_K + rank as f64);
+            }
+            (score, candidate)
+        })
+        .collect();
+    fused.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.section.slug.cmp(&b.1.section.slug))
+            .then_with(|| a.1.section.heading_path.cmp(&b.1.section.heading_path))
+    });
+    if fused.is_empty() {
         return Err(WikiError::Index(format!(
             "no wiki section matches {query:?}; the published generation may not cover this topic"
         )));
     }
-    // bm25 ties come back in SQLite scan order — pin the order deterministically.
-    candidates.sort_by(|a, b| {
-        a.rank
-            .partial_cmp(&b.rank)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.slug.cmp(&b.slug))
-            .then_with(|| a.heading_path.cmp(&b.heading_path))
-    });
 
     let page_sources = generation_page_sources(conn, &active)?;
 
@@ -128,21 +283,21 @@ pub fn build_context(
     let mut per_source: BTreeMap<String, usize> = BTreeMap::new();
     let mut tokens = 0u64;
     let mut dropped = 0usize;
-    for hit in &candidates {
+    for (fused_score, candidate) in &fused {
         if chunks.len() >= budget.max_chunks {
-            dropped += candidates.len() - chunks.len();
+            dropped += fused.len() - chunks.len();
             break;
         }
-        let fresh_page = pages_used.insert(hit.page_id.as_str().to_owned());
+        let fresh_page = pages_used.insert(candidate.section.page_id.as_str().to_owned());
         if fresh_page && pages_used.len() > budget.max_pages {
             // A NEW page beyond the diversity cap is rejected; pages already
             // under the cap keep contributing until max_chunks.
-            pages_used.remove(hit.page_id.as_str());
+            pages_used.remove(candidate.section.page_id.as_str());
             dropped += 1;
             continue;
         }
         let sources = page_sources
-            .get(hit.page_id.as_str())
+            .get(candidate.section.page_id.as_str())
             .cloned()
             .unwrap_or_default();
         if let Some(first_source) = sources.first() {
@@ -154,12 +309,12 @@ pub fn build_context(
             *per_source.entry(first_source.clone()).or_insert(0) += 1;
         }
         let chunk = ContextChunk {
-            page_id: hit.page_id.clone(),
-            slug: hit.slug.clone(),
-            title: hit.title.clone(),
-            heading_path: hit.heading_path.clone(),
-            snippet: hit.snippet.clone(),
-            rank: hit.rank,
+            page_id: candidate.section.page_id.clone(),
+            slug: candidate.section.slug.clone(),
+            title: candidate.section.title.clone(),
+            heading_path: candidate.section.heading_path.clone(),
+            snippet: candidate.snippet.clone(),
+            score: *fused_score as f32,
             sources,
         };
         let chunk_tokens = estimate_tokens(&context_chunk_text(&chunk));
@@ -204,6 +359,16 @@ pub fn build_context(
         neighbors,
         dropped,
     })
+}
+
+/// A body excerpt for vector-only candidates (no FTS snippet exists): the
+/// first paragraph-ish slice, capped for context economy.
+fn excerpt(body: &str) -> String {
+    let mut end = body.find("\n\n").unwrap_or(body.len()).min(240);
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    body[..end].trim().to_owned()
 }
 
 /// The serialized form of one chunk — what estimate_tokens judges and what a

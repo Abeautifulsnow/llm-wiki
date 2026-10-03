@@ -11,6 +11,7 @@ pub mod build;
 pub mod cache;
 pub mod changeset;
 pub mod compile;
+pub mod embed;
 pub mod incremental;
 pub mod lint;
 pub mod persist;
@@ -23,7 +24,7 @@ pub mod semantic_lint;
 pub use analysis::{
     AnalysisOutcome, AnalysisSection, AnalyzedDocument, DocumentAnalyzer, VerifiedRelation,
 };
-pub use ask::{run_ask, AskReport};
+pub use ask::{run_ask, AskReport, HybridContext};
 pub use build::{run_build, BuildReport, IncrementalSummary};
 pub use cache::{CacheContext, CacheStats, LlmCache, StageCache};
 pub use changeset::{
@@ -31,6 +32,7 @@ pub use changeset::{
     ScannedSource,
 };
 pub use compile::{CompiledGeneration, CompilerConfig, WikiCompiler};
+pub use embed::{run_embed, EmbedReport};
 pub use incremental::{map_incremental_change, MappingDecision, MappingInput};
 pub use lint::{run_lint, LintCheck, LintFinding, LintReport, LintSeverity};
 pub use persist::{persist_outcome, PersistOptions};

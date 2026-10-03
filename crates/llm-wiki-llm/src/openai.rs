@@ -119,8 +119,12 @@ impl OpenAiCompatibleProvider {
         self
     }
 
-    async fn send(&self, body: serde_json::Value) -> Result<reqwest::Response, LlmError> {
-        let url = format!("{}/chat/completions", self.base_url);
+    async fn send(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<reqwest::Response, LlmError> {
+        let url = format!("{}/{path}", self.base_url);
         let mut attempt = 0u32;
         loop {
             let mut request = self.client.post(&url).json(&body);
@@ -256,7 +260,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
         // downgrades the provider for the rest of the build and retries the
         // identical request WITHOUT the params — never an error on the user's
         // behalf, always a warning in the log.
-        let response = match self.send(body.clone()).await {
+        let response = match self.send("chat/completions", body.clone()).await {
             Err(LlmError::Api { code, message })
                 if params_applied
                     && (400..500).contains(&code)
@@ -268,7 +272,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
                 );
                 let _ = message;
                 strip_thinking_params(&mut body);
-                self.send(body).await?
+                self.send("chat/completions", body).await?
             }
             other => other?,
         };
@@ -315,9 +319,118 @@ impl LlmProvider for OpenAiCompatibleProvider {
     }
 }
 
+/// §19.3 Vector layer: batch embeddings over the same endpoint family
+/// (`POST {base_url}/embeddings`), reusing the transport's auth and
+/// 429/5xx backoff. The provider returns `data[]` in arbitrary order —
+/// responses are re-sorted by `index` so output order == input order.
+#[async_trait]
+impl crate::EmbeddingProvider for OpenAiCompatibleProvider {
+    async fn embed(&self, model: &str, texts: &[String]) -> Result<Vec<Vec<f32>>, LlmError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let body = serde_json::json!({ "model": model, "input": texts });
+        let response = self.send("embeddings", body).await?;
+        let payload: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| LlmError::InvalidResponse(format!("embeddings body is not JSON: {e}")))?;
+        let mut entries: Vec<(u64, Vec<f32>)> = payload
+            .get("data")
+            .and_then(|data| data.as_array())
+            .ok_or_else(|| {
+                LlmError::InvalidResponse("embeddings response missing data[]".to_owned())
+            })?
+            .iter()
+            .map(|entry| {
+                let index = entry
+                    .get("index")
+                    .and_then(|value| value.as_u64())
+                    .ok_or_else(|| {
+                        LlmError::InvalidResponse("embeddings entry missing index".to_owned())
+                    })?;
+                let vector = entry
+                    .get("embedding")
+                    .and_then(|value| value.as_array())
+                    .ok_or_else(|| {
+                        LlmError::InvalidResponse("embeddings entry missing embedding[]".to_owned())
+                    })?
+                    .iter()
+                    .map(|value| {
+                        value.as_f64().map(|number| number as f32).ok_or_else(|| {
+                            LlmError::InvalidResponse(
+                                "embeddings entry holds a non-numeric value".to_owned(),
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<f32>, LlmError>>()?;
+                Ok((index, vector))
+            })
+            .collect::<Result<Vec<(u64, Vec<f32>)>, LlmError>>()?;
+        entries.sort_by_key(|(index, _)| *index);
+        if entries.len() != texts.len() {
+            return Err(LlmError::InvalidResponse(format!(
+                "embeddings returned {} vectors for {} inputs",
+                entries.len(),
+                texts.len()
+            )));
+        }
+        Ok(entries.into_iter().map(|(_, vector)| vector).collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// §19.3: the embeddings endpoint contract — batch in, vectors out in
+    /// INPUT order (the provider returns data[] unordered; we sort by index).
+    #[tokio::test]
+    async fn embeddings_batch_returns_vectors_in_input_order() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = vec![0u8; 65536];
+            let n = stream.read(&mut buf).unwrap();
+            let raw = String::from_utf8_lossy(&buf[..n]).into_owned();
+            assert!(raw.contains("/embeddings"), "hits the embeddings path");
+            assert!(raw.contains("\"input\":[\"b\",\"a\"]"), "batch body: {raw}");
+            // data[] deliberately OUT of input order; index field sorts it.
+            let body = r#"{"data":[
+                {"index":1,"embedding":[0.4,0.5]},
+                {"index":0,"embedding":[0.1,0.2]}
+            ]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let provider: std::sync::Arc<dyn crate::EmbeddingProvider> = std::sync::Arc::new(
+            OpenAiCompatibleProvider::new(
+                &format!("http://127.0.0.1:{port}"),
+                "m",
+                "UNUSED_VAR",
+                10,
+                0,
+            )
+            .unwrap(),
+        );
+        let vectors = provider
+            .embed("emb-model", &["b".to_owned(), "a".to_owned()])
+            .await
+            .unwrap();
+        assert_eq!(vectors.len(), 2);
+        assert_eq!(vectors[0], vec![0.1, 0.2], "input order, not data order");
+        assert_eq!(vectors[1], vec![0.4, 0.5]);
+        server.join().unwrap();
+    }
 
     #[test]
     fn thinking_params_apply_and_strip() {

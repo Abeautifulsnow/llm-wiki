@@ -12,4 +12,5 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0008_search.sql"),
     include_str!("../migrations/0009_graph.sql"),
     include_str!("../migrations/0010_insights.sql"),
+    include_str!("../migrations/0011_section_embeddings.sql"),
 ];

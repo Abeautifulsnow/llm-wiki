@@ -13,6 +13,10 @@ pub mod structured;
 pub use fake::FakeLlmProvider;
 pub use openai::OpenAiCompatibleProvider;
 
+pub mod embedding;
+
+pub use embedding::EmbeddingProvider;
+
 use async_trait::async_trait;
 use thiserror::Error;
 

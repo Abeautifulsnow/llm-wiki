@@ -223,6 +223,7 @@ async fn ask_grounds_cites_persists_and_caches() {
         provider.clone(),
         "how do retries work",
         false,
+        None,
     )
     .await
     .unwrap()
@@ -247,11 +248,17 @@ async fn ask_grounds_cites_persists_and_caches() {
     let provider = ask_llm(Arc::new(Mutex::new(VecDeque::from([cited_answer(
         &claim_id,
     )]))));
-    let writeback =
-        llm_wiki_compiler::run_ask(&workspace, &config, provider, "how do retries work", true)
-            .await
-            .unwrap()
-            .unwrap();
+    let writeback = llm_wiki_compiler::run_ask(
+        &workspace,
+        &config,
+        provider,
+        "how do retries work",
+        true,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let insight_id = writeback.insight_id.expect("write-back ran");
     let insights = list_insights(
         &llm_wiki_storage::open(&workspace.join(".llm-wiki").join("state.db")).unwrap(),
@@ -274,6 +281,7 @@ async fn ask_grounds_cites_persists_and_caches() {
         provider.clone(),
         "how do retries work",
         false,
+        None,
     )
     .await
     .unwrap()
@@ -311,7 +319,7 @@ async fn ask_fails_closed_on_hallucinated_citations() {
         hallucinated.clone(),
         hallucinated,
     ]))));
-    let error = llm_wiki_compiler::run_ask(&workspace, &config, provider, "retries", true)
+    let error = llm_wiki_compiler::run_ask(&workspace, &config, provider, "retries", true, None)
         .await
         .unwrap_err();
     assert!(

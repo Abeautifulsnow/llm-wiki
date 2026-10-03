@@ -211,7 +211,7 @@ fn page_diversity_cap_confines_selection() {
         max_pages: 1,
         ..ContextBudget::default()
     };
-    let context = build_context(&conn, "retries sso", &budget).unwrap();
+    let context = build_context(&conn, "retries sso", &budget, &[]).unwrap();
     assert!(!context.chunks.is_empty());
     let pages: std::collections::BTreeSet<&str> = context
         .chunks
@@ -231,14 +231,14 @@ fn token_budget_limits_the_selection() {
         max_tokens: 20,
         ..ContextBudget::default()
     };
-    let context = build_context(&conn, "retries sso", &budget).unwrap();
+    let context = build_context(&conn, "retries sso", &budget, &[]).unwrap();
     let selection_tokens = llm_wiki_search::chunks_tokens(&context.chunks);
     assert!(
         selection_tokens <= 20,
         "chunk selection exceeds the budget: {selection_tokens}"
     );
     // The budget demonstrably shrank the selection versus an unbounded one.
-    let unbounded = build_context(&conn, "retries sso", &ContextBudget::default()).unwrap();
+    let unbounded = build_context(&conn, "retries sso", &ContextBudget::default(), &[]).unwrap();
     assert!(
         selection_tokens < llm_wiki_search::chunks_tokens(&unbounded.chunks),
         "the budget must drop something: {selection_tokens} vs {}",
@@ -257,7 +257,7 @@ fn source_diversity_spreads_across_sources() {
         max_per_source: 1,
         ..ContextBudget::default()
     };
-    let context = build_context(&conn, "retries sso", &budget).unwrap();
+    let context = build_context(&conn, "retries sso", &budget, &[]).unwrap();
     let mut per_source: BTreeMap<String, usize> = BTreeMap::new();
     for chunk in &context.chunks {
         if let Some(source) = chunk.sources.first() {
@@ -276,7 +276,7 @@ fn source_diversity_spreads_across_sources() {
 fn graph_neighborhood_reaches_pages_and_semantics() {
     let (conn, build) = published("graph");
     let _ = build;
-    let context = build_context(&conn, "retries sso", &ContextBudget::default()).unwrap();
+    let context = build_context(&conn, "retries sso", &ContextBudget::default(), &[]).unwrap();
     let labels: Vec<&str> = context.neighbors.iter().map(|n| n.label.as_str()).collect();
     assert!(
         labels.contains(&"Security"),
@@ -296,8 +296,8 @@ fn graph_neighborhood_reaches_pages_and_semantics() {
 #[test]
 fn assembly_is_deterministic() {
     let (conn, _) = published("determinism");
-    let a = build_context(&conn, "retries sso", &ContextBudget::default()).unwrap();
-    let b = build_context(&conn, "retries sso", &ContextBudget::default()).unwrap();
+    let a = build_context(&conn, "retries sso", &ContextBudget::default(), &[]).unwrap();
+    let b = build_context(&conn, "retries sso", &ContextBudget::default(), &[]).unwrap();
     assert_eq!(a, b);
 }
 
@@ -307,6 +307,69 @@ fn without_an_active_build_the_builder_errors() {
     let (mut conn, _) = published("noactive");
     set_active_build(&mut conn, None).unwrap();
     let _ = get_active_build_id(&conn).unwrap();
-    let error = build_context(&conn, "retries", &ContextBudget::default()).unwrap_err();
+    let error = build_context(&conn, "retries", &ContextBudget::default(), &[]).unwrap_err();
     assert!(error.to_string().contains("nothing published"));
+}
+
+/// Vector-layer fusion (§19.3): a vector candidate whose section has NO
+/// lexical hit still enters the context; an unknown hash is skipped, never
+/// guessed about; lexical-only behavior is unchanged with an empty list.
+#[test]
+fn vector_candidates_fuse_with_lexical() {
+    let (conn, _) = published("fusion");
+    // Collect the fixture's real section hashes.
+    let sections = llm_wiki_search::active_context_sections(&conn).unwrap();
+    assert!(sections.len() >= 2);
+    let other = sections
+        .iter()
+        .find(|section| section.slug == "ctx-sso")
+        .expect("fixture sso section");
+
+    // Query only matches the runtime section lexically; the sso section
+    // arrives as a VECTOR candidate and must appear in the context.
+    let vector = vec![llm_wiki_search::VectorCandidate {
+        text_hash: other.text_hash.clone(),
+        score: 0.9,
+    }];
+    let context = build_context(&conn, "retries", &ContextBudget::default(), &vector).unwrap();
+    let slugs: Vec<&str> = context
+        .chunks
+        .iter()
+        .map(|chunk| chunk.slug.as_str())
+        .collect();
+    assert!(
+        slugs.contains(&"ctx-sso"),
+        "vector candidate included: {slugs:?}"
+    );
+
+    // Unknown hashes are skipped without killing the lexical path.
+    let stale = vec![llm_wiki_search::VectorCandidate {
+        text_hash: "stale-hash".into(),
+        score: 1.0,
+    }];
+    let context = build_context(&conn, "retries", &ContextBudget::default(), &stale).unwrap();
+    assert!(
+        context
+            .chunks
+            .iter()
+            .any(|chunk| chunk.slug == "ctx-runtime"),
+        "lexical retrieval survives stale vector candidates"
+    );
+
+    // Empty vector list == pure lexical behavior.
+    let lexical_only = build_context(&conn, "retries", &ContextBudget::default(), &[]).unwrap();
+    assert!(lexical_only
+        .chunks
+        .iter()
+        .any(|chunk| chunk.slug == "ctx-runtime"));
+}
+
+/// The section hash is stable and tied to the ONE text definition.
+#[test]
+fn context_section_hash_is_content_addressed() {
+    let a = llm_wiki_search::context_section_hash("T", &["H".into()], "body");
+    let b = llm_wiki_search::context_section_hash("T", &["H".into()], "body");
+    let c = llm_wiki_search::context_section_hash("T", &["H".into()], "other");
+    assert_eq!(a, b);
+    assert_ne!(a, c);
 }

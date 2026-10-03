@@ -847,7 +847,9 @@ dependencies = [
  "llm-wiki-core",
  "llm-wiki-storage",
  "rusqlite",
+ "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

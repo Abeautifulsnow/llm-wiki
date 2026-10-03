@@ -29,7 +29,7 @@ use llm_wiki_core::error::{Result, WikiError};
 use llm_wiki_core::ids::BuildId;
 use llm_wiki_core::plan::{estimate_tokens, KnowledgeBase, PlanAnchor};
 use llm_wiki_llm::structured;
-use llm_wiki_llm::LlmProvider;
+use llm_wiki_llm::{EmbeddingProvider, LlmProvider};
 use llm_wiki_storage::{
     insert_insight, load_knowledge_base, InsightCitation, InsightRecord, PageCitationRecord,
 };
@@ -59,14 +59,29 @@ struct RawAnswer {
     answer: String,
 }
 
+/// Hybrid retrieval inputs (§19.3 Vector layer): the embedding provider and
+/// model for query-time vector candidates. `None` = lexical-only.
+#[derive(Clone)]
+pub struct HybridContext<'a> {
+    pub provider: &'a Arc<dyn EmbeddingProvider>,
+    pub model: String,
+}
+
+/// Vector candidates taken per ask (top-K cosine over the embedded
+/// sections; the diversity budgets still apply downstream).
+const VECTOR_TOP_K: usize = 8;
+
 /// Runs one grounded ask. Returns `Ok(None)` when nothing is published.
-/// `write_back = false` verifies and prints without persisting (the dry mode).
+/// `write_back = false` verifies and prints without persisting (the dry
+/// mode). `hybrid` adds Vector-layer candidates (§19.3 RRF fusion) — without
+/// embed coverage it degrades to lexical-only with a warning.
 pub async fn run_ask(
     workspace_root: &Path,
     config: &Config,
     provider: Arc<dyn LlmProvider>,
     query: &str,
     write_back: bool,
+    hybrid: Option<HybridContext<'_>>,
 ) -> Result<Option<AskReport>> {
     let state_db = workspace_root.join(".llm-wiki").join("state.db");
     if !state_db.exists() {
@@ -88,7 +103,11 @@ pub async fn run_ask(
         max_tokens: config.analysis.max_input_tokens as u64,
         ..llm_wiki_search::ContextBudget::default()
     };
-    let assembled = llm_wiki_search::build_context(&conn, query, &context_budget)?;
+    let vector: Vec<llm_wiki_search::VectorCandidate> = match &hybrid {
+        None => Vec::new(),
+        Some(hybrid) => vector_candidates(&conn, hybrid, query).await?,
+    };
+    let assembled = llm_wiki_search::build_context(&conn, query, &context_budget, &vector)?;
     let hit_slugs: BTreeSet<&str> = assembled
         .chunks
         .iter()
@@ -220,6 +239,75 @@ fn load_generation_view_pages(
     build_id: &BuildId,
 ) -> Result<Vec<llm_wiki_storage::GenerationPageView>> {
     llm_wiki_storage::load_generation_view(conn, build_id)
+}
+
+/// Top-K cosine candidates over the embedded sections of the active
+/// generation. No coverage → empty (lexical-only), with a warning that says
+/// how to fix it.
+async fn vector_candidates(
+    conn: &rusqlite::Connection,
+    hybrid: &HybridContext<'_>,
+    query: &str,
+) -> Result<Vec<llm_wiki_search::VectorCandidate>> {
+    let sections = llm_wiki_search::active_context_sections(conn)?;
+    let hashes: Vec<String> = sections.iter().map(|s| s.text_hash.clone()).collect();
+    let stored = llm_wiki_storage::section_embeddings_by_hash(conn, &hybrid.model, &hashes)?;
+    if stored.is_empty() {
+        tracing::warn!(
+            model = %hybrid.model,
+            "no embeddings stored for this model; run `llm-wiki embed` for hybrid retrieval"
+        );
+        return Ok(Vec::new());
+    }
+    let query_vectors = hybrid
+        .provider
+        .embed(&hybrid.model, &[query.to_owned()])
+        .await
+        .map_err(WikiError::from)?;
+    let Some(query_vector) = query_vectors.first() else {
+        return Ok(Vec::new());
+    };
+    let mut scored: Vec<(f32, &str)> = sections
+        .iter()
+        .filter_map(|section| {
+            stored
+                .get(&section.text_hash)
+                .map(|vector| (cosine(query_vector, vector), section.text_hash.as_str()))
+        })
+        .collect();
+    scored.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.cmp(b.1))
+    });
+    Ok(scored
+        .into_iter()
+        .take(VECTOR_TOP_K)
+        .map(|(score, text_hash)| llm_wiki_search::VectorCandidate {
+            text_hash: text_hash.to_owned(),
+            score,
+        })
+        .collect())
+}
+
+/// Cosine similarity (vectors of different length score 0 — different
+/// embedding dimensions never mix).
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() {
+        return 0.0;
+    }
+    let (mut dot, mut norm_a, mut norm_b) = (0.0f32, 0.0f32, 0.0f32);
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        norm_a += x * x;
+        norm_b += y * y;
+    }
+    let denominator = norm_a.sqrt() * norm_b.sqrt();
+    if denominator == 0.0 {
+        0.0
+    } else {
+        dot / denominator
+    }
 }
 
 fn context_payload(

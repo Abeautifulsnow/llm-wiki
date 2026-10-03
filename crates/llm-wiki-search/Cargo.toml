@@ -8,6 +8,8 @@ repository.workspace = true
 
 [dependencies]
 llm-wiki-core = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
 llm-wiki-storage = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }

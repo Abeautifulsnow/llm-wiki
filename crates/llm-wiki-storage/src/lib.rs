@@ -10,6 +10,7 @@ pub mod builds;
 pub mod cache;
 pub mod connection;
 pub mod decisions;
+pub mod embeddings;
 pub mod graph;
 pub mod insights;
 pub mod knowledge;
@@ -39,6 +40,7 @@ pub use decisions::{
     OUTCOME_REPLAN_EXECUTED, OUTCOME_REPLAN_REQUIRED, TRIGGER_FINGERPRINT_CHANGED,
     TRIGGER_PAGE_EMPTIED, TRIGGER_STRUCTURAL_CHANGE, TRIGGER_UNMAPPABLE_NODE,
 };
+pub use embeddings::{insert_section_embeddings, section_embeddings_by_hash};
 pub use graph::{
     ensure_graph_matches_active, graph_expand, graph_expand_from_page, page_node_id, rebuild_graph,
     GraphNeighbor, GraphStats, NeighborDirection, EXPAND_MAX_NODES, NODE_TYPE_CONCEPT,

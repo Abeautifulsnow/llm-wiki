@@ -69,6 +69,25 @@ enum Command {
         /// hand-modified).
         #[arg(long)]
         write_back: bool,
+        /// Add Vector-layer candidates to the retrieval fusion (§19.3).
+        /// Requires `llm-wiki embed` coverage; degrades to lexical-only
+        /// with a warning when absent.
+        #[arg(long)]
+        hybrid: bool,
+        /// Embedding model for --hybrid (falls back to
+        /// $LLM_WIKI_EMBEDDING_MODEL).
+        #[arg(long)]
+        embedding_model: Option<String>,
+    },
+    /// Backfill section embeddings for the ACTIVE generation (§19.3 Vector
+    /// layer). Incremental: fully-covered generations issue zero requests.
+    Embed {
+        /// Embedding model (falls back to $LLM_WIKI_EMBEDDING_MODEL).
+        #[arg(long)]
+        model: Option<String>,
+        /// Sections per embedding request.
+        #[arg(long, default_value_t = 16)]
+        batch: usize,
     },
     /// Lint the currently published generation (PRD §36): citation integrity,
     /// links, orphans, unsupported sections, duplicates, hand edits.
@@ -112,7 +131,13 @@ fn run(command: Command) -> Result<(), WikiError> {
         Command::Status => status(&workspace),
         Command::Search { query } => search(&workspace, &query),
         Command::Doctor => doctor(&workspace),
-        Command::Ask { query, write_back } => ask(&workspace, &query, write_back),
+        Command::Ask {
+            query,
+            write_back,
+            hybrid,
+            embedding_model,
+        } => ask(&workspace, &query, write_back, hybrid, embedding_model),
+        Command::Embed { model, batch } => embed(&workspace, model.as_deref(), batch),
         Command::Lint { semantic } => lint(&workspace, semantic),
     }
 }
@@ -549,17 +574,85 @@ fn warn_diagnostic(diagnostic: &ScanDiagnostic) {
     );
 }
 
+/// Resolves the embedding model: flag → $LLM_WIKI_EMBEDDING_MODEL → error.
+fn embedding_model(flag: Option<&str>) -> Result<String, WikiError> {
+    flag.map(str::to_owned)
+        .or_else(|| std::env::var("LLM_WIKI_EMBEDDING_MODEL").ok())
+        .filter(|model| !model.trim().is_empty())
+        .ok_or_else(|| {
+            WikiError::Config(
+                "no embedding model: pass --embedding-model <model> or set LLM_WIKI_EMBEDDING_MODEL"
+                    .into(),
+            )
+        })
+}
+
+/// Builds an embedding provider over the same endpoint family as the chat
+/// provider (base URL + API key env come from `[llm]` config).
+fn build_embedding_provider(
+    llm: &LlmConfig,
+) -> Result<Arc<dyn llm_wiki_llm::EmbeddingProvider>, WikiError> {
+    if llm.model.trim().is_empty() {
+        return Err(WikiError::Config(
+            "llm.model must be set in .llm-wiki/config.toml before building".into(),
+        ));
+    }
+    match llm.provider.as_str() {
+        "openai-compatible" => {
+            let provider = OpenAiCompatibleProvider::new(
+                &llm.base_url,
+                &llm.model,
+                &llm.api_key_env,
+                llm.timeout_seconds,
+                2,
+            )
+            .map_err(|e| WikiError::Llm(e.to_string()))?;
+            Ok(Arc::new(provider))
+        }
+        other => Err(WikiError::Config(format!(
+            "unsupported llm.provider '{other}' (supported: openai-compatible)"
+        ))),
+    }
+}
+
 /// `llm-wiki ask` (audit FIX-020): grounded answer + verified citations;
-/// `--write-back` persists the insight with provenance.
-fn ask(workspace: &Path, query: &str, write_back: bool) -> Result<(), WikiError> {
+/// `--write-back` persists the insight with provenance; `--hybrid` adds
+/// Vector-layer candidates (§19.3).
+fn ask(
+    workspace: &Path,
+    query: &str,
+    write_back: bool,
+    hybrid: bool,
+    embedding_model_flag: Option<String>,
+) -> Result<(), WikiError> {
     let config = load_config(workspace)?;
     let provider = build_provider(&config.llm)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| WikiError::Llm(format!("cannot start async runtime: {e}")))?;
+    // Owned bindings so the HybridContext borrow outlives the call.
+    let embedding_provider = if hybrid {
+        Some(build_embedding_provider(&config.llm)?)
+    } else {
+        None
+    };
+    let hybrid_context = if hybrid {
+        let model = embedding_model(embedding_model_flag.as_deref())?;
+        Some(llm_wiki_compiler::HybridContext {
+            provider: embedding_provider.as_ref().expect("checked above"),
+            model,
+        })
+    } else {
+        None
+    };
     let Some(report) = runtime.block_on(llm_wiki_compiler::run_ask(
-        workspace, &config, provider, query, write_back,
+        workspace,
+        &config,
+        provider,
+        query,
+        write_back,
+        hybrid_context,
     ))?
     else {
         println!("nothing published — build the wiki first");
@@ -576,6 +669,33 @@ fn ask(workspace: &Path, query: &str, write_back: bool) -> Result<(), WikiError>
         Some(id) => println!("insight {id} written back"),
         None => println!("(dry run — pass --write-back to persist this insight)"),
     }
+    Ok(())
+}
+
+/// `llm-wiki embed` (§19.3): incremental embedding backfill.
+fn embed(workspace: &Path, model: Option<&str>, batch: usize) -> Result<(), WikiError> {
+    let config = load_config(workspace)?;
+    let model = embedding_model(model)?;
+    let embedding_provider = build_embedding_provider(&config.llm)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| WikiError::Llm(format!("cannot start async runtime: {e}")))?;
+    let Some(report) = runtime.block_on(llm_wiki_compiler::run_embed(
+        workspace,
+        &config,
+        embedding_provider,
+        &model,
+        batch,
+    ))?
+    else {
+        println!("nothing published — build the wiki first");
+        return Ok(());
+    };
+    println!(
+        "embeddings [{}]: {} section(s), {} already covered, {} embedded",
+        report.model, report.total_sections, report.covered_before, report.embedded
+    );
     Ok(())
 }
 
