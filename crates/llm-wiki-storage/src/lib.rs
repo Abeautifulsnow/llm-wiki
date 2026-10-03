@@ -11,6 +11,7 @@ pub mod cache;
 pub mod connection;
 pub mod decisions;
 pub mod graph;
+pub mod insights;
 pub mod knowledge;
 pub mod migrations;
 pub mod page_id_map;
@@ -43,6 +44,7 @@ pub use graph::{
     GraphNeighbor, GraphStats, NeighborDirection, EXPAND_MAX_NODES, NODE_TYPE_CONCEPT,
     NODE_TYPE_ENTITY, NODE_TYPE_PAGE, RELATION_LINKS_TO,
 };
+pub use insights::{insert_insight, list_insights, InsightCitation, InsightRecord};
 pub use knowledge::{list_active_relation_pairs, load_knowledge_base, load_plan_input};
 pub use page_id_map::{
     insert_page_id_maps, list_page_id_maps_by_predecessor, list_page_id_maps_by_successor,

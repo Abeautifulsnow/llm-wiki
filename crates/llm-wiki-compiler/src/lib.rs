@@ -6,6 +6,7 @@
 //! core/llm/markdown/storage — never the reverse.
 
 pub mod analysis;
+pub mod ask;
 pub mod build;
 pub mod cache;
 pub mod changeset;
@@ -22,6 +23,7 @@ pub mod semantic_lint;
 pub use analysis::{
     AnalysisOutcome, AnalysisSection, AnalyzedDocument, DocumentAnalyzer, VerifiedRelation,
 };
+pub use ask::{run_ask, AskReport};
 pub use build::{run_build, BuildReport, IncrementalSummary};
 pub use cache::{CacheContext, CacheStats, LlmCache, StageCache};
 pub use changeset::{

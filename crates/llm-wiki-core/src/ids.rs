@@ -113,6 +113,12 @@ opaque_id!(
     "cit"
 );
 opaque_id!(
+    /// Verified insight identity (audit FIX-020 write-back): one
+    /// query-derived, citation-verified synthesis persisted with provenance.
+    InsightId,
+    "ins"
+);
+opaque_id!(
     /// Build identity; also the immutable generation directory name (PRD §35).
     BuildId,
     "bld"

@@ -174,6 +174,7 @@ pub(crate) fn prepare_pipeline_env(
                     "wiki-semantic-lint".to_owned(),
                     "wiki-semantic-lint@1".to_owned(),
                 ),
+                ("wiki-ask".to_owned(), "wiki-ask@1".to_owned()),
             ]),
             schema_version: SCHEMA_VERSION.to_owned(),
             parser_version: llm_wiki_markdown::PARSER_VERSION.to_owned(),

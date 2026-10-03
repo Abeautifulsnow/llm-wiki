@@ -58,6 +58,18 @@ enum Command {
     },
     /// Check configuration, filesystem layout, state db and provider env.
     Doctor,
+    /// Ask the published wiki a question: retrieval-grounded synthesis with
+    /// verified citations (audit FIX-020). Every cited claim must exist in
+    /// the retrieved context; citations expand from stored anchors.
+    Ask {
+        /// The question (中文、English or mixed).
+        query: String,
+        /// Persist the verified insight with provenance into the
+        /// `wiki_insights` layer (the generated wiki itself is never
+        /// hand-modified).
+        #[arg(long)]
+        write_back: bool,
+    },
     /// Lint the currently published generation (PRD §36): citation integrity,
     /// links, orphans, unsupported sections, duplicates, hand edits.
     Lint {
@@ -100,6 +112,7 @@ fn run(command: Command) -> Result<(), WikiError> {
         Command::Status => status(&workspace),
         Command::Search { query } => search(&workspace, &query),
         Command::Doctor => doctor(&workspace),
+        Command::Ask { query, write_back } => ask(&workspace, &query, write_back),
         Command::Lint { semantic } => lint(&workspace, semantic),
     }
 }
@@ -534,6 +547,36 @@ fn warn_diagnostic(diagnostic: &ScanDiagnostic) {
         "  ! {} {:?}: {}",
         diagnostic.rel_path, diagnostic.kind, diagnostic.message
     );
+}
+
+/// `llm-wiki ask` (audit FIX-020): grounded answer + verified citations;
+/// `--write-back` persists the insight with provenance.
+fn ask(workspace: &Path, query: &str, write_back: bool) -> Result<(), WikiError> {
+    let config = load_config(workspace)?;
+    let provider = build_provider(&config.llm)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| WikiError::Llm(format!("cannot start async runtime: {e}")))?;
+    let Some(report) = runtime.block_on(llm_wiki_compiler::run_ask(
+        workspace, &config, provider, query, write_back,
+    ))?
+    else {
+        println!("nothing published — build the wiki first");
+        return Ok(());
+    };
+    println!("{}", report.answer);
+    if !report.sources.is_empty() {
+        println!("\nsources:");
+        for source in &report.sources {
+            println!("  - {source}");
+        }
+    }
+    match &report.insight_id {
+        Some(id) => println!("insight {id} written back"),
+        None => println!("(dry run — pass --write-back to persist this insight)"),
+    }
+    Ok(())
 }
 
 /// `llm-wiki lint` (PRD §29/§36): thin transport over

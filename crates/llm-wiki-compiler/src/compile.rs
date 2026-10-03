@@ -623,7 +623,7 @@ fn parse_attr(text: &str, key: &str) -> Option<String> {
 /// per stored evidence anchor (PRD §16). Returns the expanded body, the
 /// citation records (body order) and the distinct source paths (first-use
 /// order) for the frontmatter.
-fn expand_citations(
+pub(crate) fn expand_citations(
     body: &str,
     anchors_by_claim: &BTreeMap<String, Vec<&PlanAnchor>>,
 ) -> (String, Vec<PageCitationRecord>, Vec<String>) {

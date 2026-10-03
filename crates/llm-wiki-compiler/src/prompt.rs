@@ -11,6 +11,7 @@ const EMBEDDED_DOCUMENT_ANALYSIS: &str = include_str!("../../../prompts/document
 const EMBEDDED_WIKI_PLANNING: &str = include_str!("../../../prompts/wiki-planning.md");
 const EMBEDDED_WIKI_COMPILATION: &str = include_str!("../../../prompts/wiki-compilation.md");
 const EMBEDDED_WIKI_SEMANTIC_LINT: &str = include_str!("../../../prompts/wiki-semantic-lint.md");
+const EMBEDDED_WIKI_ASK: &str = include_str!("../../../prompts/wiki-ask.md");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptDocument {
@@ -74,6 +75,7 @@ impl PromptDocument {
                 "wiki-planning" => Self::parse(EMBEDDED_WIKI_PLANNING),
                 "wiki-compilation" => Self::parse(EMBEDDED_WIKI_COMPILATION),
                 "wiki-semantic-lint" => Self::parse(EMBEDDED_WIKI_SEMANTIC_LINT),
+                "wiki-ask" => Self::parse(EMBEDDED_WIKI_ASK),
                 other => Err(WikiError::Config(format!(
                     "unknown prompt '{other}' and no file override provided"
                 ))),

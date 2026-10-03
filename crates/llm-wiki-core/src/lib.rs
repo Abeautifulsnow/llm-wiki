@@ -12,6 +12,6 @@ pub mod plan;
 
 pub use error::{Result, WikiError};
 pub use ids::{
-    AnalysisId, BuildId, CitationId, ClaimRowId, KnowledgeNodeId, LinkRowId, RejectedClaimId,
-    RelationRowId, SectionId, SourceId, SourceLocatorKey, WikiPageId,
+    AnalysisId, BuildId, CitationId, ClaimRowId, InsightId, KnowledgeNodeId, LinkRowId,
+    RejectedClaimId, RelationRowId, SectionId, SourceId, SourceLocatorKey, WikiPageId,
 };
