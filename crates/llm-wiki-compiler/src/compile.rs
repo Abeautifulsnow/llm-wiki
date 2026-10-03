@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
+use llm_wiki_core::cancel::CancelFlag;
 use llm_wiki_core::error::{Result, WikiError};
 use llm_wiki_core::hash::sha256_hex;
 use llm_wiki_core::ids::{BuildId, KnowledgeNodeId, WikiPageId};
@@ -101,6 +102,8 @@ pub struct WikiCompiler {
     max_concurrency: usize,
     /// §28 stage cache; only grounded, citation-valid responses are stored.
     cache: Option<Arc<dyn StageCache>>,
+    /// §31 cooperative cancellation: checked before each page spawn.
+    cancel: Option<CancelFlag>,
 }
 
 impl WikiCompiler {
@@ -116,6 +119,7 @@ impl WikiCompiler {
             config,
             max_concurrency,
             cache: None,
+            cancel: None,
         }
     }
 
@@ -124,6 +128,12 @@ impl WikiCompiler {
     /// resolvable + links resolvable, PRD §15/§28).
     pub fn with_cache(mut self, cache: Arc<dyn StageCache>) -> Self {
         self.cache = Some(cache);
+        self
+    }
+
+    /// §31 cooperative cancellation (see [`CancelFlag`]).
+    pub fn with_cancel(mut self, cancel: Option<CancelFlag>) -> Self {
+        self.cancel = cancel;
         self
     }
 
@@ -181,6 +191,10 @@ impl WikiCompiler {
                 if !page_ids.contains(&page.id) {
                     next += 1;
                     continue; // carried over verbatim by the caller (PRD §19)
+                }
+                // §31 cooperative cancellation: no NEW page work.
+                if let Some(cancel) = &self.cancel {
+                    cancel.check()?;
                 }
                 let title_to_id = Arc::clone(&title_to_id);
                 let plan = Arc::clone(&plan);

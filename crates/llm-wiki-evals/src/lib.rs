@@ -9,6 +9,7 @@
 
 pub mod fixtures;
 pub mod gates;
+pub mod retrieval;
 pub mod scoring;
 pub mod stages;
 
@@ -16,7 +17,9 @@ pub use fixtures::{
     load_fixtures, Dataset, ExpectedPage, ExpectedPages, Fact, FixtureError, MIN_CJK, MIN_DOCS,
     MIN_MDX, MIN_QUESTIONS,
 };
+pub use fixtures::{load_questions, RetrievalQuery};
 pub use gates::{evaluate_gates, thresholds, GateFailure, GateMetrics, GateReport, SourceIndex};
+pub use retrieval::{aggregate, score_query, RetrievalQuestionResult, RetrievalReport};
 pub use scoring::{
     audit_citations, coverage, cross_document_synthesis, generation_manifest, hallucination,
     CitationAudit, Coverage, Hallucination, SynthesisResult,

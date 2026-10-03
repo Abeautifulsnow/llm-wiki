@@ -28,6 +28,7 @@ llm-wiki-storage = { path = "crates/llm-wiki-storage" }
 llm-wiki-compiler = { path = "crates/llm-wiki-compiler" }
 llm-wiki-evals = { path = "crates/llm-wiki-evals" }
 llm-wiki-search = { path = "crates/llm-wiki-search" }
+llm-wiki-server = { path = "crates/llm-wiki-server" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -43,7 +44,9 @@ walkdir = "2"
 pulldown-cmark = { version = "0.13", default-features = false }
 rusqlite = { version = "0.32", features = ["bundled"] }
 async-trait = "0.1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "signal"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
+tower = { version = "0.5", features = ["util"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 clap = { version = "4", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

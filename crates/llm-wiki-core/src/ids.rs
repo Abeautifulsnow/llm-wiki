@@ -124,6 +124,12 @@ opaque_id!(
     "bld"
 );
 opaque_id!(
+    /// Server job identity (PRD §30/§31): one queued/running/terminal build
+    /// job, persisted across server restarts.
+    JobId,
+    "job"
+);
+opaque_id!(
     /// Stage-one analysis record identity (PRD §11).
     AnalysisId,
     "an"

@@ -243,30 +243,73 @@ fn load_generation_view_pages(
 
 /// Top-K cosine candidates over the embedded sections of the active
 /// generation. No coverage → empty (lexical-only), with a warning that says
-/// how to fix it.
-async fn vector_candidates(
+/// how to fix it. Shared by `ask` and the server's `/v1/context` endpoint.
+///
+/// NOTE: the returned future is `!Send` (it holds the connection across the
+/// embed call); HTTP handlers should compose [`embed_query_vector`] +
+/// [`top_cosine_candidates`] instead.
+pub async fn vector_candidates(
     conn: &rusqlite::Connection,
     hybrid: &HybridContext<'_>,
     query: &str,
 ) -> Result<Vec<llm_wiki_search::VectorCandidate>> {
-    let sections = llm_wiki_search::active_context_sections(conn)?;
-    let hashes: Vec<String> = sections.iter().map(|s| s.text_hash.clone()).collect();
-    let stored = llm_wiki_storage::section_embeddings_by_hash(conn, &hybrid.model, &hashes)?;
-    if stored.is_empty() {
+    // Coverage first: with zero stored vectors the query embedding is never
+    // spent — degraded lexical-only, never failed (§19.3).
+    if !embedding_coverage(conn, &hybrid.model)? {
         tracing::warn!(
             model = %hybrid.model,
             "no embeddings stored for this model; run `llm-wiki embed` for hybrid retrieval"
         );
         return Ok(Vec::new());
     }
-    let query_vectors = hybrid
+    let query_vector = embed_query_vector(hybrid, query).await?;
+    top_cosine_candidates(conn, &hybrid.model, query_vector.as_deref())
+}
+
+/// Whether any stored section embeddings exist for `model` over the active
+/// generation — the cheap pre-check that keeps uncovered workspaces from
+/// spending a query embedding.
+pub fn embedding_coverage(conn: &rusqlite::Connection, model: &str) -> Result<bool> {
+    let sections = llm_wiki_search::active_context_sections(conn)?;
+    let hashes: Vec<String> = sections.iter().map(|s| s.text_hash.clone()).collect();
+    Ok(!llm_wiki_storage::section_embeddings_by_hash(conn, model, &hashes)?.is_empty())
+}
+
+/// The query side of [`vector_candidates`]: one embedding for the query.
+/// `None` when the provider returns no vector.
+pub async fn embed_query_vector(
+    hybrid: &HybridContext<'_>,
+    query: &str,
+) -> Result<Option<Vec<f32>>> {
+    let vectors = hybrid
         .provider
         .embed(&hybrid.model, &[query.to_owned()])
         .await
         .map_err(WikiError::from)?;
-    let Some(query_vector) = query_vectors.first() else {
+    Ok(vectors.first().cloned())
+}
+
+/// The storage side of [`vector_candidates`] — synchronous and
+/// spawn_blocking-friendly: section hashes + stored embeddings + cosine over
+/// the ACTIVE generation's embedded sections (top-K, deterministic).
+pub fn top_cosine_candidates(
+    conn: &rusqlite::Connection,
+    model: &str,
+    query_vector: Option<&[f32]>,
+) -> Result<Vec<llm_wiki_search::VectorCandidate>> {
+    let Some(query_vector) = query_vector else {
         return Ok(Vec::new());
     };
+    let sections = llm_wiki_search::active_context_sections(conn)?;
+    let hashes: Vec<String> = sections.iter().map(|s| s.text_hash.clone()).collect();
+    let stored = llm_wiki_storage::section_embeddings_by_hash(conn, model, &hashes)?;
+    if stored.is_empty() {
+        tracing::warn!(
+            model,
+            "no embeddings stored for this model; run `llm-wiki embed` for hybrid retrieval"
+        );
+        return Ok(Vec::new());
+    }
     let mut scored: Vec<(f32, &str)> = sections
         .iter()
         .filter_map(|section| {

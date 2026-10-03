@@ -396,6 +396,44 @@ pub fn load_expected_pages(evals_dir: &Path) -> Result<ExpectedPages, FixtureErr
     Ok(ExpectedPages { pages })
 }
 
+/// One fixture question: verbatim text + the corpus docs that MUST back it.
+#[derive(Debug, Clone)]
+pub struct RetrievalQuery {
+    pub id: String,
+    pub question: String,
+    pub expected_sources: Vec<String>,
+}
+
+/// Loads `evals/questions.yaml` (id / question / expected_sources).
+pub fn load_questions(evals_dir: &Path) -> Result<Vec<RetrievalQuery>, FixtureError> {
+    let path = evals_dir.join("questions.yaml");
+    let text = std::fs::read_to_string(&path).map_err(|source| FixtureError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    let root = parse_yaml(&text, &path)?;
+    let mut queries = Vec::new();
+    for question in root.get("questions", &path)?.as_seq(&path)? {
+        let id = question.get("id", &path)?.as_scalar(&path)?.to_owned();
+        let question_text = question
+            .get("question", &path)?
+            .as_scalar(&path)?
+            .to_owned();
+        let expected_sources = question
+            .get("expected_sources", &path)?
+            .as_seq(&path)?
+            .iter()
+            .map(|s| s.as_scalar(&path).map(str::to_owned))
+            .collect::<Result<Vec<_>, _>>()?;
+        queries.push(RetrievalQuery {
+            id,
+            question: question_text,
+            expected_sources,
+        });
+    }
+    Ok(queries)
+}
+
 /// Loads both fixtures plus `questions.yaml`, enforcing all minimums.
 pub fn load_fixtures(evals_dir: &Path) -> Result<(Dataset, ExpectedPages), FixtureError> {
     let dataset = load_dataset(evals_dir)?;

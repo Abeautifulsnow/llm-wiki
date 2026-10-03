@@ -53,6 +53,12 @@ pub enum WikiError {
     #[error("lint found {errors} error(s) and {warnings} warning(s)")]
     Lint { errors: u32, warnings: u32 },
 
+    /// Cooperative cancellation (PRD §31): stop starting new LLM requests and
+    /// abandon the unpublished generation. The previous generation stays
+    /// visible.
+    #[error("cancelled")]
+    Cancelled,
+
     #[error("config error: {0}")]
     Config(String),
 
@@ -76,6 +82,7 @@ impl WikiError {
             WikiError::BudgetExceeded(_) => 9,
             WikiError::PublishRecovery(_) => 10,
             WikiError::Lint { .. } => 11,
+            WikiError::Cancelled => 12,
         }
     }
 }

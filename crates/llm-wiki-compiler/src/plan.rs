@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use llm_wiki_core::cancel::CancelFlag;
 use llm_wiki_core::error::{Result, WikiError};
 use llm_wiki_core::hash::sha256_hex;
 use llm_wiki_core::ids::{KnowledgeNodeId, SourceId, WikiPageId};
@@ -98,6 +99,9 @@ pub struct WikiPlanner {
     /// cache and plan persistence stay intact, so a `replan --dry-run` warms
     /// the stage cache and the follow-up execute pays for planning once.
     force_fresh: bool,
+    /// §31 cooperative cancellation: checked before each cluster spawn and
+    /// reconcile round.
+    cancel: Option<CancelFlag>,
 }
 
 impl WikiPlanner {
@@ -113,6 +117,7 @@ impl WikiPlanner {
             cache: None,
             plan_identity: None,
             force_fresh: false,
+            cancel: None,
         }
     }
 
@@ -131,6 +136,19 @@ impl WikiPlanner {
     pub fn with_force_fresh(mut self, force_fresh: bool) -> Self {
         self.force_fresh = force_fresh;
         self
+    }
+
+    /// §31 cooperative cancellation (see [`CancelFlag`]).
+    pub fn with_cancel(mut self, cancel: Option<CancelFlag>) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
+    fn checkpoint(&self) -> Result<()> {
+        if let Some(cancel) = &self.cancel {
+            cancel.check()?;
+        }
+        Ok(())
     }
 
     pub async fn plan(&self, base: &KnowledgeBase, registry_revision: u64) -> Result<PlanOutcome> {
@@ -219,6 +237,8 @@ impl WikiPlanner {
         let mut join_set = tokio::task::JoinSet::new();
         while next < clusters.len() || !join_set.is_empty() {
             while next < clusters.len() && join_set.len() < concurrency {
+                // §31 cooperative cancellation: no NEW cluster work.
+                self.checkpoint()?;
                 let index = next;
                 let task = task.clone();
                 let base = Arc::clone(&base);
@@ -381,6 +401,9 @@ impl WikiPlanner {
                     "reconciliation did not converge after {MAX_RECONCILE_ROUNDS} rounds; the model keeps returning one page per proposal — narrow the corpus or raise max_plan_input_tokens (PRD §14 forbids truncation)"
                 )));
             }
+            // §31 cooperative cancellation: stop before the next round's
+            // reconcile request(s).
+            self.checkpoint()?;
             let reconcile_json = reconcile_payload(
                 &round_proposals,
                 &round_keys_summary,

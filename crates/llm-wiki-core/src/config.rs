@@ -121,6 +121,11 @@ pub struct SearchConfig {
     /// config promise a capability that does not exist.
     #[serde(default = "default_true")]
     pub graph: bool,
+    /// Rerank strategy applied after rank fusion (PRD §50 V0.5). `"none"`
+    /// keeps the deterministic fused order; other values are config errors
+    /// until a concrete strategy ships.
+    #[serde(default = "default_rerank")]
+    pub rerank: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,6 +147,27 @@ pub struct ServerConfig {
     pub remote_enabled: bool,
     #[serde(default = "default_auth_token_env")]
     pub auth_token_env: String,
+    /// Maximum jobs waiting in the queue before new build requests are
+    /// rejected (PRD §30: job queue cap). Running jobs don't count.
+    #[serde(default = "default_max_queued_jobs")]
+    pub max_queued_jobs: u32,
+    /// Request body size cap in bytes (PRD §30: request size limit).
+    #[serde(default = "default_max_body_bytes")]
+    pub max_body_bytes: u32,
+    /// Per-caller request budget per minute in remote mode (PRD §30:
+    /// per-caller rate limits). 0 disables the limiter.
+    #[serde(default = "default_rate_limit_per_minute")]
+    pub rate_limit_per_minute: u32,
+}
+
+fn default_max_queued_jobs() -> u32 {
+    8
+}
+fn default_max_body_bytes() -> u32 {
+    1_048_576
+}
+fn default_rate_limit_per_minute() -> u32 {
+    120
 }
 
 fn default_project_name() -> String {
@@ -213,6 +239,9 @@ fn default_bind() -> String {
 fn default_auth_token_env() -> String {
     "LLM_WIKI_SERVER_TOKEN".to_owned()
 }
+fn default_rerank() -> String {
+    "none".to_owned()
+}
 
 impl Default for ProjectConfig {
     fn default() -> Self {
@@ -275,6 +304,7 @@ impl Default for SearchConfig {
             full_text: true,
             vector: false,
             graph: true,
+            rerank: default_rerank(),
         }
     }
 }
@@ -294,6 +324,9 @@ impl Default for ServerConfig {
             bind: default_bind(),
             remote_enabled: false,
             auth_token_env: default_auth_token_env(),
+            max_queued_jobs: default_max_queued_jobs(),
+            max_body_bytes: default_max_body_bytes(),
+            rate_limit_per_minute: default_rate_limit_per_minute(),
         }
     }
 }

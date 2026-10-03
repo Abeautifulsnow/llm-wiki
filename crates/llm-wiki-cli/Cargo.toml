@@ -15,6 +15,7 @@ llm-wiki-core = { workspace = true }
 llm-wiki-compiler = { workspace = true }
 llm-wiki-llm = { workspace = true }
 llm-wiki-search = { workspace = true }
+llm-wiki-server = { workspace = true }
 llm-wiki-source = { workspace = true }
 llm-wiki-storage = { workspace = true }
 clap = { workspace = true }

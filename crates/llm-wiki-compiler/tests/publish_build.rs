@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use rusqlite::params;
@@ -20,9 +21,9 @@ use llm_wiki_compiler::{
 use llm_wiki_core::error::WikiError;
 use llm_wiki_core::hash::sha256_hex;
 use llm_wiki_core::ids::BuildId;
-use llm_wiki_llm::{FakeLlmProvider, LlmError, LlmProvider, LlmRequest};
+use llm_wiki_llm::{FakeLlmProvider, LlmError, LlmProvider, LlmRequest, LlmResponse};
 use llm_wiki_storage::{
-    activate_build, get_active_build_id, load_generation_view, open, open_in_memory,
+    activate_build, get_active_build_id, latest_build, load_generation_view, open, open_in_memory,
     persist_generation, start_build, WikiPageRecord,
 };
 
@@ -1148,5 +1149,162 @@ Events for {name} are delivered at least once and handlers stay idempotent.
     assert!(
         observed_peak >= 2,
         "no overlap observed (peak {observed_peak}) — the test cannot prove concurrency is bounded, only serial"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cooperative cancellation (PRD §31) + fast-path snapshot guard
+// ---------------------------------------------------------------------------
+
+/// Wraps another provider and sets the cancel flag once `after_n` requests
+/// have gone through — deterministic mid-ANALYZING cancellation.
+struct CancellingProvider {
+    inner: Arc<dyn LlmProvider>,
+    cancel: llm_wiki_core::CancelFlag,
+    requests: std::sync::atomic::AtomicU64,
+    after_n: u64,
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for CancellingProvider {
+    fn model(&self) -> &str {
+        self.inner.model()
+    }
+
+    fn provider_name(&self) -> &str {
+        self.inner.provider_name()
+    }
+
+    async fn generate(&self, request: LlmRequest) -> Result<LlmResponse, LlmError> {
+        let n = self.requests.fetch_add(1, Ordering::SeqCst);
+        if n + 1 >= self.after_n {
+            self.cancel.cancel();
+        }
+        self.inner.generate(request).await
+    }
+}
+
+/// A cancelled build terminalizes CANCELLED, publishes nothing and leaves the
+/// previous generation visible (PRD §31).
+#[tokio::test]
+async fn cancelled_build_publishes_nothing_and_keeps_previous_generation() {
+    let workspace = fixture_workspace("cancel-mid");
+    let (conn, _first_report) = {
+        let conn = open(&workspace.join(".llm-wiki").join("state.db")).unwrap();
+        let config = llm_wiki_core::config::Config::load(&workspace).unwrap();
+        let report = llm_wiki_compiler::run_build(&workspace, &config, pipeline_llm())
+            .await
+            .unwrap();
+        (conn, report)
+    };
+    let first_pointer = pointer_of(&workspace.join("wiki")).expect("first build published");
+
+    let cancel = llm_wiki_core::CancelFlag::new();
+    let provider = Arc::new(CancellingProvider {
+        inner: pipeline_llm(),
+        cancel: cancel.clone(),
+        requests: std::sync::atomic::AtomicU64::new(0),
+        after_n: 1,
+    });
+    // Touch a source so the pipeline actually re-enters ANALYZING instead of
+    // taking the no-change fast path.
+    std::fs::write(
+        workspace.join("docs").join("guide").join("runtime.md"),
+        "# Runtime\n\nThe scheduler now retries failed tasks up to five times.\n\n## Delivery\n\nEvents are delivered at least once and handlers must stay idempotent.\n",
+    )
+    .unwrap();
+
+    let config = llm_wiki_core::config::Config::load(&workspace).unwrap();
+    let outcome = llm_wiki_compiler::run_build_with_options(
+        &workspace,
+        &config,
+        provider,
+        llm_wiki_compiler::BuildOptions {
+            cancel: Some(cancel),
+            on_progress: None,
+        },
+    )
+    .await;
+    assert!(
+        matches!(outcome, Err(llm_wiki_core::error::WikiError::Cancelled)),
+        "expected Cancelled, got {outcome:?}"
+    );
+
+    // The build row is CANCELLED and the pointer still names the first build.
+    let latest = latest_build(&conn).unwrap().unwrap();
+    assert_eq!(latest.status, "CANCELLED");
+    assert_eq!(
+        pointer_of(&workspace.join("wiki")).as_deref(),
+        Some(first_pointer.as_str())
+    );
+}
+
+/// The fast-path snapshot guard: a cancelled (or failed) build may have
+/// upserted the newer source hashes before dying — the registry diff alone
+/// then reports "no changes" and the naive fast path would serve the STALE
+/// generation forever. The next healthy build must rebuild.
+#[tokio::test]
+async fn build_after_cancel_rebuilds_instead_of_serving_a_stale_generation() {
+    let workspace = fixture_workspace("cancel-stale");
+    let config = llm_wiki_core::config::Config::load(&workspace).unwrap();
+    let first = llm_wiki_compiler::run_build(&workspace, &config, pipeline_llm())
+        .await
+        .unwrap();
+
+    // Modify a source, then let a build cancel mid-ANALYZING (after the
+    // registry upsert poisoned the content hashes).
+    std::fs::write(
+        workspace.join("docs").join("guide").join("runtime.md"),
+        "# Runtime\n\nThe scheduler now retries failed tasks up to five times.\n\n## Delivery\n\nEvents are delivered at least once and handlers must stay idempotent.\n",
+    )
+    .unwrap();
+    let cancel = llm_wiki_core::CancelFlag::new();
+    let cancelling = Arc::new(CancellingProvider {
+        inner: pipeline_llm(),
+        cancel: cancel.clone(),
+        requests: std::sync::atomic::AtomicU64::new(0),
+        after_n: 1,
+    });
+    let outcome = llm_wiki_compiler::run_build_with_options(
+        &workspace,
+        &config,
+        cancelling,
+        llm_wiki_compiler::BuildOptions {
+            cancel: Some(cancel),
+            on_progress: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        outcome,
+        Err(llm_wiki_core::error::WikiError::Cancelled)
+    ));
+
+    // Healthy retry: must NOT fast-path back to the stale first generation.
+    let retry = llm_wiki_compiler::run_build(&workspace, &config, pipeline_llm())
+        .await
+        .unwrap();
+    assert_ne!(
+        retry.build_id, first.build_id,
+        "the retry republished a fresh generation"
+    );
+    let pointer = read_current_pointer(&PublishPaths::new(&workspace.join("wiki")))
+        .unwrap()
+        .expect("retry published");
+    assert_eq!(pointer.build_id, retry.build_id.as_str());
+    // The republished knowledge carries the NEW source content: an ACTIVE
+    // claim states the modified sentence (the stale "three times" claim was
+    // retired by the retry's re-analysis).
+    let conn = open(&workspace.join(".llm-wiki").join("state.db")).unwrap();
+    let fresh_claims: u32 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM claims WHERE statement LIKE '%five times%' AND status = 'active'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        fresh_claims >= 1,
+        "the modified source was re-analyzed and republished"
     );
 }

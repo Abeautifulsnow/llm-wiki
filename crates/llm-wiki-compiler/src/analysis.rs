@@ -22,6 +22,7 @@ use llm_wiki_core::analysis::{
     ClaimCandidate, ConceptCandidate, DocumentAnalysis, EntityCandidate, RejectedClaim,
     RejectedRelation, RelationCandidate, ValidationIssue,
 };
+use llm_wiki_core::cancel::CancelFlag;
 use llm_wiki_core::error::{Result, WikiError};
 use llm_wiki_core::hash::sha256_hex;
 use llm_wiki_core::ids::{BuildId, SectionId, SourceId};
@@ -79,6 +80,7 @@ struct UnitTask {
     max_rejected_claim_ratio: f32,
     max_output_tokens: u32,
     cache: Option<Arc<dyn StageCache>>,
+    cancel: Option<CancelFlag>,
 }
 
 pub struct DocumentAnalyzer {
@@ -96,6 +98,9 @@ pub struct DocumentAnalyzer {
     units_semaphore: Arc<tokio::sync::Semaphore>,
     /// §28 stage cache; only validated unit responses are stored.
     cache: Option<Arc<dyn StageCache>>,
+    /// §31 cooperative cancellation: queued units check the flag (after the
+    /// semaphore permit, before the LLM call) and return `Cancelled`.
+    cancel: Option<CancelFlag>,
 }
 
 impl DocumentAnalyzer {
@@ -115,6 +120,7 @@ impl DocumentAnalyzer {
             max_output_tokens,
             units_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrency.max(1) as usize)),
             cache: None,
+            cancel: None,
         }
     }
 
@@ -122,6 +128,12 @@ impl DocumentAnalyzer {
     /// happen only after the unit's schema+evidence validation succeeded.
     pub fn with_cache(mut self, cache: Arc<dyn StageCache>) -> Self {
         self.cache = Some(cache);
+        self
+    }
+
+    /// §31 cooperative cancellation (see [`CancelFlag`]).
+    pub fn with_cancel(mut self, cancel: Option<CancelFlag>) -> Self {
+        self.cancel = cancel;
         self
     }
 
@@ -155,7 +167,14 @@ impl DocumentAnalyzer {
             let task = self.unit_task();
             let build_id_owned = build_id.cloned();
             join_set.spawn(async move {
-                let outcome = task.analyze_unit(&unit, build_id_owned.as_ref()).await;
+                // §31 cooperative cancellation: queued units (holding a
+                // permit but not yet calling) stop here; the ≤max_concurrency
+                // in-flight requests finish naturally.
+                let outcome = if task.cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
+                    Err(WikiError::Cancelled)
+                } else {
+                    task.analyze_unit(&unit, build_id_owned.as_ref()).await
+                };
                 (order, outcome, permit)
             });
         }
@@ -208,6 +227,7 @@ impl DocumentAnalyzer {
             max_rejected_claim_ratio: self.max_rejected_claim_ratio,
             max_output_tokens: self.max_output_tokens,
             cache: self.cache.clone(),
+            cancel: self.cancel.clone(),
         }
     }
 }

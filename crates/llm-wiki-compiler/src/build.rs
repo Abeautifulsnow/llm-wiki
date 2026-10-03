@@ -22,6 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use llm_wiki_core::cancel::CancelFlag;
 use llm_wiki_core::config::{lexical_absolute, Config};
 use llm_wiki_core::error::{Result, WikiError};
 use llm_wiki_core::hash::sha256_hex;
@@ -32,13 +33,14 @@ use llm_wiki_llm::LlmProvider;
 use llm_wiki_markdown::parse_document;
 use llm_wiki_source::{ScanDiagnostic, ScanOutput, Scanner, SourceManifest};
 use llm_wiki_storage::{
-    apply_section_matches, finish_build, generation_stats, get_active_build_id,
-    insert_plan_decision, latest_completed_build, list_source_active_node_sections, list_sources,
-    load_active_sections, load_generation_pages, load_generation_view, load_knowledge_base,
-    load_plan_input, mark_removed, mark_stale_builds_interrupted, open, persist_generation,
-    retire_source_knowledge, start_build, update_build_status, upsert_sources_batch, BuildDraft,
-    GenerationPageView, GenerationStats, PlanDecision, SourceRecord, SourceUpsert, WikiPageRecord,
-    OUTCOME_FAST_PATH, OUTCOME_LOCAL_UPDATE, OUTCOME_REPLAN_REQUIRED, TRIGGER_FINGERPRINT_CHANGED,
+    apply_section_matches, build_snapshot_hash, finish_build, generation_stats,
+    get_active_build_id, insert_plan_decision, latest_completed_build,
+    list_source_active_node_sections, list_sources, load_active_sections, load_generation_pages,
+    load_generation_view, load_knowledge_base, load_plan_input, mark_removed,
+    mark_stale_builds_interrupted, open, persist_generation, retire_source_knowledge, start_build,
+    update_build_status, upsert_sources_batch, BuildDraft, GenerationPageView, GenerationStats,
+    PlanDecision, SourceRecord, SourceUpsert, WikiPageRecord, OUTCOME_FAST_PATH,
+    OUTCOME_LOCAL_UPDATE, OUTCOME_REPLAN_REQUIRED, TRIGGER_FINGERPRINT_CHANGED,
     TRIGGER_STRUCTURAL_CHANGE,
 };
 
@@ -110,6 +112,83 @@ pub(crate) struct PipelineEnv {
     /// Canonical BuildFingerprint JSON (PRD §18.1/§19.2).
     pub fingerprint_json: String,
     pub cache: Arc<LlmCache>,
+}
+
+/// One §31 stage transition, pushed to the caller's sink as the pipeline
+/// crosses it. `phase` is one of `BUILD_PHASES`.
+#[derive(Debug, Clone)]
+pub struct BuildProgress {
+    pub build_id: String,
+    pub phase: &'static str,
+}
+
+/// The §31 stages a build row passes through, in order.
+pub const BUILD_PHASES: &[&str] = &[
+    "SCANNING",
+    "PARSING",
+    "ANALYZING",
+    "PLANNING",
+    "COMPILING",
+    "INDEXING",
+];
+
+/// Receives every stage transition (server jobs surface them on
+/// `GET /v1/jobs/{id}`); called from the pipeline task, so it must be
+/// non-blocking.
+pub type BuildProgressSink = Arc<dyn Fn(&BuildProgress) + Send + Sync>;
+
+/// Optional controls for [`run_build_with_options`]: cooperative cancellation
+/// (PRD §31) and stage-transition reporting.
+#[derive(Default)]
+pub struct BuildOptions {
+    /// When set, the pipeline stops starting new LLM work at the next
+    /// checkpoint (per document/cluster/page) and returns
+    /// [`WikiError::Cancelled`]; the build row is terminalized CANCELLED and
+    /// nothing is published. Once INDEXING begins the publish critical
+    /// section runs to completion — cancellation is no longer accepted.
+    pub cancel: Option<CancelFlag>,
+    /// Stage-transition sink (see [`BuildProgress`]).
+    pub on_progress: Option<BuildProgressSink>,
+}
+
+/// Cancel + progress plumbing threaded through the pipeline stages. Cheap to
+/// clone; `phase()` and `checkpoint()` degrade to the plain behavior when the
+/// corresponding option is absent (CLI `run_build`).
+#[derive(Clone)]
+pub(crate) struct BuildControl {
+    cancel: Option<CancelFlag>,
+    sink: Option<BuildProgressSink>,
+    build_id: BuildId,
+}
+
+impl BuildControl {
+    fn new(build_id: BuildId, options: &BuildOptions) -> Self {
+        Self {
+            cancel: options.cancel.clone(),
+            sink: options.on_progress.clone(),
+            build_id,
+        }
+    }
+
+    /// Persists the stage transition and notifies the sink.
+    fn phase(&self, conn: &mut rusqlite::Connection, phase: &'static str) -> Result<()> {
+        update_build_status(conn, &self.build_id, phase)?;
+        if let Some(sink) = &self.sink {
+            sink(&BuildProgress {
+                build_id: self.build_id.as_str().to_owned(),
+                phase,
+            });
+        }
+        Ok(())
+    }
+
+    /// Cooperative-cancel checkpoint: `Err(Cancelled)` once the flag is set.
+    fn checkpoint(&self) -> Result<()> {
+        if let Some(cancel) = &self.cancel {
+            cancel.check()?;
+        }
+        Ok(())
+    }
 }
 
 /// Loads prompts, derives the config hash + BuildFingerprint and opens the
@@ -202,6 +281,17 @@ pub async fn run_build(
     config: &Config,
     provider: Arc<dyn LlmProvider>,
 ) -> Result<BuildReport> {
+    run_build_with_options(workspace_root, config, provider, BuildOptions::default()).await
+}
+
+/// [`run_build`] with cooperative cancellation and stage-progress reporting
+/// (PRD §31) — the server's entry point.
+pub async fn run_build_with_options(
+    workspace_root: &Path,
+    config: &Config,
+    provider: Arc<dyn LlmProvider>,
+    options: BuildOptions,
+) -> Result<BuildReport> {
     config.validate()?;
     let root = lexical_absolute(workspace_root, &config.source.root);
     let wiki_dir = lexical_absolute(workspace_root, &config.project.wiki_dir);
@@ -246,7 +336,8 @@ pub async fn run_build(
     )?;
     tracing::info!(build = %build_id, "build started");
 
-    update_build_status(&mut conn, &build_id, "SCANNING")?;
+    let control = BuildControl::new(build_id.clone(), &options);
+    control.phase(&mut conn, "SCANNING")?;
     let result = build_inner(
         &mut conn,
         &root,
@@ -261,6 +352,7 @@ pub async fn run_build(
         &compilation_prompt,
         &prompt_version,
         &fingerprint_json,
+        &control,
     )
     .await;
 
@@ -290,6 +382,21 @@ pub async fn run_build(
             if let Err(mark_err) = marked {
                 tracing::error!(build = %build_id, error = %mark_err, "could not mark build terminal");
             }
+            if matches!(err, WikiError::Cancelled) {
+                // §31: a cancelled build leaves no unpublished generation dir
+                // behind (publish never ran, but clean defensively in case a
+                // previous crashed attempt left one for THIS build id).
+                let generation_dir = PublishPaths::new(&wiki_dir).generation_dir(&build_id);
+                if generation_dir.is_dir() {
+                    if let Err(remove_err) = std::fs::remove_dir_all(&generation_dir) {
+                        tracing::warn!(
+                            build = %build_id,
+                            error = %remove_err,
+                            "could not remove the unpublished generation dir"
+                        );
+                    }
+                }
+            }
             tracing::warn!(build = %build_id, status, error = %err, "build failed");
             Err(err)
         }
@@ -300,6 +407,7 @@ pub async fn run_build(
 pub(crate) fn terminal_status_for(err: &WikiError) -> &'static str {
     match err {
         WikiError::ReplanRequired { .. } => "REPLAN_REQUIRED",
+        WikiError::Cancelled => "CANCELLED",
         _ => "FAILED",
     }
 }
@@ -486,6 +594,7 @@ async fn compile_and_publish_incremental(
     recompile: BTreeSet<WikiPageId>,
     obsolete: BTreeSet<WikiPageId>,
     llm_request_count: u32,
+    control: &BuildControl,
 ) -> Result<(GenerationStats, u32, IncrementalSummary)> {
     let prev_meta = load_generation_pages(conn, prev_build_id)?;
     let language_of: BTreeMap<String, String> = prev_meta
@@ -494,7 +603,7 @@ async fn compile_and_publish_incremental(
         .collect();
 
     // ---- Partial compile (§19.2): ONLY affected pages consume requests. ----
-    update_build_status(conn, build_id, "COMPILING")?;
+    control.phase(conn, "COMPILING")?;
     let stage_cache: Arc<dyn StageCache> = cache.clone();
     let compiler = WikiCompiler::new(
         provider.clone(),
@@ -506,7 +615,8 @@ async fn compile_and_publish_incremental(
         },
         config.llm.max_concurrency as usize,
     )
-    .with_cache(stage_cache);
+    .with_cache(stage_cache)
+    .with_cancel(control.cancel.clone());
     let compiled = compiler
         .compile_plan_subset(plan, new_kb, build_id, &recompile)
         .await?;
@@ -577,8 +687,9 @@ async fn compile_and_publish_incremental(
     }
 
     // ---- Index + Publish (§35, unchanged contract): new immutable
-    // generation, pointer swap, previous generation intact on failure. ----
-    update_build_status(conn, build_id, "INDEXING")?;
+    // generation, pointer swap, previous generation intact on failure.
+    // Critical section: no cancel checkpoints past this point. ----
+    control.phase(conn, "INDEXING")?;
     let stats = persist_generation(conn, build_id, &new_pages)?;
     publish(
         conn,
@@ -637,6 +748,7 @@ async fn build_inner(
     compilation_prompt: &PromptDocument,
     analysis_prompt_version: &str,
     fingerprint_json: &str,
+    control: &BuildControl,
 ) -> Result<(
     GenerationStats,
     usize,
@@ -674,8 +786,24 @@ async fn build_inner(
             // stays a pure audit record (FAST_PATH decision, COMPLETED
             // status); the pointer, generation files, FTS and graph are
             // untouched. O(scan) + one stats query + one directory check.
+            //
+            // Snapshot guard (cancellation/§31 hardening): the registry diff
+            // alone cannot prove "nothing changed since publish" — a FAILED or
+            // CANCELLED build may already have upserted the newer hashes
+            // before dying. Require THIS scan's snapshot (recorded on this
+            // build row by scan_and_diff) to equal the ACTIVE build's
+            // recorded snapshot; on mismatch (or a pre-§19 active build
+            // without one) fall through to the full pipeline, which
+            // republishes from scratch (self-healing).
             let active_dir = PublishPaths::new(wiki_dir).generation_dir(active);
-            if active_dir.is_dir() {
+            let snapshot_proven = match build_snapshot_hash(conn, active)? {
+                Some(active_snapshot) => {
+                    build_snapshot_hash(conn, build_id)?.as_deref()
+                        == Some(active_snapshot.as_str())
+                }
+                None => false,
+            };
+            if active_dir.is_dir() && snapshot_proven {
                 record_decision(
                     conn,
                     build_id,
@@ -697,12 +825,13 @@ async fn build_inner(
                 return Ok((stats, output.files.len(), 0, None, Some(active.clone())));
             }
             // Unhealthy state: the pointer names a generation whose files are
-            // gone. Fall through to the full pipeline, which rebuilds and
-            // republishes from scratch (self-healing).
+            // gone, or whose snapshot cannot prove currency. Fall through to
+            // the full pipeline, which rebuilds and republishes from scratch
+            // (self-healing).
             tracing::warn!(
                 build = %build_id,
                 active = %active,
-                "active generation directory is missing; running the full pipeline to republish"
+                "active generation directory missing or snapshot unproven; running the full pipeline to republish"
             );
         }
     }
@@ -739,6 +868,7 @@ async fn build_inner(
             deleted_ids,
             previous,
             prev_pages.expect("checked above"),
+            control,
         )
         .await;
     }
@@ -764,6 +894,7 @@ async fn build_inner(
         compilation_prompt,
         analysis_prompt_version,
         &output,
+        control,
     )
     .await
     .map(|(stats, sources, count)| (stats, sources, count, None, None))
@@ -789,6 +920,7 @@ async fn build_full_pipeline(
     compilation_prompt: &PromptDocument,
     analysis_prompt_version: &str,
     output: &ScanOutput,
+    control: &BuildControl,
 ) -> Result<(GenerationStats, usize, u32)> {
     let batch: Vec<SourceUpsert> = output
         .files
@@ -810,7 +942,7 @@ async fn build_full_pipeline(
     }
 
     // ---- Parse (§9): analyzed text, sections, diagnostics. ----
-    update_build_status(conn, build_id, "PARSING")?;
+    control.phase(conn, "PARSING")?;
     let mut parsed = Vec::with_capacity(sources);
     for (file, (source_id, _created)) in output.files.iter().zip(upserted) {
         let absolute = root.join(&file.rel_path);
@@ -829,7 +961,7 @@ async fn build_full_pipeline(
     }
 
     // ---- Analyze (§10/§11) + persist the knowledge outcome. ----
-    update_build_status(conn, build_id, "ANALYZING")?;
+    control.phase(conn, "ANALYZING")?;
     // §28 stage cache: shared by analysis, planning and compilation; each
     // stage writes a response only after its own validation accepted it.
     let stage_cache: Arc<dyn StageCache> = cache.clone();
@@ -842,7 +974,8 @@ async fn build_full_pipeline(
             config.llm.max_output_tokens,
             config.llm.max_concurrency,
         )
-        .with_cache(stage_cache.clone()),
+        .with_cache(stage_cache.clone())
+        .with_cancel(control.cancel.clone()),
     );
     let doc_concurrency = config.llm.max_concurrency.max(1) as usize;
     // ---- Document-parallel analysis (T1 finding #12) ----
@@ -870,6 +1003,10 @@ async fn build_full_pipeline(
     while next_to_spawn < doc_inputs.len() || !join_set.is_empty() {
         let build_id_owned = build_id.clone();
         while next_to_spawn < doc_inputs.len() && join_set.len() < doc_concurrency {
+            // §31 cooperative cancellation: no NEW analysis work once the
+            // flag is set; in-flight documents finish or are dropped with the
+            // JoinSet on unwind.
+            control.checkpoint()?;
             let doc = doc_inputs[next_to_spawn].clone();
             let build_id_owned = build_id_owned.clone();
             let index = next_to_spawn;
@@ -909,7 +1046,7 @@ async fn build_full_pipeline(
     }
 
     // ---- Plan (§14). ----
-    update_build_status(conn, build_id, "PLANNING")?;
+    control.phase(conn, "PLANNING")?;
     let (base, registry_revision) = load_plan_input(conn)?;
     let planner_config = PlannerConfig {
         hierarchical: config.planning.hierarchical,
@@ -923,12 +1060,13 @@ async fn build_full_pipeline(
         .with_plan_cache(
             stage_cache.clone(),
             plan_cache_identity(config_hash, provider.model(), SCHEMA_VERSION),
-        );
+        )
+        .with_cancel(control.cancel.clone());
     let plan_outcome = planner.plan(&base, registry_revision).await?;
     llm_request_count += plan_outcome.llm_request_count;
 
     // ---- Compile (§15/§16). ----
-    update_build_status(conn, build_id, "COMPILING")?;
+    control.phase(conn, "COMPILING")?;
     let compiler_config = CompilerConfig {
         max_input_tokens: config.analysis.max_input_tokens as u64,
         ..CompilerConfig::default()
@@ -939,7 +1077,8 @@ async fn build_full_pipeline(
         compiler_config,
         config.llm.max_concurrency as usize,
     )
-    .with_cache(stage_cache);
+    .with_cache(stage_cache)
+    .with_cancel(control.cancel.clone());
     let generation = compiler
         .compile_plan(&plan_outcome.plan, &base, build_id)
         .await?;
@@ -950,8 +1089,10 @@ async fn build_full_pipeline(
         ));
     }
 
-    // ---- Index (§31): machine-side generation rows in one transaction. ----
-    update_build_status(conn, build_id, "INDEXING")?;
+    // ---- Index (§31): machine-side generation rows in one transaction.
+    // Past this point the build is in its critical section — no more cancel
+    // checkpoints; the publish must complete or recover via the journal. ----
+    control.phase(conn, "INDEXING")?;
     let stats = persist_generation(conn, build_id, &generation.pages)?;
 
     // ---- Publish (§35): READY → pointer swap → COMPLETED. ----
@@ -987,6 +1128,7 @@ async fn build_incremental(
     deleted_ids: Vec<SourceId>,
     prev_build_id: &BuildId,
     prev_pages: Vec<GenerationPageView>,
+    control: &BuildControl,
 ) -> Result<(
     GenerationStats,
     usize,
@@ -1027,7 +1169,7 @@ async fn build_incremental(
         .collect();
 
     // ---- Selective re-analysis (§19.2) + the mapping over its outcome. ----
-    update_build_status(conn, build_id, "PARSING")?;
+    control.phase(conn, "PARSING")?;
     let llm_request_count = analyze_changed_sources(
         conn,
         root,
@@ -1040,12 +1182,13 @@ async fn build_incremental(
         output,
         &upserted,
         &changed_files,
+        control,
     )
     .await?;
 
     // ---- Deterministic mapping attempt (§19.2 fixed order). Zero planner
     // LLM calls: the current plan's page identities are reused. ----
-    update_build_status(conn, build_id, "PLANNING")?;
+    control.phase(conn, "PLANNING")?;
     let (new_kb, recompile, updated_refs, obsolete, prev_pages) = map_incremental_or_fail(
         conn,
         build_id,
@@ -1078,6 +1221,7 @@ async fn build_incremental(
         recompile,
         obsolete,
         llm_request_count,
+        control,
     )
     .await?;
     tracing::info!(
@@ -1207,8 +1351,9 @@ async fn analyze_changed_sources(
     output: &ScanOutput,
     upserted: &[(SourceId, bool)],
     changed_files: &[usize],
+    control: &BuildControl,
 ) -> Result<u32> {
-    update_build_status(conn, build_id, "ANALYZING")?;
+    control.phase(conn, "ANALYZING")?;
     let stage_cache: Arc<dyn StageCache> = cache.clone();
     let analyzer = DocumentAnalyzer::new(
         provider.clone(),
@@ -1218,7 +1363,8 @@ async fn analyze_changed_sources(
         config.llm.max_output_tokens,
         config.llm.max_concurrency,
     )
-    .with_cache(stage_cache);
+    .with_cache(stage_cache)
+    .with_cancel(control.cancel.clone());
     // Same document-parallel pattern as the full pipeline: serial register,
     // concurrent LLM, ordered persist.
     let mut doc_inputs = Vec::with_capacity(changed_files.len());
@@ -1253,6 +1399,8 @@ async fn analyze_changed_sources(
     let mut join_set = tokio::task::JoinSet::new();
     while next_to_spawn < doc_inputs.len() || !join_set.is_empty() {
         while next_to_spawn < doc_inputs.len() && join_set.len() < doc_concurrency {
+            // §31 cooperative cancellation (see build_full_pipeline).
+            control.checkpoint()?;
             let analyzer = Arc::clone(&analyzer);
             let doc = doc_inputs[next_to_spawn].clone();
             let build_id_owned = build_id.clone();

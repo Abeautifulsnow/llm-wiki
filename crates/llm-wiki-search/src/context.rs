@@ -174,6 +174,19 @@ pub fn build_context(
     budget: &ContextBudget,
     vector: &[VectorCandidate],
 ) -> Result<AssembledContext> {
+    build_context_with_reranker(conn, query, budget, vector, None)
+}
+
+/// [`build_context`] with an optional reranker applied to the fused
+/// candidates before the budget consumes them (PRD §50 V0.5: the rerank
+/// abstraction slots between fusion and selection).
+pub fn build_context_with_reranker(
+    conn: &Connection,
+    query: &str,
+    budget: &ContextBudget,
+    vector: &[VectorCandidate],
+    reranker: Option<&dyn crate::rerank::Reranker>,
+) -> Result<AssembledContext> {
     let Some(active) = get_active_build_id(conn)? else {
         return Err(WikiError::Index(
             "nothing published; run build first".into(),
@@ -269,6 +282,54 @@ pub fn build_context(
             .then_with(|| a.1.section.slug.cmp(&b.1.section.slug))
             .then_with(|| a.1.section.heading_path.cmp(&b.1.section.heading_path))
     });
+    // ---- Rerank stage (§50 V0.5): an optional reranker reorders the fused
+    // candidates before selection. Noop/absent keeps the fused order, so
+    // determinism is unchanged by default. ----
+    if let Some(reranker) = reranker {
+        let candidates: Vec<crate::rerank::RerankCandidate> = fused
+            .iter()
+            .map(|(score, candidate)| crate::rerank::RerankCandidate {
+                key: (
+                    candidate.section.page_id.as_str().to_owned(),
+                    candidate.section.heading_path.join("\u{1f}"),
+                ),
+                slug: candidate.section.slug.clone(),
+                title: candidate.section.title.clone(),
+                heading_path: candidate.section.heading_path.clone(),
+                snippet: candidate.snippet.clone(),
+                fused_score: *score as f32,
+                score: *score as f32,
+            })
+            .collect();
+        let reranked = reranker.rerank(query, candidates)?;
+        let mut order: std::collections::BTreeMap<(String, String), usize> =
+            std::collections::BTreeMap::new();
+        for (index, candidate) in reranked.into_iter().enumerate() {
+            order.insert(candidate.key, index);
+        }
+        fused.sort_by(|(score_a, candidate_a), (score_b, candidate_b)| {
+            let key = |candidate: &Candidate| {
+                (
+                    candidate.section.page_id.as_str().to_owned(),
+                    candidate.section.heading_path.join("\u{1f}"),
+                )
+            };
+            let rank_a = order.get(&key(candidate_a)).copied().unwrap_or(usize::MAX);
+            let rank_b = order.get(&key(candidate_b)).copied().unwrap_or(usize::MAX);
+            rank_a.cmp(&rank_b).then_with(|| {
+                score_b
+                    .partial_cmp(score_a)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| candidate_a.section.slug.cmp(&candidate_b.section.slug))
+                    .then_with(|| {
+                        candidate_a
+                            .section
+                            .heading_path
+                            .cmp(&candidate_b.section.heading_path)
+                    })
+            })
+        });
+    }
     if fused.is_empty() {
         return Err(WikiError::Index(format!(
             "no wiki section matches {query:?}; the published generation may not cover this topic"

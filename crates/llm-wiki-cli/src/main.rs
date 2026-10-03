@@ -99,6 +99,17 @@ enum Command {
         #[arg(long)]
         semantic: bool,
     },
+    /// Serve the HTTP API (PRD §5.6/§30): health/status/build jobs/search/
+    /// context/query/pages. Local-only unless `server.remote_enabled` (which
+    /// requires the auth token env); the server refuses to start otherwise.
+    Serve {
+        /// Bind host override (defaults to config `server.bind`).
+        #[arg(long)]
+        host: Option<String>,
+        /// Bind port.
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+    },
 }
 
 fn main() {
@@ -139,6 +150,7 @@ fn run(command: Command) -> Result<(), WikiError> {
         } => ask(&workspace, &query, write_back, hybrid, embedding_model),
         Command::Embed { model, batch } => embed(&workspace, model.as_deref(), batch),
         Command::Lint { semantic } => lint(&workspace, semantic),
+        Command::Serve { host, port } => serve(&workspace, host, port),
     }
 }
 
@@ -212,6 +224,9 @@ max_rejected_claim_ratio = 0.10
 full_text = true
 vector = false
 graph = true
+# Rerank strategy applied after rank fusion (V0.5); "none" keeps the
+# deterministic fused order.
+rerank = "none"
 
 [build]
 incremental = true
@@ -221,6 +236,11 @@ keep_generations = 3
 bind = "127.0.0.1"
 remote_enabled = false
 auth_token_env = "LLM_WIKI_SERVER_TOKEN"
+# Remote-mode guardrails (PRD §30): job queue depth, request body size and
+# per-caller request budget per minute (0 disables the limiter).
+max_queued_jobs = 8
+max_body_bytes = 1048576
+rate_limit_per_minute = 120
 "#
         .to_owned(),
     )
@@ -772,6 +792,35 @@ fn lint(workspace: &Path, semantic: bool) -> Result<(), WikiError> {
         }
     }
     exit
+}
+
+/// `llm-wiki serve` (PRD §29/§30): thin transport over the llm-wiki-server
+/// crate. The LLM provider is optional — build/query endpoints report a
+/// clear config error when `[llm]` is unconfigured; search/context/pages
+/// keep working.
+fn serve(workspace: &Path, host: Option<String>, port: u16) -> Result<(), WikiError> {
+    let config = load_config(workspace)?;
+    config.validate()?;
+    let provider = if config.llm.model.trim().is_empty() {
+        eprintln!(
+            "note: llm.model is not configured — /v1/build and /v1/query will return config errors"
+        );
+        None
+    } else {
+        Some(build_provider(&config.llm)?)
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| WikiError::Llm(format!("cannot start async runtime: {e}")))?;
+    runtime.block_on(llm_wiki_server::serve(llm_wiki_server::ServeOptions {
+        workspace: workspace.to_path_buf(),
+        config,
+        host,
+        port,
+        provider,
+    }))?;
+    Ok(())
 }
 
 fn status(workspace: &Path) -> Result<(), WikiError> {

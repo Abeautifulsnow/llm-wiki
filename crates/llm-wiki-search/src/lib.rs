@@ -18,11 +18,15 @@ use llm_wiki_storage::search_index::{self, SearchTokenizer};
 use tokio::task::spawn_blocking;
 
 pub mod context;
+pub mod rerank;
 
 pub use context::{
-    active_context_sections, build_context, chunks_tokens, context_section_hash,
-    context_section_text, AssembledContext, ContextBudget, ContextChunk, ContextNeighbor,
-    ContextSection, VectorCandidate,
+    active_context_sections, build_context, build_context_with_reranker, chunks_tokens,
+    context_section_hash, context_section_text, AssembledContext, ContextBudget, ContextChunk,
+    ContextNeighbor, ContextSection, VectorCandidate,
+};
+pub use rerank::{
+    rerank_search_hits, reranker_from_config, NoopReranker, RerankCandidate, Reranker,
 };
 
 /// Marks crate purpose.

@@ -127,6 +127,23 @@ pub fn set_build_snapshot_hash(
     Ok(())
 }
 
+/// The source snapshot hash recorded on one build row, if any. The fast path
+/// compares the current scan against the ACTIVE build's snapshot — a failed
+/// or cancelled build may already have advanced registry hashes, so the
+/// registry diff alone cannot prove "nothing changed since publish".
+pub fn build_snapshot_hash(conn: &Connection, build_id: &BuildId) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT source_snapshot_hash FROM builds WHERE build_id = ?1",
+        params![build_id.as_str()],
+        |row| row.get(0),
+    )
+    .map(Some)
+    .or_else(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+        other => Err(WikiError::Storage(format!("build snapshot hash: {other}"))),
+    })
+}
+
 fn db(e: rusqlite::Error) -> WikiError {
     WikiError::Storage(e.to_string())
 }

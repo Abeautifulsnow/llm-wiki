@@ -13,6 +13,7 @@ pub mod decisions;
 pub mod embeddings;
 pub mod graph;
 pub mod insights;
+pub mod jobs;
 pub mod knowledge;
 pub mod migrations;
 pub mod page_id_map;
@@ -29,8 +30,8 @@ pub use analysis::{
     PersistedRejectedClaim, PersistedRelation, RetiredSourceKnowledge, SourceNodeSection,
 };
 pub use builds::{
-    finish_build, latest_build, latest_completed_build, set_build_snapshot_hash, start_build,
-    BuildDraft, BuildRecord,
+    build_snapshot_hash, finish_build, latest_build, latest_completed_build,
+    set_build_snapshot_hash, start_build, BuildDraft, BuildRecord,
 };
 pub use cache::{count_cache_entries, get_cached_response, put_cached_response, CacheRow};
 pub use connection::{open, open_in_memory, Connection};
@@ -47,6 +48,12 @@ pub use graph::{
     NODE_TYPE_ENTITY, NODE_TYPE_PAGE, RELATION_LINKS_TO,
 };
 pub use insights::{insert_insight, list_insights, InsightCitation, InsightRecord};
+pub use jobs::{
+    attach_job_build, count_jobs_by_status, finish_job, get_job, get_job_by_idempotency_key,
+    insert_job, list_jobs, mark_stale_jobs_interrupted, set_job_phase, set_job_running,
+    ServerJobRecord, FAILURE_CANCELLED, FAILURE_INTERNAL, FAILURE_INTERRUPTED, FAILURE_LLM,
+    FAILURE_PLANNING, FAILURE_PUBLISH, FAILURE_REPLAN_REQUIRED, JOB_STATUSES,
+};
 pub use knowledge::{list_active_relation_pairs, load_knowledge_base, load_plan_input};
 pub use page_id_map::{
     insert_page_id_maps, list_page_id_maps_by_predecessor, list_page_id_maps_by_successor,

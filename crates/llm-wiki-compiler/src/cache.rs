@@ -14,7 +14,7 @@
 //! LLM requests (§37.3 rebuild-determinism gate).
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -95,20 +95,37 @@ pub fn plan_cache_key(reconciliation_key: &str, identity: &str) -> String {
     sha256_hex(format!("wiki-plan\u{1f}{reconciliation_key}\u{1f}{identity}").as_bytes())
 }
 
-/// SQLite-backed stage cache. Owns its own connection so the build connection
-/// stays owned by the pipeline; WAL + busy timeout make the two safe.
+/// SQLite-backed stage cache.
+///
+/// Concurrency shape (audit FIX-018): reads go through a small pool of
+/// read-only connections so concurrent analysis/planning/compile tasks (and,
+/// in server mode, concurrent asks) never queue behind one mutex; writes go
+/// through a dedicated single-writer connection. WAL + busy timeout keep the
+/// pipeline's own connection, the pool and the writer mutually safe. When the
+/// cache is built over a bare connection ([`LlmCache::new`], in-memory test
+/// dbs), the pool is unavailable and reads share the writer — the pre-pool
+/// behavior, which is still correct.
 pub struct LlmCache {
-    conn: Mutex<rusqlite::Connection>,
+    db_path: Option<PathBuf>,
+    read_pool: Mutex<Vec<rusqlite::Connection>>,
+    writer: Mutex<rusqlite::Connection>,
     context: CacheContext,
     source_snapshot_hash: Mutex<String>,
     hits: AtomicU64,
     misses: AtomicU64,
 }
 
+/// Idle read connections kept around for reuse; bursts may open (and drop)
+/// more, but never block on the pool lock while a query runs.
+const READ_POOL_CAPACITY: usize = 8;
+const READ_POOL_PRIME: usize = 4;
+
 impl LlmCache {
     pub fn new(conn: rusqlite::Connection, context: CacheContext) -> Self {
         Self {
-            conn: Mutex::new(conn),
+            db_path: None,
+            read_pool: Mutex::new(Vec::new()),
+            writer: Mutex::new(conn),
             context,
             source_snapshot_hash: Mutex::new(String::new()),
             hits: AtomicU64::new(0),
@@ -117,8 +134,58 @@ impl LlmCache {
     }
 
     /// Opens (and migrates) the state db for caching — used by `run_build`.
+    /// Primes the read pool so the first concurrent wave doesn't pay the open
+    /// cost.
     pub fn open(db_path: &Path, context: CacheContext) -> Result<Self> {
-        Ok(Self::new(llm_wiki_storage::open(db_path)?, context))
+        let writer = llm_wiki_storage::open(db_path)?;
+        let read_pool: Vec<rusqlite::Connection> = (0..READ_POOL_PRIME)
+            .filter_map(|_| llm_wiki_storage::open(db_path).ok())
+            .collect();
+        Ok(Self {
+            db_path: Some(db_path.to_owned()),
+            read_pool: Mutex::new(read_pool),
+            writer: Mutex::new(writer),
+            context,
+            source_snapshot_hash: Mutex::new(String::new()),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+        })
+    }
+
+    /// Runs `f` on a read connection: pooled when available, else a
+    /// short-lived connection over the same db file, else (bare-connection
+    /// mode) the writer itself. The pool lock is never held while `f` runs.
+    fn with_read<T>(&self, f: impl FnOnce(&rusqlite::Connection) -> T) -> T {
+        let popped = self
+            .read_pool
+            .lock()
+            .expect("cache read pool lock")
+            .pop()
+            .or_else(|| {
+                self.db_path.as_ref().and_then(|path| {
+                    llm_wiki_storage::open(path)
+                        .map_err(|err| {
+                            tracing::warn!(error = %err, "cache read connection open failed");
+                            err
+                        })
+                        .ok()
+                })
+            });
+        match popped {
+            Some(conn) => {
+                let out = f(&conn);
+                if let Ok(mut pool) = self.read_pool.lock() {
+                    if pool.len() < READ_POOL_CAPACITY {
+                        pool.push(conn);
+                    }
+                }
+                out
+            }
+            None => {
+                let writer = self.writer.lock().expect("cache writer lock");
+                f(&writer)
+            }
+        }
     }
 
     /// The source snapshot hash recorded on cache rows (§28); set once the
@@ -146,8 +213,7 @@ impl StageCache for LlmCache {
     fn lookup(&self, request: &LlmRequest) -> Option<LlmResponse> {
         let prompt_version = self.prompt_version_for(&request.task_tag)?;
         let key = cache_key(request, &self.context, &prompt_version);
-        let conn = self.conn.lock().expect("cache connection lock");
-        let text = match get_cached_response(&conn, &key) {
+        let text = match self.with_read(|conn| get_cached_response(conn, &key)) {
             Ok(Some(text)) => text,
             Ok(None) => {
                 self.misses.fetch_add(1, Ordering::SeqCst);
@@ -161,7 +227,6 @@ impl StageCache for LlmCache {
                 return None;
             }
         };
-        drop(conn);
         self.hits.fetch_add(1, Ordering::SeqCst);
         Some(LlmResponse {
             text,
@@ -192,15 +257,14 @@ impl StageCache for LlmCache {
                 .clone(),
             response: response.text.clone(),
         };
-        let mut conn = self.conn.lock().expect("cache connection lock");
+        let mut conn = self.writer.lock().expect("cache writer lock");
         if let Err(err) = put_cached_response(&mut conn, &row) {
             tracing::warn!(error = %err, "llm cache write failed; continuing without it");
         }
     }
 
     fn lookup_raw(&self, cache_key: &str) -> Option<String> {
-        let conn = self.conn.lock().expect("cache connection lock");
-        match get_cached_response(&conn, cache_key) {
+        match self.with_read(|conn| get_cached_response(conn, cache_key)) {
             Ok(Some(text)) => Some(text),
             Ok(None) => None,
             Err(err) => {
@@ -226,7 +290,7 @@ impl StageCache for LlmCache {
                 .clone(),
             response: value.to_owned(),
         };
-        let mut conn = self.conn.lock().expect("cache connection lock");
+        let mut conn = self.writer.lock().expect("cache writer lock");
         if let Err(err) = put_cached_response(&mut conn, &row) {
             tracing::warn!(error = %err, "raw cache write failed; continuing without it");
         }
@@ -428,5 +492,69 @@ mod tests {
         assert!(cache.lookup_raw(&key).is_none());
         cache.remember_raw(&key, "{\"pages\":[]}");
         assert_eq!(cache.lookup_raw(&key).as_deref(), Some("{\"pages\":[]}"));
+    }
+
+    /// FIX-018: over a file-backed db the cache serves concurrent readers from
+    /// the pool while writes serialize on the single writer — every thread's
+    /// entry comes back exactly as written.
+    #[test]
+    fn concurrent_lookups_and_writes_over_the_read_pool() {
+        let dir = std::env::temp_dir().join(format!(
+            "llm-wiki-cache-pool-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = std::sync::Arc::new(LlmCache::open(&dir.join("state.db"), context()).unwrap());
+        cache.set_source_snapshot_hash("snap");
+
+        let base = request("parent");
+        cache.remember(
+            &base,
+            &LlmResponse {
+                text: "parent-value".into(),
+                model: "fake-model".into(),
+                input_tokens: 0,
+                output_tokens: 0,
+                finish_reason: Some("stop".into()),
+            },
+        );
+
+        let handles: Vec<_> = (0..16)
+            .map(|i| {
+                let cache = cache.clone();
+                let req = request(&format!("concurrent-{i}"));
+                std::thread::spawn(move || {
+                    cache.remember(
+                        &req,
+                        &LlmResponse {
+                            text: format!("value-{i}"),
+                            model: "fake-model".into(),
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            finish_reason: Some("stop".into()),
+                        },
+                    );
+                    assert_eq!(
+                        cache.lookup(&req).expect("own write visible").text,
+                        format!("value-{i}")
+                    );
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(
+            cache.lookup(&base).expect("parent entry").text,
+            "parent-value"
+        );
+        let probe = request("concurrent-7");
+        assert_eq!(cache.lookup(&probe).expect("thread entry").text, "value-7");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

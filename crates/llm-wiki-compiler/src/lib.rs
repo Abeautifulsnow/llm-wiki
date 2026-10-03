@@ -24,8 +24,14 @@ pub mod semantic_lint;
 pub use analysis::{
     AnalysisOutcome, AnalysisSection, AnalyzedDocument, DocumentAnalyzer, VerifiedRelation,
 };
-pub use ask::{run_ask, AskReport, HybridContext};
-pub use build::{run_build, BuildReport, IncrementalSummary};
+pub use ask::{
+    embed_query_vector, embedding_coverage, run_ask, top_cosine_candidates, vector_candidates,
+    AskReport, HybridContext,
+};
+pub use build::{
+    run_build, run_build_with_options, BuildOptions, BuildProgress, BuildProgressSink, BuildReport,
+    IncrementalSummary, BUILD_PHASES,
+};
 pub use cache::{CacheContext, CacheStats, LlmCache, StageCache};
 pub use changeset::{
     diff_manifest, finalize_change_set, BuildFingerprint, ChangeSet, FileOutcome, RegisteredSource,
