@@ -34,9 +34,9 @@ pub use persist::{persist_outcome, PersistOptions};
 pub use plan::{PlanCacheKeys, PlanOutcome, PlannerConfig, WikiPlanner};
 pub use prompt::{load_prompt, PromptDocument};
 pub use publish::{
-    atomic_write, cleanup_generations, journal_exists, publish, read_current_pointer, read_journal,
-    recover_if_needed, write_current_pointer, write_generation, write_journal, CurrentPointer,
-    PublishJournal, PublishPaths, PublishReport, RecoveryAction, RecoveryReport, RENAME_ATTEMPTS,
-    RENAME_RETRY_DELAY,
+    atomic_write, cleanup_generations, journal_exists, page_file_name, publish,
+    read_current_pointer, read_journal, recover_if_needed, write_current_pointer, write_generation,
+    write_journal, CurrentPointer, PublishJournal, PublishPaths, PublishReport, RecoveryAction,
+    RecoveryReport, RENAME_ATTEMPTS, RENAME_RETRY_DELAY,
 };
 pub use replan::{plan_diff, replan, PlanDiff, ReplanReport};

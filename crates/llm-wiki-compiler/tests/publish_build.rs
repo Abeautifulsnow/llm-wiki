@@ -7,6 +7,7 @@
 //! running `recover_if_needed`; every outcome must be a consistent old-or-new
 //! state, never a mix.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -99,7 +100,13 @@ fn crash_after_generation_write_without_journal_is_a_noop() {
     // A new build wrote its generation files, then crashed before recording
     // the intent: pointer and DB still name the old build — consistent.
     let second = new_build(&mut conn);
-    write_generation(&PublishPaths::new(&wiki_dir), &second, &pages).unwrap();
+    write_generation(
+        &PublishPaths::new(&wiki_dir),
+        &second,
+        &pages,
+        &BTreeMap::new(),
+    )
+    .unwrap();
 
     let recovered = recover_if_needed(&mut conn, &wiki_dir).unwrap();
     assert!(recovered.is_none(), "consistent state needs no recovery");
@@ -117,7 +124,7 @@ fn crash_after_journal_written_rolls_back_to_old() {
     // Steps 1–4 done (files + intent), crash before the pointer move.
     let second = new_build(&mut conn);
     let paths = PublishPaths::new(&wiki_dir);
-    write_generation(&paths, &second, &pages).unwrap();
+    write_generation(&paths, &second, &pages, &BTreeMap::new()).unwrap();
     write_journal(&paths, Some(&first), &second).unwrap();
 
     let recovered = recover_if_needed(&mut conn, &wiki_dir).unwrap().unwrap();
@@ -145,7 +152,7 @@ fn crash_after_pointer_move_completes_the_verified_new_version() {
     // rows, so recovery completes the new version.
     let second = new_build(&mut conn);
     let paths = PublishPaths::new(&wiki_dir);
-    write_generation(&paths, &second, &pages).unwrap();
+    write_generation(&paths, &second, &pages, &BTreeMap::new()).unwrap();
     persist_generation(&mut conn, &second, &pages).unwrap();
     write_journal(&paths, Some(&first), &second).unwrap();
     write_current_pointer(&paths, &second).unwrap();
@@ -202,7 +209,7 @@ fn crash_after_db_commit_only_clears_the_journal() {
     // file is a leftover.
     let second = new_build(&mut conn);
     let paths = PublishPaths::new(&wiki_dir);
-    write_generation(&paths, &second, &pages).unwrap();
+    write_generation(&paths, &second, &pages, &BTreeMap::new()).unwrap();
     write_journal(&paths, None, &second).unwrap();
     write_current_pointer(&paths, &second).unwrap();
     activate_build(&mut conn, &second).unwrap();
@@ -227,7 +234,7 @@ fn crash_of_first_publish_without_pointer_rolls_back_to_empty() {
     // version, so recovery rolls back to an empty wiki.
     let build = new_build(&mut conn);
     let paths = PublishPaths::new(&wiki_dir);
-    write_generation(&paths, &build, &pages).unwrap();
+    write_generation(&paths, &build, &pages, &BTreeMap::new()).unwrap();
     write_journal(&paths, None, &build).unwrap();
 
     let recovered = recover_if_needed(&mut conn, &wiki_dir).unwrap().unwrap();

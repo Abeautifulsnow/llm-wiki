@@ -503,6 +503,64 @@ async fn unchanged_rebuild_takes_the_fast_path_and_records_it() {
     assert_eq!(build_status(&conn, &second.build_id), "COMPLETED");
 }
 
+/// Audit FIX-013 acceptance: a carried page (byte-identical) is hardlinked
+/// into the new generation instead of rewritten — same inode, zero content
+/// copy — and the recompiled page is a fresh file.
+#[cfg(unix)]
+#[tokio::test]
+async fn carried_pages_reuse_the_previous_generation_file_via_hardlink() {
+    use std::os::unix::fs::MetadataExt;
+
+    let workspace = fixture_workspace("hardlink-reuse");
+    let config = llm_wiki_core::config::Config::load(&workspace).unwrap();
+    let wiki_dir = workspace.join("wiki");
+    let provider = incremental_llm();
+
+    let first = llm_wiki_compiler::run_build(&workspace, &config, provider.clone())
+        .await
+        .unwrap();
+    seed_runtime_doc(
+        &workspace,
+        "Events are delivered exactly once in v2 and handlers must stay idempotent.",
+    );
+    let second = llm_wiki_compiler::run_build(&workspace, &config, provider)
+        .await
+        .unwrap();
+
+    let paths = PublishPaths::new(&wiki_dir);
+    let file_of = |report: &llm_wiki_compiler::BuildReport, slug: &str| {
+        let view = load_generation_view(&conn_of(&workspace), &report.build_id).unwrap();
+        let page = view.iter().find(|page| page.slug == slug).unwrap().clone();
+        paths
+            .generation_dir(&report.build_id)
+            .join(llm_wiki_compiler::page_file_name(
+                &page.slug,
+                page.page_id.as_str(),
+            ))
+    };
+    let carried_first = file_of(&first, "security-platform");
+    let carried_second = file_of(&second, "security-platform");
+    let recompiled_second = file_of(&second, "runtime-platform");
+
+    let first_meta = std::fs::metadata(&carried_first).unwrap();
+    let second_meta = std::fs::metadata(&carried_second).unwrap();
+    assert_eq!(
+        (first_meta.dev(), first_meta.ino()),
+        (second_meta.dev(), second_meta.ino()),
+        "the carried page shares the previous generation's inode (hardlink reuse)"
+    );
+    assert_ne!(
+        std::fs::metadata(&recompiled_second).unwrap().ino(),
+        first_meta.ino(),
+        "the recompiled page is a fresh file"
+    );
+    // The carried content still validates byte-for-byte after the reuse.
+    assert_eq!(
+        std::fs::read_to_string(&carried_first).unwrap(),
+        std::fs::read_to_string(&carried_second).unwrap()
+    );
+}
+
 /// FIX-006 health condition: when the active generation's files are gone
 /// (pointer intact, directory deleted), the fast path must NOT return the
 /// missing generation — the full pipeline republishes from scratch.

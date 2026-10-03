@@ -197,7 +197,7 @@ pub fn rebuild_search_index(
     conn.execute("DELETE FROM wiki_fts", []).map_err(db)?;
     conn.execute("DELETE FROM wiki_page_text", []).map_err(db)?;
 
-    // INSERT prepares are hoisted out of the per-section loop (rusqlite
+    // INSERT prepares are hoisted out of the per-page loop (rusqlite
     // `Statement::insert` also returns the rowid, so the FTS row can link to
     // its content row without a separate `last_insert_rowid` round-trip).
     let mut insert_text = conn
@@ -234,39 +234,208 @@ pub fn rebuild_search_index(
     for row in rows {
         let (page_id, slug, title, content) = row.map_err(db)?;
         pages += 1;
-        // One structural parse per page: sections (heading path + body) plus
-        // the frontmatter `aliases` key — the fourth §20 index object (always
-        // empty in the V0.2 fixtures).
-        let parsed = parse_document(&content, &format!("{slug}.md"));
-        let aliases = page_aliases(parsed.frontmatter.get("aliases"));
-        let section_rows: Vec<(&[String], &str)> = if parsed.sections.is_empty() {
-            // A page that yields no sections still gets one row so its title
-            // stays searchable.
-            vec![(&[], "")]
-        } else {
-            parsed
-                .sections
-                .iter()
-                .map(|section| (section.heading_path.as_slice(), section.content.as_str()))
-                .collect()
-        };
-        for (heading_path, body) in section_rows {
-            insert_section_row(
-                &mut insert_text,
-                &mut insert_fts,
-                tokenizer,
-                &page_id,
-                build_id,
-                &slug,
-                &title,
-                &aliases,
-                heading_path,
-                body,
-            )?;
-            sections += 1;
-        }
+        sections += index_page(
+            &mut insert_text,
+            &mut insert_fts,
+            tokenizer,
+            &page_id,
+            build_id,
+            &slug,
+            &title,
+            &content,
+        )?;
     }
     Ok(SearchIndexStats { pages, sections })
+}
+
+/// Indexes ONE page: one structural parse, then a text row + FTS row per
+/// section. Shared by the full rebuild and the incremental update. Returns
+/// the number of section rows written.
+#[allow(clippy::too_many_arguments)]
+fn index_page(
+    insert_text: &mut rusqlite::Statement<'_>,
+    insert_fts: &mut rusqlite::Statement<'_>,
+    tokenizer: &dyn SearchTokenizer,
+    page_id: &str,
+    build_id: &BuildId,
+    slug: &str,
+    title: &str,
+    content: &str,
+) -> Result<usize> {
+    // One structural parse per page: sections (heading path + body) plus
+    // the frontmatter `aliases` key — the fourth §20 index object (always
+    // empty in the V0.2 fixtures).
+    let parsed = parse_document(content, &format!("{slug}.md"));
+    let aliases = page_aliases(parsed.frontmatter.get("aliases"));
+    let section_rows: Vec<(&[String], &str)> = if parsed.sections.is_empty() {
+        // A page that yields no sections still gets one row so its title
+        // stays searchable.
+        vec![(&[], "")]
+    } else {
+        parsed
+            .sections
+            .iter()
+            .map(|section| (section.heading_path.as_slice(), section.content.as_str()))
+            .collect()
+    };
+    let mut sections = 0usize;
+    for (heading_path, body) in section_rows {
+        insert_section_row(
+            insert_text,
+            insert_fts,
+            tokenizer,
+            page_id,
+            build_id,
+            slug,
+            title,
+            &aliases,
+            heading_path,
+            body,
+        )?;
+        sections += 1;
+    }
+    Ok(sections)
+}
+
+/// `page_id → body_hash` of one build's pages — the incremental diff key.
+fn page_body_hashes(
+    conn: &Connection,
+    build_id: &BuildId,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut stmt = conn
+        .prepare("SELECT page_id, body_hash FROM wiki_pages WHERE build_id = ?1")
+        .map_err(|e| WikiError::Storage(format!("prepare page hashes: {e}")))?;
+    let rows = stmt
+        .query_map(params![build_id.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| WikiError::Storage(format!("page hashes: {e}")))?;
+    let mut map = std::collections::BTreeMap::new();
+    for row in rows {
+        let (page_id, body_hash) = row.map_err(db)?;
+        map.insert(page_id, body_hash);
+    }
+    Ok(map)
+}
+
+/// Removes one page's text rows and their FTS entries.
+fn delete_page_index_rows(conn: &Connection, page_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM wiki_fts WHERE rowid IN (SELECT text_id FROM wiki_page_text WHERE page_id = ?1)",
+        params![page_id],
+    )
+    .map_err(db)?;
+    conn.execute(
+        "DELETE FROM wiki_page_text WHERE page_id = ?1",
+        params![page_id],
+    )
+    .map_err(db)?;
+    Ok(())
+}
+
+/// Incremental index update (audit FIX-010): diff `build_id` against the
+/// previous ACTIVE generation and touch only pages whose (page_id,
+/// body_hash) pair changed — unchanged pages keep their tokenized rows (the
+/// build stamp moves) and their FTS entries; removed pages lose theirs.
+/// `prev_build = None` (first publish) falls back to the full rebuild. Same
+/// transaction contract as the rebuild: runs inside the §35 activate
+/// transaction, where a failure aborts the whole commit point.
+pub fn update_search_index(
+    conn: &Connection,
+    prev_build: Option<&BuildId>,
+    build_id: &BuildId,
+    tokenizer: &dyn SearchTokenizer,
+) -> Result<SearchIndexStats> {
+    if !probe_fts5(conn) {
+        return Err(WikiError::Index(FTS5_UNAVAILABLE.to_owned()));
+    }
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS wiki_fts USING fts5(
+            title, headings, body, aliases, tokenize = 'unicode61'
+        )",
+    )
+    .map_err(|e| WikiError::Storage(format!("create wiki_fts: {e}")))?;
+    let Some(prev_build) = prev_build else {
+        return rebuild_search_index(conn, build_id, tokenizer);
+    };
+
+    let prev_hashes = page_body_hashes(conn, prev_build)?;
+    let new_hashes = page_body_hashes(conn, build_id)?;
+
+    let mut insert_text = conn
+        .prepare(
+            "INSERT INTO wiki_page_text (page_id, build_id, slug, title, aliases_json, heading_path_json, body)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .map_err(|e| WikiError::Storage(format!("prepare text insert: {e}")))?;
+    let mut insert_fts = conn
+        .prepare(
+            "INSERT INTO wiki_fts (rowid, title, headings, body, aliases) VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .map_err(|e| WikiError::Storage(format!("prepare fts insert: {e}")))?;
+    let mut select_page = conn
+        .prepare("SELECT slug, title, content FROM wiki_pages WHERE build_id = ?1 AND page_id = ?2")
+        .map_err(|e| WikiError::Storage(format!("prepare index page: {e}")))?;
+
+    let mut reindexed = 0usize;
+    for (page_id, body_hash) in &new_hashes {
+        match prev_hashes.get(page_id) {
+            // Byte-identical carried page: keep the tokenized rows, move the
+            // build stamp so the active-build filter keeps finding it.
+            Some(prev_hash) if prev_hash == body_hash => {
+                conn.execute(
+                    "UPDATE wiki_page_text SET build_id = ?1 WHERE page_id = ?2",
+                    params![build_id.as_str(), page_id],
+                )
+                .map_err(db)?;
+            }
+            // Changed or brand-new page: re-parse and re-tokenize.
+            _ => {
+                delete_page_index_rows(conn, page_id)?;
+                let (slug, title, content) = select_page
+                    .query_row(params![build_id.as_str(), page_id], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })
+                    .map_err(db)?;
+                index_page(
+                    &mut insert_text,
+                    &mut insert_fts,
+                    tokenizer,
+                    page_id,
+                    build_id,
+                    &slug,
+                    &title,
+                    &content,
+                )?;
+                reindexed += 1;
+            }
+        }
+    }
+    for page_id in prev_hashes.keys() {
+        if !new_hashes.contains_key(page_id) {
+            delete_page_index_rows(conn, page_id)?;
+        }
+    }
+    let sections: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM wiki_page_text WHERE build_id = ?1",
+            params![build_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(db)?;
+    tracing::debug!(
+        pages = new_hashes.len(),
+        reindexed,
+        "incremental FTS update"
+    );
+    Ok(SearchIndexStats {
+        pages: new_hashes.len(),
+        sections: sections as usize,
+    })
 }
 
 /// Frontmatter `aliases` (comma-separated, V0.2 fixtures leave it empty) as
@@ -335,14 +504,19 @@ pub fn activate_build_with_search_index(
     let tx = conn
         .transaction()
         .map_err(|e| WikiError::Storage(format!("begin tx: {e}")))?;
+    // The diff base is the CURRENT active generation, read before the swap:
+    // the derived indexes move to the new state first (incrementally, audit
+    // FIX-010/011 — O(changed), not O(total)), THEN the pointer flips, so the
+    // activation itself stays short (audit FIX-012).
+    let prev_build = crate::state::get_active_build_id(&tx)?;
+    let stats = update_search_index(&tx, prev_build.as_ref(), build_id, tokenizer)?;
+    let graph_stats = crate::graph::update_graph(&tx, prev_build.as_ref(), build_id)?;
     crate::state::activate_in_tx(&tx, build_id)?;
-    let stats = rebuild_search_index(&tx, build_id, tokenizer)?;
-    let graph_stats = crate::graph::rebuild_graph(&tx, build_id)?;
     tracing::debug!(
         nodes = graph_stats.nodes,
         edges = graph_stats.edges,
         skipped = graph_stats.skipped_edges,
-        "wiki graph rebuilt with the activated generation"
+        "wiki graph updated with the activated generation"
     );
     tx.commit()
         .map_err(|e| WikiError::Storage(format!("commit activate_build: {e}")))?;
@@ -740,6 +914,129 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM wiki_page_text", [], |r| r.get(0))
             .unwrap();
         assert_eq!(rows, 0, "the index rebuild joined the aborted transaction");
+    }
+
+    /// Audit FIX-010 acceptance: the incremental update path must land in
+    /// EXACTLY the same state as a full rebuild of the same generation —
+    /// carried pages keep their rows (re-stamped), changed pages re-tokenize,
+    /// removed pages leave the index.
+    #[test]
+    fn incremental_update_equals_full_rebuild() {
+        let tokenizer = default_tokenizer();
+        let ids: Vec<WikiPageId> = [
+            "wp_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "wp_01BX5ZZKBKACTAV9WEVGEMMVRZ",
+            "wp_01CZZZZZZZZZZZZZZZZZZZZZZZ",
+            "wp_01DZZZZZZZZZZZZZZZZZZZZZZZ",
+        ]
+        .map(WikiPageId::parse)
+        .map(Result::unwrap)
+        .to_vec();
+        let with_id =
+            |id: &WikiPageId, slug: &str, title: &str, content: &str| crate::wiki::WikiPageRecord {
+                page_id: id.clone(),
+                slug: slug.to_owned(),
+                title: title.to_owned(),
+                category: "concepts".into(),
+                language: "en".into(),
+                body_hash: llm_wiki_core::hash::sha256_hex(content.as_bytes()),
+                content: content.to_owned(),
+                knowledge_refs: Vec::new(),
+                citations: Vec::new(),
+                links: Vec::new(),
+            };
+        // Generation A: three pages.
+        let a_pages = vec![
+            with_id(
+                &ids[0],
+                "carried",
+                "Carried Page",
+                "# Carried\n\ncarried 检查点 body",
+            ),
+            with_id(
+                &ids[1],
+                "changed",
+                "Changed Page",
+                "# Changed\n\nold 单点登录 body",
+            ),
+            with_id(
+                &ids[2],
+                "dropped",
+                "Dropped Page",
+                "# Dropped\n\ndropped content",
+            ),
+        ];
+        // Generation B: page 0 carried verbatim, page 1 recompiled (same id,
+        // new content), page 3 added, page 2 removed.
+        let b_pages = vec![
+            with_id(
+                &ids[0],
+                "carried",
+                "Carried Page",
+                "# Carried\n\ncarried 检查点 body",
+            ),
+            with_id(
+                &ids[1],
+                "changed",
+                "Changed Page",
+                "# Changed\n\nnew 流任务 body",
+            ),
+            with_id(
+                &ids[3],
+                "fresh",
+                "Fresh Page",
+                "# Fresh\n\nfresh SSO 登录 body",
+            ),
+        ];
+
+        // Connection 1: A activated fully, then B via the INCREMENTAL path.
+        let mut incremental = open_in_memory().unwrap();
+        let build_a = start_build(&mut incremental, &BuildDraft::default()).unwrap();
+        persist(&mut incremental, &build_a, &a_pages);
+        _activate(&mut incremental, &build_a, tokenizer).unwrap();
+        let build_b = start_build(&mut incremental, &BuildDraft::default()).unwrap();
+        persist(&mut incremental, &build_b, &b_pages);
+        _activate(&mut incremental, &build_b, tokenizer).unwrap();
+
+        // Connection 2: B via the FULL rebuild path only.
+        let mut full = open_in_memory().unwrap();
+        let build_b2 = start_build(&mut full, &BuildDraft::default()).unwrap();
+        persist(&mut full, &build_b2, &b_pages);
+        _activate(&mut full, &build_b2, tokenizer).unwrap();
+
+        let snapshot = |conn: &Connection| -> Vec<(String, String, String, String, String)> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT t.page_id, t.slug, t.title, t.heading_path_json, f.body
+                     FROM wiki_page_text t JOIN wiki_fts f ON f.rowid = t.text_id
+                     ORDER BY t.page_id, t.heading_path_json",
+                )
+                .unwrap();
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+        };
+        assert_eq!(
+            snapshot(&incremental),
+            snapshot(&full),
+            "incremental update must equal a full rebuild of the same generation"
+        );
+
+        // The active-build filter still finds carried content after the
+        // re-stamp, and removed content is gone.
+        let hits = search(&incremental, "检查点", 10);
+        assert!(hits.iter().any(|hit| hit.slug == "carried"));
+        let hits = search(&incremental, "dropped", 10);
+        assert!(hits.is_empty(), "removed page leaves the index");
     }
 
     #[test]

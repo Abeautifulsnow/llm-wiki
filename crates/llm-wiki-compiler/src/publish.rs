@@ -28,7 +28,9 @@
 //! directory-swap atomicity is assumed and the previous good generation is
 //! always retained.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use rusqlite::params;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -298,14 +300,67 @@ pub fn page_file_name(slug: &str, page_id: &str) -> String {
     }
 }
 
+/// Computes the reuse set for one publish: pages whose (page_id, body_hash)
+/// pair exists in the previous generation AND whose previous-generation file
+/// is still on disk. Body hash equality means the compiled content is
+/// byte-identical, so the old file can back the new one via hardlink.
+fn reusable_pages(
+    conn: &rusqlite::Connection,
+    paths: &PublishPaths,
+    previous: Option<&BuildId>,
+    pages: &[WikiPageRecord],
+) -> Result<ReusablePages> {
+    let Some(previous) = previous else {
+        return Ok(BTreeMap::new());
+    };
+    let mut stmt = conn
+        .prepare("SELECT page_id, body_hash, slug FROM wiki_pages WHERE build_id = ?1")
+        .map_err(|e| WikiError::Storage(format!("prepare prev pages: {e}")))?;
+    let prev_rows = stmt
+        .query_map(params![previous.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| WikiError::Storage(format!("prev pages: {e}")))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| WikiError::Storage(e.to_string()))?;
+    drop(stmt);
+    let prev_dir = paths.generation_dir(previous);
+    let mut reuse = BTreeMap::new();
+    for page in pages {
+        let Some((_, _, prev_slug)) = prev_rows.iter().find(|(prev_id, prev_hash, _)| {
+            prev_id == page.page_id.as_str() && prev_hash == &page.body_hash
+        }) else {
+            continue;
+        };
+        let prev_path = prev_dir.join(page_file_name(prev_slug, page.page_id.as_str()));
+        if prev_path.is_file() {
+            reuse.insert(page.page_id.as_str().to_owned(), prev_path);
+        }
+    }
+    Ok(reuse)
+}
+
+/// Pages whose (page_id, body_hash) pair is byte-identical to the previous
+/// generation: page_id → that generation's on-disk file. Hardlinking a
+/// carried page reuses the object instead of rewriting the bytes (audit
+/// FIX-013) — no data copy on publish, no re-hash on validation.
+pub type ReusablePages = BTreeMap<String, PathBuf>;
+
 /// Step 1: writes the immutable generation (one .md per page). Pages must be
 /// fully written before any pointer move. Distinct slugs that sanitize onto
 /// the same file name are rejected BEFORE anything is written — a silent
-/// overwrite would drop a page from the published wiki.
+/// overwrite would drop a page from the published wiki. Carried pages in
+/// `reuse` are hardlinked from their previous-generation file (falling back
+/// to a plain write when the filesystem refuses) instead of rewritten.
 pub fn write_generation(
     paths: &PublishPaths,
     build_id: &BuildId,
     pages: &[WikiPageRecord],
+    reuse: &ReusablePages,
 ) -> Result<()> {
     let dir = paths.generation_dir(build_id);
     // Pre-compute every file name: no partial generation on a slug collision.
@@ -324,6 +379,19 @@ pub fn write_generation(
         .map_err(|e| WikiError::Storage(format!("cannot create {}: {e}", dir.display())))?;
     for page in pages {
         let path = dir.join(page_file_name(&page.slug, page.page_id.as_str()));
+        if let Some(source) = reuse.get(page.page_id.as_str()) {
+            // A hardlink shares the inode: no content bytes are copied. The
+            // shared object was hash-validated at its own publish; hand
+            // edits to it are a broken-immutability condition that lint
+            // (§36 hand-edited-file) flags on the active generation.
+            if std::fs::hard_link(source, &path).is_ok() {
+                continue;
+            }
+            tracing::debug!(
+                source = %source.display(),
+                "hardlink refused by the filesystem; writing the carried page instead"
+            );
+        }
         std::fs::write(&path, &page.content)
             .map_err(|e| WikiError::Storage(format!("cannot write {}: {e}", path.display())))?;
     }
@@ -331,11 +399,15 @@ pub fn write_generation(
 }
 
 /// Step 2: validates the generation — page set non-empty, every file present,
-/// content hash matches `body_hash` (PRD §35).
+/// content hash matches `body_hash` (PRD §35). Pages in `reused` were
+/// hardlinked from the previous generation's validated file: the shared
+/// inode is checked for presence and size only, skipping the O(unchanged)
+/// read-back + re-hash (audit FIX-013).
 pub fn validate_generation(
     paths: &PublishPaths,
     build_id: &BuildId,
     pages: &[WikiPageRecord],
+    reused: &BTreeSet<String>,
 ) -> Result<()> {
     if pages.is_empty() {
         return Err(WikiError::Compilation(format!(
@@ -345,6 +417,25 @@ pub fn validate_generation(
     let dir = paths.generation_dir(build_id);
     for page in pages {
         let path = dir.join(page_file_name(&page.slug, page.page_id.as_str()));
+        if reused.contains(page.page_id.as_str()) {
+            let len = std::fs::metadata(&path)
+                .map(|meta| meta.len() as usize)
+                .map_err(|e| {
+                    WikiError::Compilation(format!(
+                        "generation {build_id} invalid: {} is missing or unreadable: {e}",
+                        path.display()
+                    ))
+                })?;
+            if len != page.content.len() {
+                return Err(WikiError::Compilation(format!(
+                    "generation {build_id} invalid: {} has {} bytes, expected {}",
+                    path.display(),
+                    len,
+                    page.content.len()
+                )));
+            }
+            continue;
+        }
         let content = std::fs::read(&path).map_err(|e| {
             WikiError::Compilation(format!(
                 "generation {build_id} invalid: {} is missing or unreadable: {e}",
@@ -370,7 +461,9 @@ fn validate_generation_from_db(
     build_id: &BuildId,
 ) -> Result<()> {
     let pages = load_generation_pages(conn, build_id)?;
-    validate_generation(paths, build_id, &pages)
+    // Recovery validates EVERYTHING from disk: the reused-object assumption
+    // (validated at the source publish) must not be trusted after a crash.
+    validate_generation(paths, build_id, &pages, &BTreeSet::new())
 }
 
 // ---------------------------------------------------------------------------
@@ -403,18 +496,21 @@ pub fn publish(
         )));
     }
 
-    // Step 1+2: write and validate the immutable generation FIRST — until the
-    // files verify, nothing else happens.
-    write_generation(&paths, build_id, pages)?;
-    validate_generation(&paths, build_id, pages)?;
-
-    // The generation the pointer names is the explicit rollback target.
+    // The generation the pointer names is the explicit rollback target; it is
+    // also the reuse base for byte-identical carried pages (audit FIX-013).
     let previous = match read_current_pointer(&paths)? {
         Some(pointer) => Some(BuildId::parse(pointer.build_id.clone()).map_err(|e| {
             WikiError::PublishRecovery(format!("current.json holds an invalid build id: {e}"))
         })?),
         None => get_active_build_id(conn)?,
     };
+    let reuse = reusable_pages(conn, &paths, previous.as_ref(), pages)?;
+    let reused: BTreeSet<String> = reuse.keys().cloned().collect();
+
+    // Step 1+2: write and validate the immutable generation FIRST — until the
+    // files verify, nothing else happens.
+    write_generation(&paths, build_id, pages, &reuse)?;
+    validate_generation(&paths, build_id, pages, &reused)?;
 
     // Step 3: generation rows are already persisted; the build goes READY.
     update_build_status(conn, build_id, "READY")?;
@@ -834,20 +930,20 @@ mod tests {
         let pages = vec![page("runtime", "# Runtime\n\nbody")];
 
         assert!(
-            validate_generation(&paths, &build, &pages).is_err(),
+            validate_generation(&paths, &build, &pages, &BTreeSet::new()).is_err(),
             "empty dir"
         );
 
-        write_generation(&paths, &build, &pages).unwrap();
-        validate_generation(&paths, &build, &pages).unwrap();
+        write_generation(&paths, &build, &pages, &BTreeMap::new()).unwrap();
+        validate_generation(&paths, &build, &pages, &BTreeSet::new()).unwrap();
 
         // Tamper with the file: hash must stop matching.
         let file = paths.generation_dir(&build).join("runtime.md");
         std::fs::write(&file, "# Tampered").unwrap();
-        assert!(validate_generation(&paths, &build, &pages).is_err());
+        assert!(validate_generation(&paths, &build, &pages, &BTreeSet::new()).is_err());
 
         // Empty page set is rejected outright.
-        assert!(validate_generation(&paths, &build, &[]).is_err());
+        assert!(validate_generation(&paths, &build, &[], &BTreeSet::new()).is_err());
     }
 
     #[test]
@@ -980,7 +1076,7 @@ mod tests {
         let build = BuildId::generate();
         // "a b" and "a-b" sanitize onto the same file name.
         let pages = vec![page("a b", "# A"), page("a-b", "# B")];
-        let err = write_generation(&paths, &build, &pages).unwrap_err();
+        let err = write_generation(&paths, &build, &pages, &BTreeMap::new()).unwrap_err();
         let message = err.to_string();
         assert!(
             message.contains("\"a b\"") && message.contains("\"a-b\""),

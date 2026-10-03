@@ -142,19 +142,16 @@ fn insert_page_nodes(tx: &Transaction, build_id: &BuildId) -> Result<usize> {
     Ok(inserted)
 }
 
-/// Phase 2: one node per ACTIVE `entity`/`concept` registry entry (§17 node
-/// vocabulary; claims/topics never enter). Returns the map from RAW registry
-/// id to graph node id — a registry id carries no kind, the graph node does,
-/// and this map is what relation endpoints are resolved against.
-fn insert_registry_nodes(tx: &Transaction) -> Result<BTreeMap<String, String>> {
-    let mut stmt = tx
+/// The ACTIVE `entity`/`concept` registry entries: (raw id, kind, label).
+fn registry_rows(conn: &Connection) -> Result<Vec<(String, String, String)>> {
+    let mut stmt = conn
         .prepare(
             "SELECT id, node_kind, canonical_name, canonical_key FROM knowledge_registry
              WHERE status = 'active' AND node_kind IN ('entity', 'concept')
              ORDER BY id",
         )
         .map_err(|e| WikiError::Storage(format!("prepare graph registry nodes: {e}")))?;
-    let registry_rows: Vec<(String, String, Option<String>, String)> = stmt
+    let rows: Vec<(String, String, Option<String>, String)> = stmt
         .query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -166,15 +163,27 @@ fn insert_registry_nodes(tx: &Transaction) -> Result<BTreeMap<String, String>> {
         .map_err(|e| WikiError::Storage(format!("graph registry nodes: {e}")))?
         .collect::<std::result::Result<_, _>>()
         .map_err(db)?;
-    drop(stmt);
+    Ok(rows
+        .into_iter()
+        .map(|(id, kind, canonical_name, canonical_key)| {
+            let label = canonical_name
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or(canonical_key);
+            (id, kind, label)
+        })
+        .collect())
+}
+
+/// Phase 2: one node per ACTIVE `entity`/`concept` registry entry (§17 node
+/// vocabulary; claims/topics never enter). Returns the map from RAW registry
+/// id to graph node id — a registry id carries no kind, the graph node does,
+/// and this map is what relation endpoints are resolved against.
+fn insert_registry_nodes(tx: &Transaction) -> Result<BTreeMap<String, String>> {
     let mut insert_node = tx
         .prepare("INSERT INTO graph_nodes (id, node_type, label) VALUES (?1, ?2, ?3)")
         .map_err(|e| WikiError::Storage(format!("prepare graph node insert: {e}")))?;
     let mut registry_nodes = BTreeMap::new();
-    for (id, kind, canonical_name, canonical_key) in registry_rows {
-        let label = canonical_name
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or(canonical_key);
+    for (id, kind, label) in registry_rows(tx)? {
         let node_id = format!("{kind}:{id}");
         insert_node
             .execute(params![node_id, kind, label])
@@ -335,6 +344,352 @@ fn insert_relation_edges(
     Ok(skipped)
 }
 
+/// One page's graph-relevant signature: title, link pairs, knowledge refs.
+/// Pages whose signature is unchanged between generations keep their node
+/// and edges untouched (audit FIX-011) — body-only edits never touch the graph.
+struct PageGraphSignature {
+    title: String,
+    links: BTreeSet<(String, String)>,
+    refs: BTreeSet<String>,
+}
+
+/// `page_id → signature` for one build.
+fn page_graph_signatures(
+    conn: &Connection,
+    build_id: &BuildId,
+) -> Result<BTreeMap<String, PageGraphSignature>> {
+    let mut sigs: BTreeMap<String, PageGraphSignature> = BTreeMap::new();
+    {
+        let mut stmt = conn
+            .prepare("SELECT page_id, title FROM wiki_pages WHERE build_id = ?1")
+            .map_err(|e| WikiError::Storage(format!("prepare sig pages: {e}")))?;
+        let rows = stmt
+            .query_map(params![build_id.as_str()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| WikiError::Storage(format!("sig pages: {e}")))?;
+        for row in rows {
+            let (page_id, title) = row.map_err(db)?;
+            sigs.insert(
+                page_id,
+                PageGraphSignature {
+                    title,
+                    links: BTreeSet::new(),
+                    refs: BTreeSet::new(),
+                },
+            );
+        }
+    }
+    {
+        let mut stmt = conn
+            .prepare("SELECT from_page_id, to_page_id FROM page_links WHERE build_id = ?1")
+            .map_err(|e| WikiError::Storage(format!("prepare sig links: {e}")))?;
+        let rows = stmt
+            .query_map(params![build_id.as_str()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| WikiError::Storage(format!("sig links: {e}")))?;
+        for row in rows {
+            let (from, to) = row.map_err(db)?;
+            if let Some(sig) = sigs.get_mut(&from) {
+                sig.links.insert((from.clone(), to));
+            }
+        }
+    }
+    {
+        let mut stmt = conn
+            .prepare("SELECT page_id, knowledge_refs_json FROM wiki_pages WHERE build_id = ?1")
+            .map_err(|e| WikiError::Storage(format!("prepare sig refs: {e}")))?;
+        let rows = stmt
+            .query_map(params![build_id.as_str()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| WikiError::Storage(format!("sig refs: {e}")))?;
+        for row in rows {
+            let (page_id, refs_json) = row.map_err(db)?;
+            let refs: BTreeSet<String> = parse_knowledge_refs(&refs_json)?
+                .into_iter()
+                .map(|node_id| node_id.as_str().to_owned())
+                .collect();
+            if let Some(sig) = sigs.get_mut(&page_id) {
+                sig.refs = refs;
+            }
+        }
+    }
+    Ok(sigs)
+}
+
+/// Incremental graph update (audit FIX-011): diff `build_id` against the
+/// previous ACTIVE generation and touch only what changed —
+/// - pages whose graph signature (title, links, refs) changed are rebuilt
+///   node-and-edges; removed pages lose node and all touching edges; added
+///   pages gain theirs. Unchanged pages (including their inbound links from
+///   carried siblings) are left alone;
+/// - the registry node set and the active relation set are applied as
+///   deltas, keyed by their stable edge ids (`rel:{relation_id}`).
+///
+/// `prev_build = None` (first publish) falls back to the full rebuild. Same
+/// transaction contract as the rebuild (§35 activate transaction).
+pub fn update_graph(
+    tx: &Transaction,
+    prev_build: Option<&BuildId>,
+    build_id: &BuildId,
+) -> Result<GraphStats> {
+    let Some(prev_build) = prev_build else {
+        return rebuild_graph(tx, build_id);
+    };
+    let prev_sigs = page_graph_signatures(tx, prev_build)?;
+    let new_sigs = page_graph_signatures(tx, build_id)?;
+
+    let mut statements = tx
+        .prepare("DELETE FROM graph_edges WHERE source_id = ?1 OR target_id = ?1")
+        .map_err(db)?;
+    let mut delete_node = tx
+        .prepare("DELETE FROM graph_nodes WHERE id = ?1")
+        .map_err(db)?;
+    let mut insert_node = tx
+        .prepare("INSERT INTO graph_nodes (id, node_type, label) VALUES (?1, ?2, ?3)")
+        .map_err(db)?;
+
+    // Page nodes and edges for the touch set (edges before nodes — FK).
+    let mut touched: Vec<(String, &PageGraphSignature)> = Vec::new();
+    for (page_id, sig) in &new_sigs {
+        let changed = match prev_sigs.get(page_id) {
+            Some(prev_sig) => {
+                prev_sig.title != sig.title
+                    || prev_sig.links != sig.links
+                    || prev_sig.refs != sig.refs
+            }
+            None => true, // added
+        };
+        if changed {
+            let node_id = format!("page:{page_id}");
+            statements.execute(params![node_id.clone()]).map_err(db)?;
+            delete_node.execute(params![node_id]).map_err(db)?;
+            touched.push((page_id.clone(), sig));
+        }
+    }
+    for page_id in prev_sigs.keys() {
+        if !new_sigs.contains_key(page_id) {
+            let node_id = format!("page:{page_id}");
+            statements.execute(params![node_id.clone()]).map_err(db)?;
+            delete_node.execute(params![node_id]).map_err(db)?;
+        }
+    }
+    for (page_id, sig) in &touched {
+        insert_node
+            .execute(params![
+                format!("page:{page_id}"),
+                NODE_TYPE_PAGE,
+                sig.title
+            ])
+            .map_err(db)?;
+    }
+    drop(statements);
+    drop(delete_node);
+    drop(insert_node);
+
+    // Outgoing links_to for touched pages, from the NEW build's rows. A
+    // changed page's incoming links from unchanged siblings are rebuilt too:
+    // the (from → to) pair query covers both directions of the touch set.
+    {
+        let mut select_links = tx
+            .prepare(
+                "SELECT link_id, from_page_id, to_page_id FROM page_links
+                 WHERE build_id = ?1 AND (from_page_id = ?2 OR to_page_id = ?2)",
+            )
+            .map_err(db)?;
+        let mut insert_edge = tx
+            .prepare(
+                "INSERT INTO graph_edges (id, source_id, relation_type, target_id)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )
+            .map_err(db)?;
+        for (page_id, _) in &touched {
+            let rows = select_links
+                .query_map(params![build_id.as_str(), page_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(db)?;
+            for row in rows {
+                let (link_id, from, to) = row.map_err(db)?;
+                insert_edge
+                    .execute(params![
+                        format!("link:{link_id}"),
+                        format!("page:{from}"),
+                        RELATION_LINKS_TO,
+                        format!("page:{to}")
+                    ])
+                    .map_err(db)?;
+            }
+        }
+    }
+
+    // Registry node delta: graph currently holds the PREVIOUS active set.
+    let mut registry_nodes: BTreeMap<String, String> = BTreeMap::new();
+    {
+        let mut existing: BTreeMap<String, String> = BTreeMap::new(); // raw id → node id
+        {
+            let mut select = tx
+                .prepare("SELECT id FROM graph_nodes WHERE node_type IN ('entity', 'concept')")
+                .map_err(db)?;
+            let rows = select
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(db)?;
+            for row in rows {
+                let node_id: String = row.map_err(db)?;
+                let raw = node_id
+                    .split_once(':')
+                    .map(|(_, raw)| raw.to_owned())
+                    .unwrap_or_else(|| node_id.clone());
+                existing.insert(raw, node_id);
+            }
+        }
+        let active_rows = registry_rows(tx)?;
+        let mut insert_node = tx
+            .prepare("INSERT INTO graph_nodes (id, node_type, label) VALUES (?1, ?2, ?3)")
+            .map_err(db)?;
+        for (raw, kind, label) in &active_rows {
+            let node_id = format!("{kind}:{raw}");
+            if !existing.contains_key(raw) {
+                insert_node
+                    .execute(params![node_id.clone(), kind, label])
+                    .map_err(db)?;
+            }
+            registry_nodes.insert(raw.clone(), node_id);
+        }
+        drop(insert_node);
+        // Retired registry nodes leave the graph with their edges.
+        let mut delete_edges = tx
+            .prepare("DELETE FROM graph_edges WHERE source_id = ?1 OR target_id = ?1")
+            .map_err(db)?;
+        let mut delete_node = tx
+            .prepare("DELETE FROM graph_nodes WHERE id = ?1")
+            .map_err(db)?;
+        for (raw, node_id) in &existing {
+            if !registry_nodes.contains_key(raw) {
+                delete_edges.execute(params![node_id]).map_err(db)?;
+                delete_node.execute(params![node_id]).map_err(db)?;
+            }
+        }
+    }
+
+    // `contains` edges for touched pages (claims/topics skip silently —
+    // pages citing claims are the norm, not a filter event).
+    {
+        let mut insert_edge = tx
+            .prepare(
+                "INSERT INTO graph_edges (id, source_id, relation_type, target_id)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )
+            .map_err(db)?;
+        for (page_id, sig) in &touched {
+            for raw in &sig.refs {
+                let Some(target) = registry_nodes.get(raw) else {
+                    continue;
+                };
+                insert_edge
+                    .execute(params![
+                        format!("contains:{page_id}:{raw}"),
+                        format!("page:{page_id}"),
+                        RELATION_CONTAINS,
+                        target,
+                    ])
+                    .map_err(db)?;
+            }
+        }
+    }
+
+    // Relation delta keyed by the stable `rel:{relation_id}` edge id.
+    let mut skipped_edges = 0usize;
+    {
+        let mut desired: BTreeMap<String, (String, String, String)> = BTreeMap::new();
+        {
+            let mut select = tx
+                .prepare(
+                    "SELECT relation_id, source_node_id, relation_type, target_node_id
+                     FROM relations WHERE status = 'active' ORDER BY relation_id",
+                )
+                .map_err(db)?;
+            let rows = select
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(db)?;
+            for row in rows {
+                let (relation_id, source, relation_type, target) = row.map_err(db)?;
+                match (registry_nodes.get(&source), registry_nodes.get(&target)) {
+                    (Some(source_node), Some(target_node)) => {
+                        desired.insert(
+                            format!("rel:{relation_id}"),
+                            (source_node.clone(), relation_type, target_node.clone()),
+                        );
+                    }
+                    _ => skipped_edges += 1,
+                }
+            }
+        }
+        let mut existing_rel: BTreeSet<String> = BTreeSet::new();
+        {
+            let mut select = tx
+                .prepare("SELECT id FROM graph_edges WHERE id LIKE 'rel:%'")
+                .map_err(db)?;
+            let rows = select
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(db)?;
+            for row in rows {
+                existing_rel.insert(row.map_err(db)?);
+            }
+        }
+        let mut insert_edge = tx
+            .prepare(
+                "INSERT INTO graph_edges (id, source_id, relation_type, target_id)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )
+            .map_err(db)?;
+        for (edge_id, (source, relation_type, target)) in &desired {
+            if !existing_rel.contains(edge_id) {
+                insert_edge
+                    .execute(params![edge_id, source, relation_type, target])
+                    .map_err(db)?;
+            }
+        }
+        let mut delete_edge = tx
+            .prepare("DELETE FROM graph_edges WHERE id = ?1")
+            .map_err(db)?;
+        let desired_ids: BTreeSet<String> = desired.keys().cloned().collect();
+        for edge_id in existing_rel.difference(&desired_ids).collect::<Vec<_>>() {
+            delete_edge.execute(params![edge_id]).map_err(db)?;
+        }
+    }
+
+    // Final totals (the update's answer must equal a full rebuild's).
+    let nodes: usize = tx
+        .query_row("SELECT COUNT(*) FROM graph_nodes", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(db)? as usize;
+    let edges: usize = tx
+        .query_row("SELECT COUNT(*) FROM graph_edges", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(db)? as usize;
+    Ok(GraphStats {
+        nodes,
+        edges,
+        skipped_edges,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Recovery-side verification
 // ---------------------------------------------------------------------------
@@ -493,6 +848,7 @@ pub fn graph_expand_from_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::open_in_memory;
     use crate::registry::NodeDraft;
     use crate::sources::upsert_source;
     use crate::wiki::{persist_generation, PageLinkRecord, WikiPageRecord};
@@ -759,6 +1115,254 @@ mod tests {
             )
             .unwrap();
         assert_eq!(edges, 1);
+    }
+
+    /// Audit FIX-011 acceptance: the incremental update path must land in
+    /// EXACTLY the same graph state as a full rebuild of the same generation.
+    /// The scenario covers every diff class: a carried page (untouched), a
+    /// page whose title and refs change, an added page with links, a removed
+    /// page, a registry node retired between generations, and a new active
+    /// relation.
+    #[test]
+    fn incremental_graph_update_equals_full_rebuild() {
+        // Registry fixture per connection: entity "sso" + concept
+        // "single sign-on" (+ a claim that must never enter the graph).
+        let setup = |conn: &mut Connection| -> (BuildId, BuildId, Vec<KnowledgeNodeId>) {
+            let (source_id, _) = upsert_source(
+                conn,
+                &SourceLocatorKey::compute("ws", "eq/arch.md"),
+                "eq/arch.md",
+                "hash-eq",
+                10,
+                None,
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO document_analyses (analysis_id, source_id, status, created_at)
+                 VALUES ('an_eq', ?1, 'completed', '2026-01-01')",
+                params![source_id.as_str()],
+            )
+            .unwrap();
+            let drafts = vec![
+                NodeDraft {
+                    kind: NodeKind::Entity,
+                    canonical_key: "sso".into(),
+                    canonical_name: "SSO".into(),
+                    entity_type: None,
+                    description: None,
+                },
+                NodeDraft {
+                    kind: NodeKind::Concept,
+                    canonical_key: "single sign-on".into(),
+                    canonical_name: "Single Sign-On".into(),
+                    entity_type: None,
+                    description: None,
+                },
+                NodeDraft {
+                    kind: NodeKind::Claim,
+                    canonical_key: "eq-claim".into(),
+                    canonical_name: "claim".into(),
+                    entity_type: None,
+                    description: None,
+                },
+            ];
+            let ids = crate::get_or_create_batch(conn, &drafts, None).unwrap();
+            // Generation A: a relation entity→concept, one claim relation
+            // (skipped), two pages: p1 refs the entity, p2 links to p1 and
+            // refs the claim.
+            conn.execute(
+                "INSERT INTO relations (relation_id, analysis_id, source_node_id, relation_type, target_node_id, status)
+                 VALUES ('rel_eq_1', 'an_eq', ?1, 'related_to', ?2, 'active')",
+                params![ids[0].as_str(), ids[1].as_str()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO relations (relation_id, analysis_id, source_node_id, relation_type, target_node_id, status)
+                 VALUES ('rel_eq_2', 'an_eq', ?1, 'related_to', ?2, 'active')",
+                params![ids[0].as_str(), ids[2].as_str()],
+            )
+            .unwrap();
+            (
+                start_build(conn, &BuildDraft::default()).unwrap(),
+                start_build(conn, &BuildDraft::default()).unwrap(),
+                ids,
+            )
+        };
+
+        // Pages per connection (page ULIDs are connection-local; the carried
+        // page keeps its id across the two builds of the SAME connection).
+        let make_pages = |ids: &[KnowledgeNodeId]| {
+            let page_with_refs = |page_id: Option<WikiPageId>,
+                                  slug: &str,
+                                  title: &str,
+                                  links: &[WikiPageRecord],
+                                  refs: &[usize]| WikiPageRecord {
+                page_id: page_id.unwrap_or_else(WikiPageId::generate),
+                slug: slug.to_owned(),
+                title: title.to_owned(),
+                category: "concepts".into(),
+                language: "en".into(),
+                body_hash: sha256_hex(slug.as_bytes()),
+                content: format!("# {title}\n\nbody\n"),
+                knowledge_refs: refs.iter().map(|&i| ids[i].clone()).collect(),
+                citations: Vec::new(),
+                links: links
+                    .iter()
+                    .map(|prev| PageLinkRecord {
+                        to_page_id: prev.page_id.clone(),
+                        target_title: prev.title.clone(),
+                    })
+                    .collect(),
+            };
+            let p1 = page_with_refs(None, "eq-one", "Eq One", &[], &[0]);
+            let p2 = page_with_refs(None, "eq-two", "Eq Two", std::slice::from_ref(&p1), &[2]);
+            let a_pages = vec![p1.clone(), p2.clone()];
+            // Generation B: p1 carried verbatim (same id); p2 retitled + refs
+            // the concept instead of the claim; p3 added linking to p1; p2's
+            // old claim ref disappears with the recompile.
+            let p1b = page_with_refs(Some(p1.page_id.clone()), "eq-one", "Eq One", &[], &[0]);
+            let p2b = page_with_refs(None, "eq-two", "Eq Two Renamed", &[], &[1]);
+            let p3 = page_with_refs(
+                None,
+                "eq-three",
+                "Eq Three",
+                std::slice::from_ref(&p1b),
+                &[1],
+            );
+            let b_pages = vec![p1b, p2b, p3];
+            (a_pages, b_pages)
+        };
+
+        // Connection 1: rebuild(A) then the INCREMENTAL update A→B. A new
+        // active relation concept→entity lands in B via a second analysis row.
+        let mut incremental = open_in_memory().unwrap();
+        let (build_a, build_b, inc_ids) = setup(&mut incremental);
+        incremental
+            .execute(
+                "INSERT INTO relations (relation_id, analysis_id, source_node_id, relation_type, target_node_id, status)
+                 VALUES ('rel_eq_3', 'an_eq', ?1, 'uses', ?2, 'active')",
+                params![inc_ids[1].as_str(), inc_ids[0].as_str()],
+            )
+            .unwrap();
+        let (a_pages, b_pages) = make_pages(&inc_ids);
+        persist_generation(&mut incremental, &build_a, &a_pages).unwrap();
+        persist_generation(&mut incremental, &build_b, &b_pages).unwrap();
+        {
+            let tx = incremental.transaction().unwrap();
+            rebuild_graph(&tx, &build_a).unwrap();
+            update_graph(&tx, Some(&build_a), &build_b).unwrap();
+            tx.commit().unwrap();
+        }
+        // Connection 2: same fixture, full rebuild of B only.
+        let mut full = open_in_memory().unwrap();
+        let (build_b2, _, full_ids) = setup(&mut full);
+        full.execute(
+            "INSERT INTO relations (relation_id, analysis_id, source_node_id, relation_type, target_node_id, status)
+             VALUES ('rel_eq_3', 'an_eq', ?1, 'uses', ?2, 'active')",
+            params![full_ids[1].as_str(), full_ids[0].as_str()],
+        )
+        .unwrap();
+        let (_, full_b_pages) = make_pages(&full_ids);
+        persist_generation(&mut full, &build_b2, &full_b_pages).unwrap();
+        {
+            let tx = full.transaction().unwrap();
+            rebuild_graph(&tx, &build_b2).unwrap();
+            tx.commit().unwrap();
+        }
+
+        // Registry ULIDs differ per connection, so node ids are canonicalized:
+        // registry nodes get a `{type}::{label}` alias, page ids are stable
+        // (the records are shared). Edges are compared by canonical endpoints
+        // and relation type — the id column is connection-local (`link:…`
+        // row ids are regenerated per build).
+        type NodeRow = (String, String, String);
+        let canonical = |conn: &Connection| -> (Vec<NodeRow>, Vec<NodeRow>) {
+            let mut alias: std::collections::BTreeMap<String, String> =
+                std::collections::BTreeMap::new();
+            // Page nodes are connection-local ULIDs too: alias by slug.
+            {
+                let mut stmt = conn
+                    .prepare("SELECT page_id, slug FROM wiki_pages")
+                    .unwrap();
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .unwrap();
+                for row in rows {
+                    let (page_id, slug) = row.unwrap();
+                    alias.insert(format!("page:{page_id}"), format!("page::{slug}"));
+                }
+            }
+            let mut nodes = Vec::new();
+            {
+                let mut stmt = conn
+                    .prepare("SELECT id, node_type, label FROM graph_nodes ORDER BY id")
+                    .unwrap();
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })
+                    .unwrap();
+                for row in rows {
+                    let (id, node_type, label) = row.unwrap();
+                    let key = if node_type == "wiki_page" {
+                        alias[&id].clone()
+                    } else {
+                        format!("{node_type}::{label}")
+                    };
+                    alias.insert(id, key.clone());
+                    nodes.push((key, node_type, label));
+                }
+            }
+            let mut edges = Vec::new();
+            {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT source_id, relation_type, target_id FROM graph_edges
+                             ORDER BY source_id, relation_type, target_id",
+                    )
+                    .unwrap();
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })
+                    .unwrap();
+                for row in rows {
+                    let (source, relation_type, target) = row.unwrap();
+                    edges.push((
+                        alias[&source].clone(),
+                        relation_type,
+                        alias[&target].clone(),
+                    ));
+                }
+            }
+            (nodes, edges)
+        };
+        let (mut left_nodes, mut left_edges) = canonical(&incremental);
+        let (mut right_nodes, mut right_edges) = canonical(&full);
+        // Iteration order follows each connection's ULIDs — compare as sets
+        // by sorting on the canonical keys.
+        left_nodes.sort();
+        right_nodes.sort();
+        left_edges.sort();
+        right_edges.sort();
+        assert_eq!(
+            left_nodes, right_nodes,
+            "node set must equal a full rebuild"
+        );
+        assert_eq!(
+            left_edges, right_edges,
+            "edge set must equal a full rebuild"
+        );
     }
 
     #[test]
