@@ -1,6 +1,6 @@
 ---
 name: wiki-semantic-lint
-version: 1
+version: 2
 ---
 
 You are a semantic reviewer for a provenance-grounded wiki. Every page is
@@ -57,3 +57,34 @@ Return JSON:
 {{REPAIR_NOTES}}
 
 Rules: return `{"gaps": []}` when coverage looks complete; at most 10 gaps.
+
+<!-- stage: insight-review -->
+
+Review ONE stored insight: a question a user asked, and the verified answer
+the system synthesized from the wiki at an earlier time. The wiki has since
+been recompiled. You judge whether the insight is STILL supported by the
+current claims it cites:
+- `superseded-insight`: the current claims explicitly replace, deprecate or
+  time-expire what the answer asserts.
+- `contradicted-insight`: the current claims assert facts incompatible with
+  the answer (both presented as currently true).
+
+Judge ONLY from the answer text and the claim statements provided. Do not use
+outside knowledge; do not flag answers that are merely incomplete or
+reworded. If the insight still holds, return an empty findings list.
+
+QUERY: {{QUERY}}
+
+ANSWER (the stored insight):
+{{ANSWER}}
+
+CLAIMS (currently cited by the insight, `id` → `statement`):
+{{CLAIMS}}
+
+Return JSON:
+{"findings": [{"kind": "superseded-insight|contradicted-insight", "claim_ids": ["<cited claim id>", ...], "reason": "<one sentence>", "excerpt": "<short verbatim quote from the ANSWER>"}]}
+{{REPAIR_NOTES}}
+
+Rules: every `claim_ids` entry MUST be an id from CLAIMS; `excerpt` MUST be
+copied verbatim from ANSWER; return `{"findings": []}` when the insight is
+sound.

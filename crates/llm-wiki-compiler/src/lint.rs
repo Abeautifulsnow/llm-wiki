@@ -22,7 +22,7 @@ use llm_wiki_core::hash::sha256_hex;
 use llm_wiki_core::ids::BuildId;
 use llm_wiki_markdown::parse_document;
 use llm_wiki_storage::list_sources;
-use llm_wiki_storage::{list_active_relation_pairs, load_generation_view};
+use llm_wiki_storage::{list_active_relation_pairs, list_insights, load_generation_view};
 
 use crate::compile::{scan_citations, scan_wikilinks, strip_citations};
 use crate::publish::{page_file_name, read_current_pointer, PublishPaths};
@@ -58,6 +58,7 @@ pub enum LintCheck {
     OrphanPage,
     UnsupportedSection,
     DuplicateConcept,
+    StaleInsight,
     HandEditedFile,
 }
 
@@ -70,6 +71,7 @@ impl LintCheck {
             LintCheck::OrphanPage => "orphan-page",
             LintCheck::UnsupportedSection => "unsupported-section",
             LintCheck::DuplicateConcept => "duplicate-concept",
+            LintCheck::StaleInsight => "stale-insight",
             LintCheck::HandEditedFile => "hand-edited-file",
         }
     }
@@ -163,6 +165,7 @@ pub fn run_lint(workspace_root: &Path, config: &Config) -> Result<Option<LintRep
     check_orphans(&pages, &relation_pairs, &mut report);
     check_sections(&pages, &mut report);
     check_duplicates(&pages, &mut report);
+    check_insights(&conn, &pages, &mut report);
     check_files_on_disk(&paths, &build_id, &pages, &mut report);
     Ok(Some(report.finish()))
 }
@@ -364,6 +367,72 @@ fn check_duplicates(pages: &[llm_wiki_storage::GenerationPageView], report: &mut
     }
 }
 
+/// Insight-consumption check (the write-back loop's read side): every stored
+/// insight is re-verified against the ACTIVE generation. An insight whose
+/// cited claim no longer exists in the generation, or whose recorded
+/// evidence digest drifted, can no longer be traced to its provenance —
+/// flagged as a warning so the curator can re-ask or retire it. Deterministic,
+/// no model involvement.
+fn check_insights(
+    conn: &rusqlite::Connection,
+    pages: &[llm_wiki_storage::GenerationPageView],
+    report: &mut LintReport,
+) {
+    let insights = match list_insights(conn) {
+        Ok(insights) => insights,
+        Err(err) => {
+            tracing::warn!(error = %err, "could not list insights; stale-insight check skipped");
+            return;
+        }
+    };
+    if insights.is_empty() {
+        return;
+    }
+    // Current claim digest map over the active generation: claim node id →
+    // evidence digest (a claim is cited by at most one page, but multiple
+    // citations of it agree by construction; last wins deterministically).
+    let mut claim_digests: BTreeMap<String, String> = BTreeMap::new();
+    for page in pages {
+        for citation in &page.citations {
+            claim_digests.insert(
+                citation.claim_node_id.as_str().to_owned(),
+                citation.evidence_digest.clone(),
+            );
+        }
+    }
+    for insight in insights {
+        for citation in &insight.citations {
+            let Some(current) = claim_digests.get(&citation.claim_node_id) else {
+                report.push(LintFinding {
+                    check: LintCheck::StaleInsight,
+                    severity: LintSeverity::Warning,
+                    page_slug: "(insight)".to_owned(),
+                    message: format!(
+                        "insight {} ({:?}) cites claim {} which is no longer part of the published generation",
+                        insight.insight_id.as_str(),
+                        insight.query,
+                        citation.claim_node_id
+                    ),
+                });
+                continue;
+            };
+            if current != &citation.evidence_digest {
+                report.push(LintFinding {
+                    check: LintCheck::StaleInsight,
+                    severity: LintSeverity::Warning,
+                    page_slug: "(insight)".to_owned(),
+                    message: format!(
+                        "insight {} ({:?}) quotes evidence of claim {} that changed since the insight was written",
+                        insight.insight_id.as_str(),
+                        insight.query,
+                        citation.claim_node_id
+                    ),
+                });
+            }
+        }
+    }
+}
+
 fn check_files_on_disk(
     paths: &PublishPaths,
     build_id: &BuildId,
@@ -445,6 +514,7 @@ mod tests {
             LintCheck::OrphanPage,
             LintCheck::UnsupportedSection,
             LintCheck::DuplicateConcept,
+            LintCheck::StaleInsight,
             LintCheck::HandEditedFile,
         ];
         for pair in ordered.windows(2) {

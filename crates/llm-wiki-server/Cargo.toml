@@ -21,3 +21,6 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 ulid = { workspace = true }
 rusqlite = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }

@@ -91,3 +91,63 @@ pub fn list_insights(conn: &Connection) -> Result<Vec<InsightRecord>> {
     }
     Ok(out)
 }
+
+/// One page of insights, newest first, cursor-paginated (PRD §30: list
+/// endpoints paginate). `cursor` is the previous page's last insight id; the
+/// page starts strictly after it.
+pub fn list_insights_paged(
+    conn: &Connection,
+    limit: usize,
+    cursor: Option<&InsightId>,
+) -> Result<Vec<InsightRecord>> {
+    let cursor_created: Option<String> = match cursor {
+        Some(insight_id) => conn
+            .query_row(
+                "SELECT created_at FROM wiki_insights WHERE insight_id = ?1",
+                params![insight_id.as_str()],
+                |row| row.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(WikiError::Storage(format!("insight cursor: {other}"))),
+            })?
+            .ok_or_else(|| WikiError::Storage(format!("cursor insight {insight_id} not found")))?,
+        None => None,
+    };
+    let mut stmt = conn
+        .prepare(
+            "SELECT insight_id, build_id, query, answer, citations_json, created_at
+             FROM wiki_insights
+             WHERE (?1 IS NULL OR created_at < ?1 OR (created_at = ?1 AND insight_id < ?2))
+             ORDER BY created_at DESC, insight_id DESC LIMIT ?3",
+        )
+        .map_err(|e| WikiError::Storage(format!("prepare list insights paged: {e}")))?;
+    let mut rows = stmt
+        .query(params![
+            cursor_created,
+            cursor.map(|c| c.as_str()),
+            limit as i64
+        ])
+        .map_err(|e| WikiError::Storage(format!("list insights paged: {e}")))?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().map_err(db)? {
+        let insight_id: String = row.get(0).map_err(db)?;
+        let build_id: String = row.get(1).map_err(db)?;
+        let query: String = row.get(2).map_err(db)?;
+        let answer: String = row.get(3).map_err(db)?;
+        let citations_json: String = row.get(4).map_err(db)?;
+        let created_at: String = row.get(5).map_err(db)?;
+        let citations: Vec<InsightCitation> = serde_json::from_str(&citations_json)
+            .map_err(|e| WikiError::Storage(format!("parse insight citations: {e}")))?;
+        out.push(InsightRecord {
+            insight_id: InsightId::from_validated(insight_id),
+            build_id: BuildId::from_validated(build_id),
+            query,
+            answer,
+            citations,
+            created_at,
+        });
+    }
+    Ok(out)
+}

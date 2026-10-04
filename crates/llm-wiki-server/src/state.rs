@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 use llm_wiki_core::cancel::CancelFlag;
 use llm_wiki_core::config::Config;
 use llm_wiki_core::ids::JobId;
-use llm_wiki_llm::LlmProvider;
+use llm_wiki_llm::{EmbeddingProvider, LlmProvider};
 
 /// Cloneable handle to the server state.
 #[derive(Clone)]
@@ -22,6 +22,9 @@ pub struct Inner {
     /// Present when `[llm]` was configured at startup; `None` → build/query
     /// endpoints fail with a 400 config error.
     pub provider: Option<Arc<dyn LlmProvider>>,
+    /// Embedding provider override (tests / embedders). When absent, the
+    /// `/v1/embed` and hybrid endpoints construct one from `[llm]` config.
+    pub embedding: Option<Arc<dyn EmbeddingProvider>>,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub jobs: JobManager,
     /// LLM semaphore for request-time endpoints (`/v1/query`): bounds
@@ -44,11 +47,19 @@ impl SharedState {
             workspace,
             config,
             provider,
+            embedding: None,
             started_at: chrono::Utc::now(),
             jobs: JobManager::new(),
             llm_permits: Arc::new(tokio::sync::Semaphore::new(permits)),
             rate_buckets: Mutex::new(std::collections::HashMap::new()),
         }))
+    }
+
+    /// Overrides the config-derived embedding provider (tests, embedders).
+    pub fn with_embedding_provider(mut self, provider: Arc<dyn EmbeddingProvider>) -> Self {
+        let inner = Arc::get_mut(&mut self.0).expect("state not yet shared");
+        inner.embedding = Some(provider);
+        self
     }
 
     pub fn db_path(&self) -> PathBuf {

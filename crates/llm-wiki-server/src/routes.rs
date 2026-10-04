@@ -14,8 +14,10 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use axum::Extension;
+
 use llm_wiki_core::cancel::CancelFlag;
-use llm_wiki_core::ids::JobId;
+use llm_wiki_core::ids::{InsightId, JobId};
 use llm_wiki_llm::LlmProvider;
 use llm_wiki_search::{
     rerank_search_hits, reranker_from_config, FullTextSearch, SqliteFullTextSearch,
@@ -23,12 +25,15 @@ use llm_wiki_search::{
 use llm_wiki_storage::{
     count_jobs_by_status, count_sources, finish_job, get_active_build_id,
     get_job as storage_get_job, get_job_by_idempotency_key, insert_job, latest_build,
-    list_jobs as storage_list_jobs, load_generation_pages, open, FAILURE_CANCELLED, JOB_STATUSES,
+    list_insights_paged, list_jobs as storage_list_jobs, load_generation_pages, open,
+    FAILURE_CANCELLED, JOB_STATUSES,
 };
 
 use crate::error::ApiError;
 use crate::jobs::spawn_build_job;
+use crate::middleware::RequestId;
 use crate::state::{ActiveJob, SharedState};
+use crate::PROTOCOL_VERSION;
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -91,6 +96,7 @@ pub struct PageQuery {
 /// `GET /v1/status`: sources, latest build, active generation, job depth.
 pub async fn status(State(state): State<SharedState>) -> Result<Json<serde_json::Value>, ApiError> {
     let path = state.db_path();
+    let workspace_name = state.config().project.name.clone();
     let payload = tokio::task::spawn_blocking(move || {
         let conn = open(&path).map_err(ApiError::from)?;
         let sources = count_sources(&conn).map_err(ApiError::from)?;
@@ -98,6 +104,8 @@ pub async fn status(State(state): State<SharedState>) -> Result<Json<serde_json:
         let active = get_active_build_id(&conn).map_err(ApiError::from)?;
         let jobs = count_jobs_by_status(&conn, JOB_STATUSES).map_err(ApiError::from)?;
         Result::<_, ApiError>::Ok(json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "workspace": workspace_name,
             "sources": sources,
             "latest_build": latest.map(|build| json!({
                 "build_id": build.build_id.as_str(),
@@ -400,6 +408,7 @@ pub struct SearchRequest {
 /// counts.
 pub async fn search(
     State(state): State<SharedState>,
+    Extension(request_id): Extension<RequestId>,
     body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let request: SearchRequest = parse_body(&body)?;
@@ -472,6 +481,8 @@ pub async fn search(
         })
         .collect();
     Ok(Json(json!({
+        "protocol_version": PROTOCOL_VERSION,
+        "request_id": request_id.0.as_str(),
         "generation": generation.as_ref().map(llm_wiki_core::ids::BuildId::as_str),
         "hits": hits_json,
         "truncated": truncated,
@@ -564,6 +575,7 @@ async fn vector_candidates_for(
 /// assembly call → serialization; no logic deeper than the outcome `??`s.
 pub async fn context(
     State(state): State<SharedState>,
+    Extension(request_id): Extension<RequestId>,
     body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let request: ContextRequest = parse_body(&body)?;
@@ -626,6 +638,8 @@ pub async fn context(
         })
         .collect();
     Ok(Json(json!({
+        "protocol_version": PROTOCOL_VERSION,
+        "request_id": request_id.0.as_str(),
         "generation": generation.as_ref().map(llm_wiki_core::ids::BuildId::as_str),
         "chunks": chunks,
         "neighbors": neighbors,
@@ -651,6 +665,7 @@ pub struct QueryRequest {
 /// published generation — the same service as `llm-wiki ask`.
 pub async fn query(
     State(state): State<SharedState>,
+    Extension(request_id): Extension<RequestId>,
     body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let request: QueryRequest = parse_body(&body)?;
@@ -711,6 +726,8 @@ pub async fn query(
         return Err(ApiError::nothing_published());
     };
     Ok(Json(json!({
+        "protocol_version": PROTOCOL_VERSION,
+        "request_id": request_id.0.as_str(),
         "generation": generation.as_ref().map(llm_wiki_core::ids::BuildId::as_str),
         "answer": report.answer,
         "citations": report.citations.iter().map(|c| json!({
@@ -745,6 +762,11 @@ fn hybrid_context(
                 "hybrid retrieval needs an embedding model: pass embedding_model or set LLM_WIKI_EMBEDDING_MODEL",
             )
         })?;
+    // An injected provider (tests / embedders) wins over the config-derived
+    // one; the config check below still guards the model name.
+    if let Some(injected) = state.0.embedding.clone() {
+        return Ok((injected, model));
+    }
     if config.llm.model.trim().is_empty() {
         return Err(ApiError::bad_request(
             "llm.model must be configured before hybrid retrieval",
@@ -882,5 +904,137 @@ pub async fn get_page(
             "to_page_id": l.to_page_id.as_str(),
             "target_title": l.target_title,
         })).collect::<Vec<_>>(),
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Insights (write-back loop read surface) + Embed (vector layer maintenance)
+// ---------------------------------------------------------------------------
+
+/// Serializes one insight record for the API.
+fn insight_json(record: &llm_wiki_storage::InsightRecord) -> serde_json::Value {
+    json!({
+        "insight_id": record.insight_id.as_str(),
+        "build_id": record.build_id.as_str(),
+        "query": record.query,
+        "answer": record.answer,
+        "citations": record.citations.iter().map(|c| json!({
+            "claim_node_id": c.claim_node_id,
+            "source": c.source,
+            "heading_path": c.heading_path,
+            "range": [c.range.0, c.range.1],
+            "evidence_digest": c.evidence_digest,
+        })).collect::<Vec<_>>(),
+        "created_at": record.created_at,
+    })
+}
+
+/// `GET /v1/insights?limit=&cursor=` — the curated insight layer, newest
+/// first, cursor-paginated (frozen V1.x protocol).
+pub async fn list_insights(
+    State(state): State<SharedState>,
+    Extension(request_id): Extension<RequestId>,
+    Query(query): Query<PageQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let limit = query.limit.unwrap_or(20).clamp(1, 100);
+    let cursor = match &query.cursor {
+        Some(raw) => Some(InsightId::parse(raw).map_err(ApiError::from)?),
+        None => None,
+    };
+    let outcome = db(&state, move |conn| {
+        // Insights span generations (a curated layer), so the active build is
+        // only a "something was published" signal here.
+        if get_active_build_id(conn)?.is_none() {
+            return Ok(None);
+        }
+        let mut records = list_insights_paged(conn, limit + 1, cursor.as_ref())?;
+        let truncated = records.len() > limit;
+        if truncated {
+            records.truncate(limit);
+        }
+        let next_cursor = records
+            .last()
+            .filter(|_| truncated)
+            .map(|record| record.insight_id.as_str().to_owned());
+        Ok(Some((records, next_cursor, truncated)))
+    })
+    .await?;
+    let Some((records, next_cursor, truncated)) = outcome else {
+        return Err(ApiError::nothing_published());
+    };
+    Ok(Json(json!({
+        "protocol_version": PROTOCOL_VERSION,
+        "request_id": request_id.0.as_str(),
+        "insights": records.iter().map(insight_json).collect::<Vec<_>>(),
+        "next_cursor": next_cursor,
+        "truncated": truncated,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EmbedRequest {
+    /// Embedding model override (falls back to $LLM_WIKI_EMBEDDING_MODEL).
+    pub model: Option<String>,
+    /// Sections per embedding request (default 16).
+    pub batch: Option<usize>,
+}
+
+/// `POST /v1/embed` — incremental embedding backfill for the ACTIVE
+/// generation (the service counterpart of `llm-wiki embed`). Synchronous by
+/// design: embedding is incremental (fully covered generations issue zero
+/// requests), so the first backfill is the only long call, and the §31 job
+/// state machine is build-shaped — embedding is maintenance, not a build.
+/// Bounded by the shared LLM semaphore.
+pub async fn embed(
+    State(state): State<SharedState>,
+    Extension(request_id): Extension<RequestId>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let request: EmbedRequest = if body.iter().all(|b| b.is_ascii_whitespace()) {
+        EmbedRequest {
+            model: None,
+            batch: None,
+        }
+    } else {
+        parse_body(&body)?
+    };
+    let batch = request.batch.unwrap_or(16).clamp(1, 64);
+    let (embedding_provider, model) = hybrid_context(&state, request.model.as_deref())?;
+
+    let _permit = state
+        .0
+        .llm_permits
+        .acquire()
+        .await
+        .map_err(|e| ApiError::internal(format!("llm semaphore: {e}")))?;
+
+    let workspace = state.0.workspace.clone();
+    let config = state.0.config.clone();
+    // run_embed holds its SQLite connection across awaits (a !Send future by
+    // design): give it the blocking pool with a block_on handle.
+    let report = tokio::task::spawn_blocking(move || {
+        tokio::runtime::Handle::current().block_on(llm_wiki_compiler::run_embed(
+            &workspace,
+            &config,
+            embedding_provider,
+            &model,
+            batch,
+        ))
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("task join: {e}")))?
+    .map_err(ApiError::from)?;
+    let Some(report) = report else {
+        return Err(ApiError::nothing_published());
+    };
+    let generation = db(&state, get_active_build_id).await?;
+    Ok(Json(json!({
+        "protocol_version": PROTOCOL_VERSION,
+        "request_id": request_id.0.as_str(),
+        "generation": generation.as_ref().map(llm_wiki_core::ids::BuildId::as_str),
+        "model": report.model,
+        "total_sections": report.total_sections,
+        "covered_before": report.covered_before,
+        "embedded": report.embedded,
     })))
 }

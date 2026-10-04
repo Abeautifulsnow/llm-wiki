@@ -12,8 +12,9 @@ use llm_wiki_core::error::WikiError;
 use llm_wiki_core::ids::{BuildId, JobId};
 use llm_wiki_llm::LlmProvider;
 use llm_wiki_storage::{
-    attach_job_build, finish_job, open, set_job_phase, set_job_running, FAILURE_CANCELLED,
-    FAILURE_INTERNAL, FAILURE_LLM, FAILURE_PLANNING, FAILURE_PUBLISH, FAILURE_REPLAN_REQUIRED,
+    attach_job_build, finish_job, list_resumable_jobs, open, requeue_job, set_job_phase,
+    set_job_running, FAILURE_CANCELLED, FAILURE_INTERNAL, FAILURE_LLM, FAILURE_PLANNING,
+    FAILURE_PUBLISH, FAILURE_REPLAN_REQUIRED,
 };
 
 use crate::state::SharedState;
@@ -133,4 +134,82 @@ pub fn spawn_build_job(
         }
         state.0.jobs.take(&job_id).await;
     });
+}
+
+/// Auto-resume (PRD §31 "根据未来策略恢复", config-gated): re-enqueues build
+/// jobs that died with the previous server process and re-runs them ONE at a
+/// time under the single-slot lock. Runs as a background task from `serve`;
+/// tests call it directly. Returns how many jobs were resumed.
+///
+/// The same job ROW is reused (not duplicated), so its `idempotency_key`
+/// mapping survives: a client replaying the original request still resolves
+/// to the same job, never to a second LLM run.
+///
+/// Length note: ~45 lines — a flat claim→requeue→spawn→wait loop.
+pub async fn recover_interrupted_jobs(state: &SharedState) -> usize {
+    let Some(provider) = state.0.provider.clone() else {
+        return 0;
+    };
+    let mut resumed = 0usize;
+    loop {
+        let next: Option<llm_wiki_storage::ServerJobRecord> = match open(&state.db_path()) {
+            Ok(conn) => match list_resumable_jobs(&conn) {
+                Ok(list) => list.into_iter().next(),
+                Err(err) => {
+                    tracing::warn!(error = %err, "could not list resumable jobs; recovery stops");
+                    break;
+                }
+            },
+            Err(err) => {
+                tracing::warn!(error = %err, "could not open state db; recovery stops");
+                break;
+            }
+        };
+        let Some(record) = next else {
+            break;
+        };
+        let job_id = record.job_id.clone();
+        let cancel = CancelFlag::new();
+        if !state
+            .0
+            .jobs
+            .start(crate::state::ActiveJob {
+                job_id: job_id.clone(),
+                cancel: cancel.clone(),
+            })
+            .await
+        {
+            // A build claimed the slot while we were recovering (manual
+            // request or a concurrent recovery): leave the rest queued and
+            // stop — racing the slot would break the single-build contract.
+            tracing::info!(job = %job_id, "build slot busy; remaining interrupted jobs stay INTERRUPTED");
+            break;
+        }
+        let requeued = match open(&state.db_path()) {
+            Ok(conn) => requeue_job(&conn, &job_id).unwrap_or(false),
+            Err(_) => false,
+        };
+        if !requeued {
+            // The row changed underneath us (terminalized some other way);
+            // nothing to run — release and move on.
+            state.0.jobs.take(&job_id).await;
+            continue;
+        }
+        tracing::info!(job = %job_id, "resuming build job interrupted by restart");
+        spawn_build_job(state.clone(), job_id.clone(), cancel, provider.clone());
+        // Wait for the task to release the slot before considering the next
+        // job — resumed builds are strictly sequential by contract.
+        while state
+            .0
+            .jobs
+            .running()
+            .await
+            .map(|running| running.as_str().to_owned())
+            == Some(job_id.as_str().to_owned())
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        resumed += 1;
+    }
+    resumed
 }

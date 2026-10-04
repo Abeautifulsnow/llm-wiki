@@ -8,6 +8,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
+use llm_wiki_compiler::{write_current_pointer, PublishPaths};
 use llm_wiki_llm::{FakeLlmProvider, LlmProvider};
 use llm_wiki_server::{build_router, validate_security, SharedState};
 use llm_wiki_storage::{get_job, open};
@@ -572,4 +573,208 @@ async fn set_job_running_reports_a_cancelled_row_as_not_started() {
     )
     .unwrap();
     assert!(!set_job_running(&conn, &job_id).unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// Insights + Embed + auto-resume (V0.4/V1.x functional completion)
+// ---------------------------------------------------------------------------
+
+use llm_wiki_core::hash::sha256_hex;
+use llm_wiki_core::ids::{BuildId, InsightId, WikiPageId};
+use llm_wiki_llm::{EmbeddingProvider, LlmError as EmbedLlmError};
+use llm_wiki_storage::{
+    insert_insight, persist_generation, requeue_job, start_build, InsightCitation, InsightRecord,
+    WikiPageRecord,
+};
+
+/// A deterministic fake embedding provider counting its calls.
+struct CountingEmbeddings {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl EmbeddingProvider for CountingEmbeddings {
+    async fn embed(&self, _model: &str, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedLlmError> {
+        self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        Ok(texts
+            .iter()
+            .map(|text| vec![text.len() as f32; 4])
+            .collect())
+    }
+}
+
+/// Seeds a published generation (one page, one citation-backed section row is
+/// not needed: context sections come from wiki page sections) plus one
+/// insight citing a claim.
+fn seed_published_generation(workspace: &std::path::Path) -> (BuildId, String) {
+    let db_path = workspace.join(".llm-wiki").join("state.db");
+    let mut conn = open(&db_path).unwrap();
+    let build_id = start_build(&mut conn, &llm_wiki_storage::BuildDraft::default()).unwrap();
+    let claim_id = "kn_fixtureclaim".to_owned();
+    let content = "## Overview\n\nThe fixture page cites its stored claims.\n";
+    let page = WikiPageRecord {
+        page_id: WikiPageId::generate(),
+        slug: "fixture".into(),
+        title: "Fixture".into(),
+        category: "concepts".into(),
+        language: "en".into(),
+        body_hash: sha256_hex(content.as_bytes()),
+        content: content.to_owned(),
+        knowledge_refs: Vec::new(),
+        citations: Vec::new(),
+        links: Vec::new(),
+    };
+    persist_generation(&mut conn, &build_id, &[page]).unwrap();
+    llm_wiki_storage::activate_build(&mut conn, &build_id).unwrap();
+    std::fs::create_dir_all(workspace.join("wiki")).unwrap();
+    write_current_pointer(&PublishPaths::new(&workspace.join("wiki")), &build_id).unwrap();
+    (build_id, claim_id)
+}
+
+/// GET /v1/insights: cursor-paginated read surface over the insight layer.
+#[tokio::test]
+async fn insights_endpoint_lists_paged_records() {
+    let workspace = fixture_workspace("insights-endpoint");
+    let (build_id, _claim) = seed_published_generation(&workspace);
+    let state = state_for(workspace.clone());
+    let mut conn = open(&state.db_path()).unwrap();
+    for i in 0..3 {
+        insert_insight(
+            &mut conn,
+            &InsightRecord {
+                insight_id: InsightId::generate(),
+                build_id: build_id.clone(),
+                query: format!("question {i}"),
+                answer: format!("answer {i}"),
+                citations: vec![InsightCitation {
+                    claim_node_id: "kn_x".into(),
+                    source: "docs/a.md".into(),
+                    heading_path: vec![],
+                    range: (0, 1),
+                    evidence_digest: "d".into(),
+                }],
+                created_at: format!("2026-01-0{}T00:00:00+00:00", i + 1),
+            },
+        )
+        .unwrap();
+    }
+
+    let app = build_router(state);
+    let (status, body) = get(app.clone(), "/v1/insights?limit=2").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let page: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(page["protocol_version"], 1);
+    assert!(!page["request_id"].as_str().unwrap_or("").is_empty());
+    assert_eq!(page["truncated"], true);
+    assert_eq!(page["insights"].as_array().unwrap().len(), 2);
+    assert_eq!(page["insights"][0]["query"], "question 2", "newest first");
+    let cursor = page["next_cursor"].as_str().unwrap().to_owned();
+
+    let (status, body) = get(app, &format!("/v1/insights?limit=2&cursor={cursor}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let page_two: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(page_two["truncated"], false);
+    assert_eq!(page_two["insights"].as_array().unwrap().len(), 1);
+    assert_eq!(page_two["insights"][0]["query"], "question 0");
+}
+
+/// POST /v1/embed: runs the incremental backfill with the injected embedding
+/// provider and reports the counters.
+#[tokio::test]
+async fn embed_endpoint_runs_the_backfill() {
+    let workspace = fixture_workspace("embed-endpoint");
+    seed_published_generation(&workspace);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let state = state_with_provider(
+        workspace,
+        Arc::new(FakeLlmProvider::fixed("fake-server", "x")),
+    )
+    .with_embedding_provider(Arc::new(CountingEmbeddings {
+        calls: calls.clone(),
+    }));
+    // The model name comes from the env (same contract as the CLI).
+    std::env::set_var("LLM_WIKI_EMBEDDING_MODEL", "fake-embed");
+
+    let app = build_router(state);
+    let (status, body) = post(app, "/v1/embed", "{}", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(payload["protocol_version"], 1);
+    assert_eq!(payload["model"], "fake-embed");
+    assert!(payload["total_sections"].is_u64(), "{body}");
+
+    // Uncovered generation: the endpoint issued at most one embed call.
+    assert!(calls.load(AtomicOrdering::SeqCst) <= 1, "{body}");
+}
+
+/// Auto-resume (config-gated): recover_interrupted_jobs re-enqueues and
+/// re-runs INTERRUPTED-by-restart build jobs one at a time, reusing the SAME
+/// job row (idempotency mapping preserved).
+#[tokio::test]
+async fn interrupted_jobs_are_resumed_through_the_same_row() {
+    let workspace = fixture_workspace("job-resume");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let handler = Arc::new(
+        move |_request: &llm_wiki_llm::LlmRequest| -> Result<String, LlmError> {
+            counter.fetch_add(1, AtomicOrdering::SeqCst);
+            Err(LlmError::Api {
+                code: 500,
+                message: "deterministic pipeline failure".into(),
+            })
+        },
+    );
+    let provider: Arc<dyn LlmProvider> = Arc::new(FakeLlmProvider::new("fake-server", handler));
+    let state = state_with_provider(workspace, provider);
+
+    // Seed a job the previous server died with.
+    let job_id = JobId::generate();
+    let conn = open(&state.db_path()).unwrap();
+    let mut record = job_row(&job_id, "INTERRUPTED");
+    record.failure_code = Some(llm_wiki_storage::FAILURE_INTERRUPTED.into());
+    record.retryable = true;
+    record.idempotency_key = Some("client-key-resume".into());
+    insert_job(&conn, &record).unwrap();
+
+    let resumed = llm_wiki_server::jobs::recover_interrupted_jobs(&state).await;
+    assert_eq!(resumed, 1, "the interrupted job was resumed");
+
+    // Wait for the re-run to terminalize (the fake always fails the pipeline).
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let record = get_job(&conn, &job_id).unwrap().unwrap();
+        if !matches!(record.status.as_str(), "QUEUED" | "RUNNING") {
+            assert_eq!(
+                record.status, "FAILED",
+                "the resumed build failed as scripted"
+            );
+            assert!(calls.load(AtomicOrdering::SeqCst) >= 1, "the pipeline ran");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "resumed job never finished"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // The idempotency key still resolves to the SAME row.
+    let by_key = llm_wiki_storage::get_job_by_idempotency_key(&conn, "client-key-resume")
+        .unwrap()
+        .unwrap();
+    assert_eq!(by_key.job_id, job_id);
+    assert!(state.0.jobs.running().await.is_none(), "slot released");
+}
+
+/// requeue_job never resurrects rows interrupted for other reasons.
+#[test]
+fn requeue_refuses_non_restart_interruptions() {
+    let workspace = fixture_workspace("requeue-guard");
+    let state = state_for(workspace);
+    let conn = open(&state.db_path()).unwrap();
+    let job_id = JobId::generate();
+    let mut record = job_row(&job_id, "INTERRUPTED");
+    record.failure_code = Some("llm_error".into());
+    insert_job(&conn, &record).unwrap();
+    assert!(!requeue_job(&conn, &job_id).unwrap());
 }

@@ -47,12 +47,15 @@ pub use graph::{
     GraphNeighbor, GraphStats, NeighborDirection, EXPAND_MAX_NODES, NODE_TYPE_CONCEPT,
     NODE_TYPE_ENTITY, NODE_TYPE_PAGE, RELATION_LINKS_TO,
 };
-pub use insights::{insert_insight, list_insights, InsightCitation, InsightRecord};
+pub use insights::{
+    insert_insight, list_insights, list_insights_paged, InsightCitation, InsightRecord,
+};
 pub use jobs::{
     attach_job_build, count_jobs_by_status, finish_job, get_job, get_job_by_idempotency_key,
-    insert_job, list_jobs, mark_stale_jobs_interrupted, set_job_phase, set_job_running,
-    ServerJobRecord, FAILURE_CANCELLED, FAILURE_INTERNAL, FAILURE_INTERRUPTED, FAILURE_LLM,
-    FAILURE_PLANNING, FAILURE_PUBLISH, FAILURE_REPLAN_REQUIRED, JOB_STATUSES,
+    insert_job, list_jobs, list_resumable_jobs, mark_stale_jobs_interrupted, requeue_job,
+    set_job_phase, set_job_running, ServerJobRecord, FAILURE_CANCELLED, FAILURE_INTERNAL,
+    FAILURE_INTERRUPTED, FAILURE_LLM, FAILURE_PLANNING, FAILURE_PUBLISH, FAILURE_REPLAN_REQUIRED,
+    JOB_STATUSES,
 };
 pub use knowledge::{list_active_relation_pairs, load_knowledge_base, load_plan_input};
 pub use page_id_map::{

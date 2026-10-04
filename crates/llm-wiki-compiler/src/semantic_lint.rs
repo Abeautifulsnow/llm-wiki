@@ -59,6 +59,8 @@ pub enum SemanticFindingKind {
     Superseded,
     WeakSynthesis,
     KnowledgeGap,
+    SupersededInsight,
+    ContradictedInsight,
 }
 
 impl SemanticFindingKind {
@@ -68,6 +70,8 @@ impl SemanticFindingKind {
             SemanticFindingKind::Superseded => "superseded-facts",
             SemanticFindingKind::WeakSynthesis => "weak-synthesis",
             SemanticFindingKind::KnowledgeGap => "knowledge-gap",
+            SemanticFindingKind::SupersededInsight => "superseded-insight",
+            SemanticFindingKind::ContradictedInsight => "contradicted-insight",
         }
     }
 
@@ -76,6 +80,8 @@ impl SemanticFindingKind {
             "contradiction" => Some(Self::Contradiction),
             "superseded" => Some(Self::Superseded),
             "weak-synthesis" => Some(Self::WeakSynthesis),
+            "superseded-insight" => Some(Self::SupersededInsight),
+            "contradicted-insight" => Some(Self::ContradictedInsight),
             _ => None,
         }
     }
@@ -340,6 +346,67 @@ pub async fn run_semantic_lint(
         }
     }
 
+    // ---- Insight review (the write-back loop's LLM consumer): each stored
+    // insight is judged against the CURRENT claims it cites, so a verified
+    // synthesis that the recompiled wiki no longer supports is surfaced as
+    // superseded/contradicted. Sequential by design: insights are a curated
+    // layer (hand-fuls, not pages). Findings keep the insight identity in
+    // the slug (`(insight <id>)`); the §28 cache makes re-runs free. ----
+    let insight_stage = prompt.stage_block("insight-review")?;
+    let insights = llm_wiki_storage::list_insights(&conn).unwrap_or_default();
+    for insight in insights {
+        let slug = format!("(insight {})", insight.insight_id.as_str());
+        let cited: BTreeSet<String> = insight
+            .citations
+            .iter()
+            .map(|citation| citation.claim_node_id.clone())
+            .collect();
+        let claims: Vec<(String, String)> = insight
+            .citations
+            .iter()
+            .filter_map(|citation| {
+                statements
+                    .get(&citation.claim_node_id)
+                    .map(|statement| (citation.claim_node_id.clone(), statement.clone()))
+            })
+            .collect();
+        if claims.is_empty() {
+            // Every cited claim vanished from the registry — the structural
+            // stale-insight lint owns that report; there is nothing left to
+            // judge semantically.
+            continue;
+        }
+        let payload = insight_payload(&insight.query, &insight.answer, &claims);
+        if estimate_tokens(&payload) > max_input {
+            tracing::warn!(insight = %insight.insight_id, "insight exceeds max_input_tokens for semantic review; skipped");
+            skipped.push(slug);
+            continue;
+        }
+        match review_insight(
+            &provider,
+            Some(&cache),
+            &insight_stage,
+            &language,
+            max_output,
+            &insight.query,
+            &insight.answer,
+            &claims,
+        )
+        .await
+        {
+            Ok((raw, cacheable)) => {
+                findings.extend(validate_findings(raw, &slug, &cited, &insight.answer));
+                if let Some((request, response)) = cacheable {
+                    crate::cache::remember_validated(Some(&cache), &request, &response);
+                }
+            }
+            Err(err) => {
+                tracing::warn!(insight = %insight.insight_id, error = %err, "insight review failed; skipped");
+                skipped.push(slug);
+            }
+        }
+    }
+
     Ok(Some(
         SemanticReport {
             findings,
@@ -357,6 +424,73 @@ fn page_payload(title: &str, claims: &[(String, String)], body: &str) -> String 
     }
     payload.push_str(body);
     payload
+}
+
+fn insight_payload(query: &str, answer: &str, claims: &[(String, String)]) -> String {
+    let mut payload = format!("QUERY {query}\n");
+    for (id, statement) in claims {
+        payload.push_str(&format!("{id}: {statement}\n"));
+    }
+    payload.push_str(answer);
+    payload
+}
+
+/// One insight review: shape → single repair (mirrors [`review_page`]; the
+/// quoted text is the ANSWER, not a page body).
+#[allow(clippy::too_many_arguments)]
+async fn review_insight(
+    provider: &Arc<dyn LlmProvider>,
+    cache: Option<&Arc<dyn StageCache>>,
+    stage: &crate::prompt::PromptDocument,
+    language: &str,
+    max_output: u32,
+    query: &str,
+    answer: &str,
+    claims: &[(String, String)],
+) -> Result<(
+    RawPageFindings,
+    Option<(llm_wiki_llm::LlmRequest, llm_wiki_llm::LlmResponse)>,
+)> {
+    let claims_json = serde_json::json!(claims
+        .iter()
+        .map(|(id, statement)| serde_json::json!({ "id": id, "statement": statement }))
+        .collect::<Vec<_>>())
+    .to_string();
+    let template = stage.render(&[
+        ("LANGUAGE", language),
+        ("QUERY", query),
+        ("ANSWER", answer),
+        ("CLAIMS", &claims_json),
+    ]);
+    let base_request = llm_wiki_llm::LlmRequest {
+        task_tag: stage.name.clone(),
+        system: None,
+        prompt: template.replace("{{REPAIR_NOTES}}", ""),
+        temperature: 0.0,
+        max_output_tokens: max_output,
+        json_mode: true,
+    };
+    let (first, added) = generate_cached(provider, cache, base_request.clone()).await?;
+    match structured::parse_json::<RawPageFindings>(&first.text) {
+        Ok(parsed) => {
+            let cacheable = (added > 0).then_some((base_request, first));
+            Ok((parsed, cacheable))
+        }
+        Err(shape) => {
+            tracing::warn!(reason = %shape, query = %query, "insight review shape failure, repairing once");
+            let repair = repair_request(&base_request, &template, &[shape.machine_reason()]);
+            let (repaired, added) = generate_cached(provider, cache, repair.clone()).await?;
+            let parsed =
+                structured::parse_json::<RawPageFindings>(&repaired.text).map_err(|shape| {
+                    WikiError::Llm(format!(
+                        "insight review failed after repair: {}",
+                        shape.machine_reason()
+                    ))
+                })?;
+            let cacheable = (added > 0).then_some((repair, repaired));
+            Ok((parsed, cacheable))
+        }
+    }
 }
 
 /// One page review: shape → single repair. Model errors propagate (the

@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 const PAGE_REVIEW_MARK: &str = "Review ONE page";
 const GAP_MARK: &str = "coverage gaps";
+const INSIGHT_MARK: &str = "stored insight";
 
 /// Stage-routing fake: handles the full build pipeline (so a generation is
 /// published) plus the semantic-lint stages. The page-review handler can be
@@ -103,6 +104,14 @@ fn semantic_llm(page_review_responses: Arc<Mutex<VecDeque<String>>>) -> Arc<Fake
                     serde_json::json!({"gaps": [{
                         "topic": "retry budgets",
                         "reason": "the fixture page leans on retry semantics with no page of its own",
+                    }]})
+                    .to_string()
+                } else if prompt.contains(INSIGHT_MARK) {
+                    serde_json::json!({"findings": [{
+                        "kind": "contradicted-insight",
+                        "claim_ids": kn_ids_in(prompt),
+                        "reason": "the current claims contradict the stored answer",
+                        "excerpt": "retries failed tasks",
                     }]})
                     .to_string()
                 } else {
@@ -330,5 +339,194 @@ async fn semantic_lint_repairs_once_and_drops_hallucinated_claim_references() {
         report.skipped_pages.is_empty(),
         "{:?}",
         report.skipped_pages
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Insight consumption (the write-back loop's read side)
+// ---------------------------------------------------------------------------
+
+use llm_wiki_compiler::{run_lint, LintCheck};
+use llm_wiki_core::ids::InsightId;
+use llm_wiki_storage::{insert_insight, InsightCitation, InsightRecord};
+
+/// A2: the semantic lint consumes stored insights — the scripted
+/// contradicted-insight finding is validated against the insight's REAL
+/// claim ids and a verbatim answer excerpt, and the second run is fully
+/// cache-served.
+#[tokio::test]
+async fn semantic_lint_reviews_stored_insights_against_current_claims() {
+    let workspace = fixture_workspace("insight-semantic");
+    let config = Config::load(&workspace).unwrap();
+
+    // First, get the real evidence digest: build once, read the page
+    // citation, rebuild in a fresh workspace? Simpler: build, then read the
+    // digest from the generation view and store the insight against it.
+    {
+        let provider = semantic_llm(Arc::new(Mutex::new(VecDeque::new())));
+        run_build(&workspace, &config, provider).await.unwrap();
+    }
+    let conn = llm_wiki_storage::open(&workspace.join(".llm-wiki").join("state.db")).unwrap();
+    let active = llm_wiki_storage::get_active_build_id(&conn)
+        .unwrap()
+        .expect("published");
+    let pages = llm_wiki_storage::load_generation_view(&conn, &active).unwrap();
+    let citation = pages
+        .iter()
+        .flat_map(|page| page.citations.iter())
+        .next()
+        .expect("fixture page cites its claim")
+        .clone();
+    let claim_id = citation.claim_node_id.as_str().to_owned();
+    drop(pages);
+    insert_insight(
+        &mut llm_wiki_storage::open(&workspace.join(".llm-wiki").join("state.db")).unwrap(),
+        &InsightRecord {
+            insight_id: InsightId::generate(),
+            build_id: active,
+            query: "how do retries work?".into(),
+            answer: "The scheduler retries failed tasks up to three times before giving up.".into(),
+            citations: vec![InsightCitation {
+                claim_node_id: claim_id.clone(),
+                source: "docs/runtime.md".into(),
+                heading_path: vec![],
+                range: (0, 1),
+                evidence_digest: citation.evidence_digest.clone(),
+            }],
+            created_at: chrono::Utc::now().to_rfc3339(),
+        },
+    )
+    .unwrap();
+
+    // The page review is scripted sound ({"findings": []}) so the run's
+    // request accounting isolates the insight stage.
+    let provider = semantic_llm(Arc::new(Mutex::new(VecDeque::from([serde_json::json!(
+        {"findings": []}
+    )
+    .to_string()]))));
+    let report = llm_wiki_compiler::run_semantic_lint(&workspace, &config, provider.clone())
+        .await
+        .unwrap()
+        .expect("published");
+    let insight_findings: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| f.kind == llm_wiki_compiler::SemanticFindingKind::ContradictedInsight)
+        .collect();
+    assert_eq!(insight_findings.len(), 1, "{:?}", report.findings);
+    assert!(
+        insight_findings[0].page_slug.starts_with("(insight ins_"),
+        "the finding keeps the insight identity: {}",
+        insight_findings[0].page_slug
+    );
+    assert_eq!(insight_findings[0].claim_ids, vec![claim_id]);
+    assert!(
+        insight_findings[0].message.contains("retries failed tasks"),
+        "the excerpt is a verbatim answer quote: {:?}",
+        insight_findings[0].message
+    );
+
+    // The insight review is §28-cached like the page reviews.
+    let before = provider.request_count();
+    let second = llm_wiki_compiler::run_semantic_lint(&workspace, &config, provider.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(provider.request_count() - before, 0);
+    assert_eq!(
+        second
+            .findings
+            .iter()
+            .filter(|f| f.kind == llm_wiki_compiler::SemanticFindingKind::ContradictedInsight)
+            .count(),
+        1
+    );
+}
+
+/// A1: the deterministic stale-insight lint — a healthy digest passes
+/// silently, a drifted digest and a vanished claim are flagged.
+#[tokio::test]
+async fn stale_insight_lint_flags_missing_and_drifted_evidence() {
+    let workspace = fixture_workspace("insight-stale");
+    let config = Config::load(&workspace).unwrap();
+    let provider = semantic_llm(Arc::new(Mutex::new(VecDeque::new())));
+    run_build(&workspace, &config, provider).await.unwrap();
+
+    let conn = llm_wiki_storage::open(&workspace.join(".llm-wiki").join("state.db")).unwrap();
+    let active = llm_wiki_storage::get_active_build_id(&conn)
+        .unwrap()
+        .expect("published");
+    let pages = llm_wiki_storage::load_generation_view(&conn, &active).unwrap();
+    let citation = pages
+        .iter()
+        .flat_map(|page| page.citations.iter())
+        .next()
+        .expect("fixture claim citation")
+        .clone();
+
+    let claim_id = citation.claim_node_id.as_str().to_owned();
+    let make = |id: &str, digest: String, claim: String| InsightRecord {
+        insight_id: InsightId::from_validated(id.to_owned()),
+        build_id: active.clone(),
+        query: "q".into(),
+        answer: "a".into(),
+        citations: vec![InsightCitation {
+            claim_node_id: claim,
+            source: "docs/runtime.md".into(),
+            heading_path: vec![],
+            range: (0, 1),
+            evidence_digest: digest,
+        }],
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let mut writable =
+        llm_wiki_storage::open(&workspace.join(".llm-wiki").join("state.db")).unwrap();
+    // Healthy: correct claim + real digest → no finding.
+    insert_insight(
+        &mut writable,
+        &make(
+            "ins_health",
+            citation.evidence_digest.clone(),
+            claim_id.clone(),
+        ),
+    )
+    .unwrap();
+    // Drifted digest → flagged.
+    insert_insight(
+        &mut writable,
+        &make("ins_drift", "deadbeef".into(), claim_id.clone()),
+    )
+    .unwrap();
+    // Vanished claim → flagged.
+    insert_insight(
+        &mut writable,
+        &make(
+            "ins_gone",
+            citation.evidence_digest.clone(),
+            "kn_missing".into(),
+        ),
+    )
+    .unwrap();
+    drop(writable);
+
+    let report = run_lint(&workspace, &config).unwrap().expect("published");
+    let stale: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| f.check == LintCheck::StaleInsight)
+        .collect();
+    assert_eq!(stale.len(), 2, "{:?}", report.findings);
+    assert!(stale.iter().all(|f| f.page_slug == "(insight)"));
+    assert!(
+        stale
+            .iter()
+            .any(|f| f.message.contains("ins_drift") && f.message.contains("changed")),
+        "{stale:?}"
+    );
+    assert!(
+        stale
+            .iter()
+            .any(|f| f.message.contains("ins_gone") && f.message.contains("no longer part")),
+        "{stale:?}"
     );
 }

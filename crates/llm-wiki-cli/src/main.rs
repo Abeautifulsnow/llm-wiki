@@ -241,6 +241,9 @@ auth_token_env = "LLM_WIKI_SERVER_TOKEN"
 max_queued_jobs = 8
 max_body_bytes = 1048576
 rate_limit_per_minute = 120
+# Re-run build jobs interrupted by a server restart (spends LLM budget on
+# restart — enable deliberately).
+resume_interrupted_jobs = false
 "#
         .to_owned(),
     )

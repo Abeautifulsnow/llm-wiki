@@ -273,6 +273,44 @@ pub fn mark_stale_jobs_interrupted(conn: &Connection) -> Result<u64> {
     Ok(changed as u64)
 }
 
+/// Jobs eligible for auto-resume (PRD §31 "根据未来策略恢复"): build jobs
+/// interrupted by a server restart, oldest first. Callers gate this behind
+/// `server.resume_interrupted_jobs` — resuming spends LLM budget.
+pub fn list_resumable_jobs(conn: &Connection) -> Result<Vec<ServerJobRecord>> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {RECORD_COLUMNS} FROM server_jobs \
+             WHERE status = 'INTERRUPTED' AND failure_code = ?1 AND retryable = 1 AND kind = 'build' \
+             ORDER BY created_at ASC, job_id ASC"
+        ))
+        .map_err(db)?;
+    let mut rows = stmt.query(params![FAILURE_INTERRUPTED]).map_err(db)?;
+    let mut records = Vec::new();
+    while let Some(row) = rows.next().map_err(db)? {
+        records.push(row_to_record(row)?);
+    }
+    Ok(records)
+}
+
+/// Returns an INTERRUPTED-by-restart job to the queue so a fresh task can
+/// claim it. Terminal rows and rows interrupted for other reasons are never
+/// resurrected; returns `false` when nothing matched.
+pub fn requeue_job(conn: &Connection, job_id: &JobId) -> Result<bool> {
+    let changed = conn
+        .execute(
+            "UPDATE server_jobs SET status = 'QUEUED', phase = NULL, started_at = NULL, \
+             finished_at = NULL, failure_code = NULL, error = ?2 \
+             WHERE job_id = ?1 AND status = 'INTERRUPTED' AND failure_code = ?3",
+            params![
+                job_id.as_str(),
+                "resumed after server restart",
+                FAILURE_INTERRUPTED
+            ],
+        )
+        .map_err(db)?;
+    Ok(changed > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

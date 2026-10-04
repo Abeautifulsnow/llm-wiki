@@ -35,6 +35,11 @@ use llm_wiki_llm::LlmProvider;
 pub use error::ApiError;
 pub use state::{JobManager, SharedState};
 
+/// The frozen agent-protocol version carried by every `/v1` response body
+/// (V1.x contract: additive-only changes bump this number). See
+/// `docs/agent-protocol.md`.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 /// Everything [`serve`] needs: the workspace (holding `.llm-wiki/config.toml`
 /// conventions), the effective config, optional CLI host override and the
 /// (optional) LLM provider for build/query endpoints.
@@ -108,6 +113,27 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         }
     }
 
+    // Opt-in auto-resume (PRD §31 "根据未来策略恢复"): jobs that died with
+    // the previous server process are re-enqueued and re-run one at a time.
+    // Off by default — resuming spends LLM budget on restart, which must
+    // never come as a surprise.
+    if state.config().server.resume_interrupted_jobs {
+        if state.0.provider.is_some() {
+            let resume_state = state.clone();
+            tokio::spawn(async move {
+                let resumed = jobs::recover_interrupted_jobs(&resume_state).await;
+                if resumed > 0 {
+                    tracing::info!(count = resumed, "resumed interrupted build jobs");
+                }
+            });
+        } else {
+            tracing::warn!(
+                "server.resume_interrupted_jobs is enabled but no LLM provider is configured; \
+                 interrupted jobs stay INTERRUPTED"
+            );
+        }
+    }
+
     let app = build_router(state).layer(axum::extract::DefaultBodyLimit::max(body_limit));
     let listener = tokio::net::TcpListener::bind((host.as_str(), options.port))
         .await
@@ -133,6 +159,12 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
 /// The full v1 API (PRD §30). `/health` is unauthenticated; everything under
 /// `/v1` passes the security middleware (loopback restriction in local mode,
 /// bearer token in remote mode).
+///
+/// The agent-facing read surface (`/v1/search`, `/v1/context`, `/v1/query`,
+/// `/v1/insights`, `/v1/embed`) is the frozen V1.x protocol (PRD §50):
+/// additive-only changes, every response carries `protocol_version` and the
+/// caller's `request_id` (also on the `x-request-id` header). See
+/// `docs/agent-protocol.md`.
 pub fn build_router(state: SharedState) -> Router {
     let protected = Router::new()
         .route("/v1/status", get(routes::status))
@@ -145,6 +177,8 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/v1/query", post(routes::query))
         .route("/v1/pages", get(routes::list_pages))
         .route("/v1/pages/{id}", get(routes::get_page))
+        .route("/v1/insights", get(routes::list_insights))
+        .route("/v1/embed", post(routes::embed))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             middleware::auth,

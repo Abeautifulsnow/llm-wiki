@@ -158,6 +158,11 @@ pub struct ServerConfig {
     /// per-caller rate limits). 0 disables the limiter.
     #[serde(default = "default_rate_limit_per_minute")]
     pub rate_limit_per_minute: u32,
+    /// Re-enqueue build jobs that were interrupted by a server restart
+    /// (PRD §31 "根据未来策略恢复"). Off by default: resuming spends LLM
+    /// budget on restart, which must never come as a surprise.
+    #[serde(default)]
+    pub resume_interrupted_jobs: bool,
 }
 
 fn default_max_queued_jobs() -> u32 {
@@ -327,6 +332,7 @@ impl Default for ServerConfig {
             max_queued_jobs: default_max_queued_jobs(),
             max_body_bytes: default_max_body_bytes(),
             rate_limit_per_minute: default_rate_limit_per_minute(),
+            resume_interrupted_jobs: false,
         }
     }
 }

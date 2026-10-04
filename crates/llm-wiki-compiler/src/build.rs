@@ -251,7 +251,7 @@ pub(crate) fn prepare_pipeline_env(
                 // the extra entry never changes other task tags' keys.
                 (
                     "wiki-semantic-lint".to_owned(),
-                    "wiki-semantic-lint@1".to_owned(),
+                    "wiki-semantic-lint@2".to_owned(),
                 ),
                 ("wiki-ask".to_owned(), "wiki-ask@1".to_owned()),
             ]),
