@@ -218,6 +218,31 @@ export interface KnowledgeProvider {
   cancelJob(jobId: string): Promise<{ job_id: string; status: string }>;
 }
 
+/** The single protocol major version this SDK understands. */
+const SUPPORTED_PROTOCOL_VERSION = 1;
+
+/**
+ * Rejects responses whose `protocol_version` has a different MAJOR version
+ * instead of guessing at an evolved contract (README guarantee). Responses
+ * without the field (e.g. `/health`) pass through untouched.
+ */
+function assertProtocolVersion(payload: unknown): void {
+  if (
+    payload !== null &&
+    typeof payload === "object" &&
+    "protocol_version" in payload
+  ) {
+    const version = (payload as { protocol_version?: unknown }).protocol_version;
+    if (typeof version !== "number" || version !== SUPPORTED_PROTOCOL_VERSION) {
+      throw new LlmWikiApiError(
+        0,
+        "protocol_mismatch",
+        `server speaks protocol ${String(version)}; this SDK understands ${SUPPORTED_PROTOCOL_VERSION}. Upgrade @llm-wiki/sdk.`,
+      );
+    }
+  }
+}
+
 export class LlmWikiClient implements KnowledgeProvider {
   private readonly baseUrl: string;
   private readonly apiKey?: string;
@@ -317,7 +342,9 @@ export class LlmWikiClient implements KnowledgeProvider {
         }
         throw new LlmWikiApiError(response.status, code, message, requestId);
       }
-      return JSON.parse(text) as T;
+      const parsed = JSON.parse(text) as T;
+      assertProtocolVersion(parsed);
+      return parsed;
     } finally {
       clearTimeout(timer);
     }

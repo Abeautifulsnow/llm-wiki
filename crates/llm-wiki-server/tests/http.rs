@@ -670,12 +670,20 @@ async fn insights_endpoint_lists_paged_records() {
     assert_eq!(page["insights"][0]["query"], "question 2", "newest first");
     let cursor = page["next_cursor"].as_str().unwrap().to_owned();
 
-    let (status, body) = get(app, &format!("/v1/insights?limit=2&cursor={cursor}")).await;
+    let (status, body) = get(
+        app.clone(),
+        &format!("/v1/insights?limit=2&cursor={cursor}"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let page_two: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(page_two["truncated"], false);
     assert_eq!(page_two["insights"].as_array().unwrap().len(), 1);
     assert_eq!(page_two["insights"][0]["query"], "question 0");
+
+    // An unknown cursor is a client error (400), not a storage failure.
+    let (status, body) = get(app, "/v1/insights?cursor=ins_missing").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
 
 /// POST /v1/embed: runs the incremental backfill with the injected embedding
@@ -705,6 +713,7 @@ async fn embed_endpoint_runs_the_backfill() {
 
     // Uncovered generation: the endpoint issued at most one embed call.
     assert!(calls.load(AtomicOrdering::SeqCst) <= 1, "{body}");
+    std::env::remove_var("LLM_WIKI_EMBEDDING_MODEL");
 }
 
 /// Auto-resume (config-gated): recover_interrupted_jobs re-enqueues and
@@ -777,4 +786,55 @@ fn requeue_refuses_non_restart_interruptions() {
     record.failure_code = Some("llm_error".into());
     insert_job(&conn, &record).unwrap();
     assert!(!requeue_job(&conn, &job_id).unwrap());
+}
+
+/// #I01 regression: a PANIC inside the pipeline must not leak the build
+/// slot — the job terminalizes FAILED and the next build is accepted.
+#[tokio::test]
+async fn panicking_pipeline_releases_the_build_slot() {
+    let workspace = fixture_workspace("panic-slot");
+    let handler = Arc::new(
+        move |_request: &llm_wiki_llm::LlmRequest| -> Result<String, LlmError> {
+            panic!("deterministic pipeline bug");
+        },
+    );
+    let provider: Arc<dyn LlmProvider> = Arc::new(FakeLlmProvider::new("fake-server", handler));
+    let state = state_with_provider(workspace, provider);
+    let app = build_router(state.clone());
+
+    let (status, body) = post(app.clone(), "/v1/build", "{}", None).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let accepted: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let job_id = accepted["job_id"].as_str().unwrap().to_owned();
+
+    // The job terminalizes FAILED (the panic became a JoinError) and the
+    // slot is released afterwards.
+    let conn = open(&state.db_path()).unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let record = get_job(
+            &conn,
+            &llm_wiki_core::ids::JobId::from_validated(job_id.clone()),
+        )
+        .unwrap()
+        .unwrap();
+        if !matches!(record.status.as_str(), "QUEUED" | "RUNNING") {
+            assert_eq!(record.status, "FAILED", "{record:?}");
+            assert_eq!(record.failure_code.as_deref(), Some("llm_error"));
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the panicking task never terminalized the job"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        state.0.jobs.running().await.is_none(),
+        "the panicking task leaked the build slot"
+    );
+
+    // The slot is genuinely free: the next build is accepted, not 409.
+    let (status, body) = post(app, "/v1/build", "{}", None).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
 }

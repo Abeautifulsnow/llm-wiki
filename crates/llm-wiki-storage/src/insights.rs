@@ -55,6 +55,22 @@ pub fn insert_insight(conn: &mut Connection, record: &InsightRecord) -> Result<(
     Ok(())
 }
 
+/// Whether the cursor insight id exists (pagination input validation).
+pub fn insight_exists(conn: &Connection, insight_id: &InsightId) -> Result<bool> {
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM wiki_insights WHERE insight_id = ?1",
+            params![insight_id.as_str()],
+            |row| row.get(0),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(WikiError::Storage(format!("insight_exists: {other}"))),
+        })?;
+    Ok(found.is_some())
+}
+
 /// All insights (newest first), for `doctor`/future consumers.
 pub fn list_insights(conn: &Connection) -> Result<Vec<InsightRecord>> {
     let mut stmt = conn

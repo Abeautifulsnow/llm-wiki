@@ -24,8 +24,8 @@ use llm_wiki_search::{
 };
 use llm_wiki_storage::{
     count_jobs_by_status, count_sources, finish_job, get_active_build_id,
-    get_job as storage_get_job, get_job_by_idempotency_key, insert_job, latest_build,
-    list_insights_paged, list_jobs as storage_list_jobs, load_generation_pages, open,
+    get_job as storage_get_job, get_job_by_idempotency_key, insert_job, insight_exists,
+    latest_build, list_insights_paged, list_jobs as storage_list_jobs, load_generation_pages, open,
     FAILURE_CANCELLED, JOB_STATUSES,
 };
 
@@ -94,9 +94,13 @@ pub struct PageQuery {
 }
 
 /// `GET /v1/status`: sources, latest build, active generation, job depth.
-pub async fn status(State(state): State<SharedState>) -> Result<Json<serde_json::Value>, ApiError> {
+pub async fn status(
+    State(state): State<SharedState>,
+    Extension(request_id): Extension<RequestId>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let path = state.db_path();
     let workspace_name = state.config().project.name.clone();
+    let request_id = request_id.0.as_str().to_owned();
     let payload = tokio::task::spawn_blocking(move || {
         let conn = open(&path).map_err(ApiError::from)?;
         let sources = count_sources(&conn).map_err(ApiError::from)?;
@@ -105,6 +109,7 @@ pub async fn status(State(state): State<SharedState>) -> Result<Json<serde_json:
         let jobs = count_jobs_by_status(&conn, JOB_STATUSES).map_err(ApiError::from)?;
         Result::<_, ApiError>::Ok(json!({
             "protocol_version": PROTOCOL_VERSION,
+            "request_id": request_id,
             "workspace": workspace_name,
             "sources": sources,
             "latest_build": latest.map(|build| json!({
@@ -803,6 +808,7 @@ fn hybrid_context(
 /// only), slug-ordered, cursor-paginated.
 pub async fn list_pages(
     State(state): State<SharedState>,
+    Extension(request_id): Extension<RequestId>,
     Query(query): Query<PageQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
@@ -856,6 +862,8 @@ pub async fn list_pages(
         return Err(ApiError::nothing_published());
     };
     Ok(Json(json!({
+        "protocol_version": PROTOCOL_VERSION,
+        "request_id": request_id.0.as_str(),
         "generation": generation.as_str(),
         "pages": pages,
         "next_cursor": next_cursor,
@@ -946,6 +954,15 @@ pub async fn list_insights(
         // only a "something was published" signal here.
         if get_active_build_id(conn)?.is_none() {
             return Ok(None);
+        }
+        // An unknown cursor is a CLIENT error, not a storage failure (§30:
+        // 4xx for malformed requests).
+        if let Some(cursor) = &cursor {
+            if !insight_exists(conn, cursor)? {
+                return Err(llm_wiki_core::error::WikiError::Config(format!(
+                    "unknown cursor insight {cursor}"
+                )));
+            }
         }
         let mut records = list_insights_paged(conn, limit + 1, cursor.as_ref())?;
         let truncated = records.len() > limit;

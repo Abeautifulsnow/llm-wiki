@@ -88,16 +88,30 @@ pub fn spawn_build_job(
         let sink = progress_sink(db_path.clone(), job_id.clone());
         let workspace = state.0.workspace.clone();
         let config = state.0.config.clone();
-        let result = llm_wiki_compiler::run_build_with_options(
-            &workspace,
-            &config,
-            provider,
-            BuildOptions {
-                cancel: Some(cancel),
-                on_progress: Some(sink),
-            },
-        )
-        .await;
+        // The pipeline runs on a NESTED task and the outer task joins its
+        // JoinHandle: a PANIC inside the pipeline surfaces as a JoinError
+        // instead of aborting this task, so the job is terminalized FAILED
+        // and the build slot is ALWAYS released (review #I01 — otherwise a
+        // panic would hold the slot until restart, 409-ing every build and
+        // deadlocking the auto-resume wait loop).
+        let pipeline = tokio::spawn(async move {
+            llm_wiki_compiler::run_build_with_options(
+                &workspace,
+                &config,
+                provider,
+                BuildOptions {
+                    cancel: Some(cancel),
+                    on_progress: Some(sink),
+                },
+            )
+            .await
+        });
+        let result = match pipeline.await {
+            Ok(result) => result,
+            Err(join_err) => Err(llm_wiki_core::error::WikiError::Llm(format!(
+                "build task panicked: {join_err}"
+            ))),
+        };
 
         match &result {
             Ok(report) => {

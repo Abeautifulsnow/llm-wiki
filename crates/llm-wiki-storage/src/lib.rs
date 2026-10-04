@@ -48,7 +48,8 @@ pub use graph::{
     NODE_TYPE_ENTITY, NODE_TYPE_PAGE, RELATION_LINKS_TO,
 };
 pub use insights::{
-    insert_insight, list_insights, list_insights_paged, InsightCitation, InsightRecord,
+    insert_insight, insight_exists, list_insights, list_insights_paged, InsightCitation,
+    InsightRecord,
 };
 pub use jobs::{
     attach_job_build, count_jobs_by_status, finish_job, get_job, get_job_by_idempotency_key,
