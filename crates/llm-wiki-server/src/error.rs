@@ -100,6 +100,12 @@ impl IntoResponse for ApiError {
 
 /// Maps the domain error model (PRD §34) onto HTTP: the category decides the
 /// status + stable code; the message is preserved verbatim.
+///
+/// KNOWN EXPOSURE (review #S04, accepted for the local-first v1): `Storage`/
+/// `Index` messages can embed SQL or path detail in 500 bodies. Local mode is
+/// the primary deployment; before exposing a server on a reachable interface
+/// (remote mode), scrub those two variants to a generic message and keep the
+/// detail in the `tracing` log.
 impl From<WikiError> for ApiError {
     fn from(err: WikiError) -> Self {
         let (status, code) = match &err {

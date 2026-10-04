@@ -2,6 +2,7 @@
 //! `POST /v1/build`, mirrors §31 stage transitions onto the persisted job row
 //! and terminalizes the job from the pipeline's outcome.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -31,9 +32,36 @@ pub fn failure_of(err: &WikiError) -> (&'static str, &'static str, bool) {
     }
 }
 
+/// The §31 progress sink: mirrors every pipeline stage transition onto the
+/// job row and attaches the build id on the first transition.
+fn progress_sink(db_path: PathBuf, job_id: JobId) -> BuildProgressSink {
+    let attached = Arc::new(AtomicBool::new(false));
+    let attach_flag = attached.clone();
+    Arc::new(move |progress: &BuildProgress| {
+        // A dedicated short-lived connection per transition: the build
+        // holds its own; WAL + busy timeout make the two safe.
+        let Ok(conn) = open(&db_path) else {
+            return;
+        };
+        if let Err(err) = set_job_phase(&conn, &job_id, progress.phase) {
+            tracing::warn!(job = %job_id, error = %err, "phase mirror failed");
+        }
+        if !attach_flag.swap(true, Ordering::SeqCst) {
+            if let Ok(build_id) = BuildId::parse(&progress.build_id) {
+                if let Err(err) = attach_job_build(&conn, &job_id, &build_id) {
+                    tracing::warn!(job = %job_id, error = %err, "build attach failed");
+                }
+            }
+        }
+    })
+}
+
 /// Spawns the background task that runs `run_build_with_options` for a queued
 /// job: RUNNING → phase mirror (progress sink) → terminal status. Releases
 /// the job slot when the task unwinds, whatever the outcome.
+///
+/// Length note: ~70 lines — flat orchestration over three helpers (failure_of,
+/// progress_sink, terminalize) with no nesting beyond the outcome match.
 pub fn spawn_build_job(
     state: SharedState,
     job_id: JobId,
@@ -42,34 +70,21 @@ pub fn spawn_build_job(
 ) {
     tokio::spawn(async move {
         let db_path = state.db_path();
-        if let Ok(conn) = open(&db_path) {
-            if let Err(err) = set_job_running(&conn, &job_id) {
-                tracing::warn!(job = %job_id, error = %err, "could not mark job RUNNING");
-            }
+
+        // Claim the QUEUED row. A `false` transition means the row is no
+        // longer QUEUED (cancelled between accept and task start): the job
+        // must NOT run — exit without touching the row or the pipeline.
+        let started = open(&db_path)
+            .ok()
+            .and_then(|conn| set_job_running(&conn, &job_id).ok())
+            .unwrap_or(false);
+        if !started {
+            tracing::info!(job = %job_id, "job no longer queued; not starting the build");
+            state.0.jobs.take(&job_id).await;
+            return;
         }
 
-        let sink_db = db_path.clone();
-        let sink_job = job_id.clone();
-        let attached = Arc::new(AtomicBool::new(false));
-        let attach_flag = attached.clone();
-        let sink: BuildProgressSink = Arc::new(move |progress: &BuildProgress| {
-            // A dedicated short-lived connection per transition: the build
-            // holds its own; WAL + busy timeout make the two safe.
-            let Ok(conn) = open(&sink_db) else {
-                return;
-            };
-            if let Err(err) = set_job_phase(&conn, &sink_job, progress.phase) {
-                tracing::warn!(job = %sink_job, error = %err, "phase mirror failed");
-            }
-            if !attach_flag.swap(true, Ordering::SeqCst) {
-                if let Ok(build_id) = BuildId::parse(&progress.build_id) {
-                    if let Err(err) = attach_job_build(&conn, &sink_job, &build_id) {
-                        tracing::warn!(job = %sink_job, error = %err, "build attach failed");
-                    }
-                }
-            }
-        });
-
+        let sink = progress_sink(db_path.clone(), job_id.clone());
         let workspace = state.0.workspace.clone();
         let config = state.0.config.clone();
         let result = llm_wiki_compiler::run_build_with_options(

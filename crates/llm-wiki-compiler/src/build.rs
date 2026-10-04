@@ -272,7 +272,6 @@ pub(crate) fn prepare_pipeline_env(
     })
 }
 
-/// Length note: ~95 lines — thin orchestration (recoveries + env prep + error terminalization); the heavy lifting lives in build_full_pipeline/build_incremental.
 /// Runs the whole V0.1 build pipeline. `workspace_root` is the project
 /// directory holding `.llm-wiki/config.toml`; paths inside `config` are
 /// resolved against it.
@@ -284,8 +283,44 @@ pub async fn run_build(
     run_build_with_options(workspace_root, config, provider, BuildOptions::default()).await
 }
 
+/// Terminalizes a failed build (PRD §35: the previous generation and pointer
+/// stay untouched) and cleans up a cancelled build's unpublished generation
+/// directory (§31).
+fn terminalize_failure(
+    conn: &mut rusqlite::Connection,
+    build_id: &BuildId,
+    wiki_dir: &Path,
+    err: &WikiError,
+) {
+    let status = terminal_status_for(err);
+    let marked = finish_build(conn, build_id, status, None, None);
+    if let Err(mark_err) = marked {
+        tracing::error!(build = %build_id, error = %mark_err, "could not mark build terminal");
+    }
+    if matches!(err, WikiError::Cancelled) {
+        // §31: a cancelled build leaves no unpublished generation dir behind
+        // (publish never ran, but clean defensively in case a previous
+        // crashed attempt left one for THIS build id).
+        let generation_dir = PublishPaths::new(wiki_dir).generation_dir(build_id);
+        if generation_dir.is_dir() {
+            if let Err(remove_err) = std::fs::remove_dir_all(&generation_dir) {
+                tracing::warn!(
+                    build = %build_id,
+                    error = %remove_err,
+                    "could not remove the unpublished generation dir"
+                );
+            }
+        }
+    }
+    tracing::warn!(build = %build_id, status, error = %err, "build failed");
+}
+
 /// [`run_build`] with cooperative cancellation and stage-progress reporting
 /// (PRD §31) — the server's entry point.
+///
+/// Length note: ~95 lines — thin orchestration (recoveries + env prep +
+/// start/terminalize via helpers); the heavy lifting lives in
+/// build_full_pipeline/build_incremental and [`terminalize_failure`].
 pub async fn run_build_with_options(
     workspace_root: &Path,
     config: &Config,
@@ -376,28 +411,7 @@ pub async fn run_build_with_options(
             })
         }
         Err(err) => {
-            // The previous generation and pointer stay untouched (PRD §35).
-            let status = terminal_status_for(&err);
-            let marked = finish_build(&mut conn, &build_id, status, None, None);
-            if let Err(mark_err) = marked {
-                tracing::error!(build = %build_id, error = %mark_err, "could not mark build terminal");
-            }
-            if matches!(err, WikiError::Cancelled) {
-                // §31: a cancelled build leaves no unpublished generation dir
-                // behind (publish never ran, but clean defensively in case a
-                // previous crashed attempt left one for THIS build id).
-                let generation_dir = PublishPaths::new(&wiki_dir).generation_dir(&build_id);
-                if generation_dir.is_dir() {
-                    if let Err(remove_err) = std::fs::remove_dir_all(&generation_dir) {
-                        tracing::warn!(
-                            build = %build_id,
-                            error = %remove_err,
-                            "could not remove the unpublished generation dir"
-                        );
-                    }
-                }
-            }
-            tracing::warn!(build = %build_id, status, error = %err, "build failed");
+            terminalize_failure(&mut conn, &build_id, &wiki_dir, &err);
             Err(err)
         }
     }

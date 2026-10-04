@@ -193,21 +193,25 @@ pub fn count_jobs_by_status(
     Ok(counts)
 }
 
-/// Marks a job RUNNING (idempotent; also stamps `started_at` once).
-pub fn set_job_running(conn: &Connection, job_id: &JobId) -> Result<()> {
-    conn.execute(
-        "UPDATE server_jobs SET status = 'RUNNING', \
+/// Marks a job RUNNING. Returns `false` when the row is no longer QUEUED
+/// (e.g. cancelled before start) — the caller must then NOT run the job.
+pub fn set_job_running(conn: &Connection, job_id: &JobId) -> Result<bool> {
+    let changed = conn
+        .execute(
+            "UPDATE server_jobs SET status = 'RUNNING', \
          started_at = COALESCE(started_at, ?2) WHERE job_id = ?1 AND status = 'QUEUED'",
-        params![job_id.as_str(), chrono::Utc::now().to_rfc3339()],
-    )
-    .map_err(db)?;
-    Ok(())
+            params![job_id.as_str(), chrono::Utc::now().to_rfc3339()],
+        )
+        .map_err(db)?;
+    Ok(changed > 0)
 }
 
-/// Mirrors a pipeline stage transition onto the job row.
+/// Mirrors a pipeline stage transition onto the job row. Writes to
+/// non-RUNNING rows are silently dropped — a job cancelled between phase
+/// transitions must not have its phase fields revived.
 pub fn set_job_phase(conn: &Connection, job_id: &JobId, phase: &str) -> Result<()> {
     conn.execute(
-        "UPDATE server_jobs SET phase = ?2 WHERE job_id = ?1",
+        "UPDATE server_jobs SET phase = ?2 WHERE job_id = ?1 AND status = 'RUNNING'",
         params![job_id.as_str(), phase],
     )
     .map_err(db)?;
@@ -224,7 +228,10 @@ pub fn attach_job_build(conn: &Connection, job_id: &JobId, build_id: &BuildId) -
     Ok(())
 }
 
-/// Terminalizes a job with its §31 outcome.
+/// Terminalizes a job with its §31 outcome. Terminal rows are IMMUTABLE
+/// (§31: a cancelled job must never be resurrected to COMPLETED by a task
+/// that raced its cancellation) — returns `false` when the row was already
+/// terminal and nothing changed.
 pub fn finish_job(
     conn: &Connection,
     job_id: &JobId,
@@ -232,24 +239,25 @@ pub fn finish_job(
     failure_code: Option<&str>,
     retryable: bool,
     error: Option<&str>,
-) -> Result<()> {
+) -> Result<bool> {
     if !JOB_STATUSES.contains(&status) {
         return Err(WikiError::Storage(format!("invalid job status {status}")));
     }
-    conn.execute(
-        "UPDATE server_jobs SET status = ?2, failure_code = ?3, retryable = ?4, error = ?5, \
-         finished_at = ?6 WHERE job_id = ?1",
-        params![
-            job_id.as_str(),
-            status,
-            failure_code,
-            i64::from(retryable),
-            error,
-            chrono::Utc::now().to_rfc3339()
-        ],
-    )
-    .map_err(db)?;
-    Ok(())
+    let changed = conn
+        .execute(
+            "UPDATE server_jobs SET status = ?2, failure_code = ?3, retryable = ?4, error = ?5, \
+         finished_at = ?6 WHERE job_id = ?1 AND status IN ('QUEUED', 'RUNNING')",
+            params![
+                job_id.as_str(),
+                status,
+                failure_code,
+                i64::from(retryable),
+                error,
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )
+        .map_err(db)?;
+    Ok(changed > 0)
 }
 
 /// Startup recovery (§31): every QUEUED/RUNNING job becomes INTERRUPTED with
@@ -315,7 +323,10 @@ mod tests {
         insert_job(&conn, &queued("job_A", None)).unwrap();
         insert_job(&conn, &queued("job_B", None)).unwrap();
 
-        set_job_running(&conn, &JobId::from_validated("job_A")).unwrap();
+        assert!(
+            set_job_running(&conn, &JobId::from_validated("job_A")).unwrap(),
+            "a QUEUED job transitions to RUNNING"
+        );
         set_job_phase(&conn, &JobId::from_validated("job_A"), "ANALYZING").unwrap();
         let running = get_job(&conn, &JobId::from_validated("job_A"))
             .unwrap()
@@ -324,7 +335,7 @@ mod tests {
         assert_eq!(running.phase.as_deref(), Some("ANALYZING"));
         assert!(running.started_at.is_some());
 
-        finish_job(
+        assert!(finish_job(
             &conn,
             &JobId::from_validated("job_A"),
             "FAILED",
@@ -332,7 +343,7 @@ mod tests {
             true,
             Some("boom"),
         )
-        .unwrap();
+        .unwrap());
         let failed = get_job(&conn, &JobId::from_validated("job_A"))
             .unwrap()
             .unwrap();
@@ -354,6 +365,51 @@ mod tests {
         );
         // Recovery never touches terminal rows.
         assert_eq!(mark_stale_jobs_interrupted(&conn).unwrap(), 0);
+    }
+
+    /// §31 immutability: a terminal row is never overwritten — a task that
+    /// raced its cancellation must not resurrect a CANCELLED job to
+    /// COMPLETED, and a cancelled job can never start.
+    #[test]
+    fn terminal_rows_are_immutable_and_cancelled_jobs_never_start() {
+        let conn = open_in_memory().unwrap();
+        insert_job(&conn, &queued("job_A", None)).unwrap();
+
+        // Cancel before start, then both the task-side start and a late
+        // completion write must be no-ops.
+        assert!(finish_job(
+            &conn,
+            &JobId::from_validated("job_A"),
+            "CANCELLED",
+            Some(FAILURE_CANCELLED),
+            true,
+            Some("cancelled before start"),
+        )
+        .unwrap());
+        assert!(!set_job_running(&conn, &JobId::from_validated("job_A")).unwrap());
+        assert!(!finish_job(
+            &conn,
+            &JobId::from_validated("job_A"),
+            "COMPLETED",
+            None,
+            false,
+            None,
+        )
+        .unwrap());
+        let cancelled = get_job(&conn, &JobId::from_validated("job_A"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.status, "CANCELLED");
+        assert_eq!(cancelled.failure_code.as_deref(), Some(FAILURE_CANCELLED));
+        // Phase writes drop on non-RUNNING rows.
+        set_job_phase(&conn, &JobId::from_validated("job_A"), "ANALYZING").unwrap();
+        assert_eq!(
+            get_job(&conn, &JobId::from_validated("job_A"))
+                .unwrap()
+                .unwrap()
+                .phase,
+            None
+        );
     }
 
     #[test]

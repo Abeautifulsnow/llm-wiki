@@ -112,6 +112,22 @@ impl JobManager {
         }
     }
 
+    /// The cancel flag of the job holding the slot, WITHOUT releasing it.
+    ///
+    /// Cancellation must not free the build slot: a cooperatively-cancelled
+    /// pipeline is still unwinding toward its next checkpoint, and a new
+    /// build admitted in that window would race it over the registry (the
+    /// slot is the single-build contract, §31). Only the job task itself
+    /// releases the slot, via [`Self::take`], when its pipeline has ended.
+    pub async fn cancel_flag_of(&self, job_id: &JobId) -> Option<CancelFlag> {
+        self.slot
+            .lock()
+            .await
+            .as_ref()
+            .filter(|job| &job.job_id == job_id)
+            .map(|job| job.cancel.clone())
+    }
+
     /// Releases the slot if it still belongs to `job_id` (end-of-job path).
     pub async fn take(&self, job_id: &JobId) -> bool {
         self.detach_running(job_id).await.is_some()

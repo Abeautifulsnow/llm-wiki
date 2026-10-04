@@ -403,3 +403,173 @@ async fn remote_mode_requires_a_bearer_token() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 }
+
+// ---------------------------------------------------------------------------
+// Cancellation race regressions (#I01/#I02 from the post-delivery review)
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+use llm_wiki_core::ids::JobId;
+use llm_wiki_llm::LlmError;
+use llm_wiki_server::state::ActiveJob;
+use llm_wiki_storage::{
+    finish_job, insert_job, set_job_running, ServerJobRecord, FAILURE_CANCELLED,
+};
+
+fn job_row(job_id: &JobId, status: &str) -> ServerJobRecord {
+    ServerJobRecord {
+        job_id: job_id.clone(),
+        kind: "build".into(),
+        status: status.into(),
+        phase: None,
+        build_id: None,
+        failure_code: None,
+        retryable: false,
+        error: None,
+        request_id: None,
+        idempotency_key: None,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        started_at: None,
+        finished_at: None,
+    }
+}
+
+/// #I01 regression: cancelling a RUNNING job must NOT release the build
+/// slot — the cancelled pipeline is still unwinding, and a new build
+/// admitted in that window would race it over the registry.
+#[tokio::test]
+async fn cancelling_a_running_job_keeps_the_build_slot_claimed() {
+    let workspace = fixture_workspace("cancel-keeps-slot");
+    let state = state_with_provider(
+        workspace,
+        Arc::new(FakeLlmProvider::fixed("fake-server", "x")),
+    );
+    let job_id = JobId::generate();
+
+    let conn = open(&state.db_path()).unwrap();
+    insert_job(&conn, &job_row(&job_id, "RUNNING")).unwrap();
+    let cancel = llm_wiki_core::CancelFlag::new();
+    assert!(
+        state
+            .0
+            .jobs
+            .start(ActiveJob {
+                job_id: job_id.clone(),
+                cancel: cancel.clone(),
+            })
+            .await
+    );
+
+    let app = build_router(state.clone());
+    let (status, body) = post(app.clone(), &format!("/v1/jobs/{job_id}/cancel"), "", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(cancel.is_cancelled(), "the running job's flag was set");
+
+    // THE CONTRACT: the slot is still claimed while the cancelled pipeline
+    // unwinds — a concurrent build request is rejected with 409, not run.
+    assert_eq!(
+        state
+            .0
+            .jobs
+            .running()
+            .await
+            .map(|running| running.as_str().to_owned()),
+        Some(job_id.as_str().to_owned()),
+        "cancelling must not free the build slot"
+    );
+    let (build_status, build_body) = post(app, "/v1/build", "{}", None).await;
+    assert_eq!(build_status, StatusCode::CONFLICT, "{build_body}");
+    assert!(build_body.contains("build_already_running"), "{build_body}");
+
+    // Only the job task's own unwind releases the slot.
+    assert!(state.0.jobs.take(&job_id).await);
+    assert!(state.0.jobs.running().await.is_none());
+}
+
+/// #I02 regression: a job cancelled before its task claims the row must
+/// never run the pipeline — the task exits immediately, the row stays
+/// CANCELLED, and the provider is never invoked.
+#[tokio::test]
+async fn cancelled_job_task_exits_without_running_the_pipeline() {
+    let workspace = fixture_workspace("cancel-before-start");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let handler = Arc::new(
+        move |_request: &llm_wiki_llm::LlmRequest| -> Result<String, LlmError> {
+            counter.fetch_add(1, AtomicOrdering::SeqCst);
+            Err(LlmError::Api {
+                code: 500,
+                message: "provider must not be called for a cancelled job".into(),
+            })
+        },
+    );
+    let provider: Arc<dyn LlmProvider> = Arc::new(FakeLlmProvider::new("fake-server", handler));
+    let state = state_with_provider(workspace, provider.clone());
+    let job_id = JobId::generate();
+
+    let conn = open(&state.db_path()).unwrap();
+    insert_job(&conn, &job_row(&job_id, "QUEUED")).unwrap();
+    assert!(finish_job(
+        &conn,
+        &job_id,
+        "CANCELLED",
+        Some(FAILURE_CANCELLED),
+        true,
+        Some("cancelled before start"),
+    )
+    .unwrap());
+
+    let cancel = llm_wiki_core::CancelFlag::new();
+    assert!(
+        state
+            .0
+            .jobs
+            .start(ActiveJob {
+                job_id: job_id.clone(),
+                cancel: cancel.clone(),
+            })
+            .await
+    );
+
+    llm_wiki_server::jobs::spawn_build_job(state.clone(), job_id.clone(), cancel, provider);
+
+    // The task exits at once (set_job_running returns false): the slot is
+    // freed and the provider was never touched.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while state.0.jobs.running().await.is_some() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the cancelled task never released the slot"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        calls.load(AtomicOrdering::SeqCst),
+        0,
+        "no LLM call happened"
+    );
+    let record = get_job(&conn, &job_id).unwrap().unwrap();
+    assert_eq!(record.status, "CANCELLED", "the terminal row is immutable");
+}
+
+/// #I02 regression (task side): `set_job_running` on a non-QUEUED row
+/// returns false, which is the early-exit signal.
+#[tokio::test]
+async fn set_job_running_reports_a_cancelled_row_as_not_started() {
+    let workspace = fixture_workspace("set-running-guard");
+    let state = state_for(workspace);
+    let conn = open(&state.db_path()).unwrap();
+    let job_id = JobId::generate();
+    insert_job(&conn, &job_row(&job_id, "QUEUED")).unwrap();
+    finish_job(
+        &conn,
+        &job_id,
+        "CANCELLED",
+        Some(FAILURE_CANCELLED),
+        true,
+        Some("cancelled before start"),
+    )
+    .unwrap();
+    assert!(!set_job_running(&conn, &job_id).unwrap());
+}

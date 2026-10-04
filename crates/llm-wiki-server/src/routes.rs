@@ -16,6 +16,7 @@ use serde_json::json;
 
 use llm_wiki_core::cancel::CancelFlag;
 use llm_wiki_core::ids::JobId;
+use llm_wiki_llm::LlmProvider;
 use llm_wiki_search::{
     rerank_search_hits, reranker_from_config, FullTextSearch, SqliteFullTextSearch,
 };
@@ -123,8 +124,57 @@ pub struct BuildRequest {
     pub source_id: Option<String>,
 }
 
+/// Idempotency replay (PRD §30): the same `Idempotency-Key` returns the SAME
+/// job instead of starting a second LLM run. Keys currently have NO TTL —
+/// retention equals job-row retention (no cleanup exists yet), which is
+/// stricter than the contract's "within the validity period".
+async fn replay_idempotent(
+    state: &SharedState,
+    key: Option<String>,
+) -> Result<Option<Response>, ApiError> {
+    let Some(key) = key else {
+        return Ok(None);
+    };
+    let existing = db(state, move |conn| get_job_by_idempotency_key(conn, &key)).await?;
+    Ok(existing.map(|record| {
+        (
+            StatusCode::OK,
+            Json(json!({"job": job_json(&record), "replayed": true})),
+        )
+            .into_response()
+    }))
+}
+
+/// Admission control before a job id is consumed: provider configured, queue
+/// cap, single-slot build lock.
+async fn ensure_build_admission(state: &SharedState) -> Result<Arc<dyn LlmProvider>, ApiError> {
+    let provider = state.0.provider.clone().ok_or_else(|| {
+        ApiError::bad_request(
+            "llm.model is not configured in .llm-wiki/config.toml; the server cannot build",
+        )
+    })?;
+    let queued = db(state, |conn| count_jobs_by_status(conn, &["QUEUED"]))
+        .await?
+        .remove("QUEUED")
+        .unwrap_or(0);
+    let cap = state.config().server.max_queued_jobs;
+    if queued >= cap {
+        return Err(ApiError::queue_full(cap));
+    }
+    if let Some(running) = state.0.jobs.running().await {
+        return Err(ApiError::conflict(
+            "build_already_running",
+            format!("build job {running} is already running; one build at a time"),
+        ));
+    }
+    Ok(provider)
+}
+
 /// `POST /v1/build`: queue a build job. Honors `Idempotency-Key`, the job
 /// queue cap and the single-slot build lock.
+///
+/// Length note: ~55 lines — thin orchestration over parse/admission helpers;
+/// the tail is the accept path (insert row → claim slot → spawn).
 pub async fn build(
     State(state): State<SharedState>,
     headers: axum::http::HeaderMap,
@@ -144,50 +194,17 @@ pub async fn build(
         }
     }
 
-    // Idempotency (PRD §30): same key → same job, never a second LLM run.
     let idempotency_key = headers
         .get("idempotency-key")
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned);
-    if let Some(key) = idempotency_key.clone() {
-        let existing = db(&state, move |conn| get_job_by_idempotency_key(conn, &key)).await?;
-        if let Some(record) = existing {
-            return Ok((
-                StatusCode::OK,
-                Json(json!({"job": job_json(&record), "replayed": true})),
-            )
-                .into_response());
-        }
+    if let Some(replayed) = replay_idempotent(&state, idempotency_key.clone()).await? {
+        return Ok(replayed);
     }
 
-    let provider = state
-        .0
-        .provider
-        .clone()
-        .ok_or_else(|| {
-            ApiError::bad_request(
-                "llm.model is not configured in .llm-wiki/config.toml; the server cannot build",
-            )
-        })?
-        .clone();
-
-    // Queue cap + single-slot check BEFORE consuming a job id.
-    let queued = db(&state, |conn| count_jobs_by_status(conn, &["QUEUED"]))
-        .await?
-        .remove("QUEUED")
-        .unwrap_or(0);
-    let cap = state.config().server.max_queued_jobs;
-    if queued >= cap {
-        return Err(ApiError::queue_full(cap));
-    }
-    if let Some(running) = state.0.jobs.running().await {
-        return Err(ApiError::conflict(
-            "build_already_running",
-            format!("build job {running} is already running; one build at a time"),
-        ));
-    }
+    let provider = ensure_build_admission(&state).await?;
 
     let job_id = JobId::generate();
     let record = llm_wiki_storage::ServerJobRecord {
@@ -295,6 +312,11 @@ pub struct JobFilter {
 /// `POST /v1/jobs/{job_id}/cancel` — cooperative (PRD §31): RUNNING jobs
 /// stop at the next pipeline checkpoint; QUEUED jobs cancel immediately;
 /// terminal jobs are a 409.
+///
+/// Cancellation NEVER releases the build slot (#I01): a cancelled pipeline
+/// is still unwinding toward its checkpoint, and only the job task itself
+/// frees the slot when its pipeline has ended — otherwise a new build could
+/// be admitted against a workspace that still has a live pipeline.
 pub async fn cancel_job(
     State(state): State<SharedState>,
     Path(job_id): Path<String>,
@@ -306,8 +328,14 @@ pub async fn cancel_job(
         .ok_or_else(|| ApiError::not_found(format!("no job {job_id}")))?;
     match record.status.as_str() {
         "QUEUED" => {
+            // Signal the in-memory flag too: the task may be between the
+            // accept and its RUNNING transition; the flag makes its first
+            // pipeline checkpoint bail out.
+            if let Some(cancel) = state.0.jobs.cancel_flag_of(&job_id).await {
+                cancel.cancel();
+            }
             let cancel_id = job_id.clone();
-            db(&state, move |conn| {
+            let cancelled = db(&state, move |conn| {
                 finish_job(
                     conn,
                     &cancel_id,
@@ -318,27 +346,43 @@ pub async fn cancel_job(
                 )
             })
             .await?;
-            Ok(Json(
-                json!({"job_id": job_id.as_str(), "status": "cancelled"}),
-            ))
+            if cancelled {
+                Ok(Json(
+                    json!({"job_id": job_id.as_str(), "status": "cancelled"}),
+                ))
+            } else {
+                // Lost the race: the task flipped the row to RUNNING between
+                // our read and write — fall through to the cooperative path.
+                cancel_running(&state, &job_id).await
+            }
         }
-        "RUNNING" => {
-            let Some(cancel) = state.0.jobs.detach_running(&job_id).await else {
-                return Err(ApiError::conflict(
-                    "job_not_cancellable",
-                    "the job is RUNNING but not owned by this server instance",
-                ));
-            };
-            cancel.cancel();
-            Ok(Json(
-                json!({"job_id": job_id.as_str(), "status": "cancelling"}),
-            ))
-        }
+        "RUNNING" => cancel_running(&state, &job_id).await,
         other => Err(ApiError::conflict(
             "job_not_cancellable",
             format!("job is already terminal ({other})"),
         )),
     }
+}
+
+/// Signals a RUNNING job's cancel flag without releasing its slot.
+fn cancel_running<'a>(
+    state: &'a SharedState,
+    job_id: &'a JobId,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Json<serde_json::Value>, ApiError>> + Send + 'a>,
+> {
+    Box::pin(async move {
+        let Some(cancel) = state.0.jobs.cancel_flag_of(job_id).await else {
+            return Err(ApiError::conflict(
+                "job_not_cancellable",
+                "the job is RUNNING but not owned by this server instance",
+            ));
+        };
+        cancel.cancel();
+        Ok(Json(
+            json!({"job_id": job_id.as_str(), "status": "cancelling"}),
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -451,9 +495,73 @@ pub struct ContextBudgetRequest {
     pub graph_limit: Option<usize>,
 }
 
+/// Resolves the request budget over the safe defaults (absent fields keep
+/// the default; the request can only tighten or relax the documented knobs).
+fn requested_budget(over: Option<&ContextBudgetRequest>) -> llm_wiki_search::ContextBudget {
+    let mut budget = llm_wiki_search::ContextBudget::default();
+    let Some(over) = over else {
+        return budget;
+    };
+    if let Some(v) = over.max_chunks {
+        budget.max_chunks = v;
+    }
+    if let Some(v) = over.max_tokens {
+        budget.max_tokens = v;
+    }
+    if let Some(v) = over.max_pages {
+        budget.max_pages = v;
+    }
+    if let Some(v) = over.max_per_source {
+        budget.max_per_source = v;
+    }
+    if let Some(v) = over.graph_limit {
+        budget.graph_limit = v;
+    }
+    budget
+}
+
+/// The §19.3 vector candidates for one query, split by Send-ness: the
+/// coverage check and cosine scoring run on the blocking pool; the embed
+/// call is the only async piece, and an uncovered workspace never spends it.
+async fn vector_candidates_for(
+    state: &SharedState,
+    query: &str,
+) -> Result<Vec<llm_wiki_search::VectorCandidate>, ApiError> {
+    let (embedding_provider, model) = hybrid_context(state, None)?;
+    let coverage_path = state.db_path();
+    let model_for_coverage = model.clone();
+    let covered = tokio::task::spawn_blocking(move || {
+        let conn = open(&coverage_path).map_err(ApiError::from)?;
+        llm_wiki_compiler::embedding_coverage(&conn, &model_for_coverage).map_err(ApiError::from)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("task join: {e}")))?;
+    if !covered? {
+        return Ok(Vec::new());
+    }
+    let hybrid = llm_wiki_compiler::HybridContext {
+        provider: &embedding_provider,
+        model: model.clone(),
+    };
+    let query_vector = llm_wiki_compiler::embed_query_vector(&hybrid, query)
+        .await
+        .map_err(ApiError::from)?;
+    let path = state.db_path();
+    tokio::task::spawn_blocking(move || {
+        let conn = open(&path).map_err(ApiError::from)?;
+        llm_wiki_compiler::top_cosine_candidates(&conn, &model, query_vector.as_deref())
+            .map_err(ApiError::from)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("task join: {e}")))?
+}
+
 /// `POST /v1/context` (PRD §24/§30, the Agent-integration surface): the
 /// budgeted, diversity-aware retrieval bundle with citations and truncation
 /// transparency.
+///
+/// Length note: ~75 lines — parse → budget/vector helpers → one blocking
+/// assembly call → serialization; no logic deeper than the outcome `??`s.
 pub async fn context(
     State(state): State<SharedState>,
     body: axum::body::Bytes,
@@ -462,59 +570,11 @@ pub async fn context(
     if request.query.trim().is_empty() {
         return Err(ApiError::bad_request("query must not be empty"));
     }
-    let mut budget = llm_wiki_search::ContextBudget::default();
-    if let Some(over) = &request.budget {
-        if let Some(v) = over.max_chunks {
-            budget.max_chunks = v;
-        }
-        if let Some(v) = over.max_tokens {
-            budget.max_tokens = v;
-        }
-        if let Some(v) = over.max_pages {
-            budget.max_pages = v;
-        }
-        if let Some(v) = over.max_per_source {
-            budget.max_per_source = v;
-        }
-        if let Some(v) = over.graph_limit {
-            budget.graph_limit = v;
-        }
-    }
+    let budget = requested_budget(request.budget.as_ref());
     let reranker = reranker_from_config(&state.config().search.rerank)?;
 
-    let vector: Vec<llm_wiki_search::VectorCandidate> = if request.hybrid {
-        // Split the §19.3 candidate path by Send-ness: coverage check + cosine
-        // scoring run on the blocking pool; the embed call is the only async
-        // piece, and an uncovered workspace never spends it.
-        let (embedding_provider, model) = hybrid_context(&state, None)?;
-        let coverage_path = state.db_path();
-        let model_for_coverage = model.clone();
-        let covered = tokio::task::spawn_blocking(move || {
-            let conn = open(&coverage_path).map_err(ApiError::from)?;
-            llm_wiki_compiler::embedding_coverage(&conn, &model_for_coverage)
-                .map_err(ApiError::from)
-        })
-        .await
-        .map_err(|e| ApiError::internal(format!("task join: {e}")))?;
-        if !covered? {
-            Vec::new()
-        } else {
-            let hybrid = llm_wiki_compiler::HybridContext {
-                provider: &embedding_provider,
-                model: model.clone(),
-            };
-            let query_vector = llm_wiki_compiler::embed_query_vector(&hybrid, &request.query)
-                .await
-                .map_err(ApiError::from)?;
-            let path = state.db_path();
-            tokio::task::spawn_blocking(move || {
-                let conn = open(&path).map_err(ApiError::from)?;
-                llm_wiki_compiler::top_cosine_candidates(&conn, &model, query_vector.as_deref())
-                    .map_err(ApiError::from)
-            })
-            .await
-            .map_err(|e| ApiError::internal(format!("task join: {e}")))??
-        }
+    let vector = if request.hybrid {
+        vector_candidates_for(&state, &request.query).await?
     } else {
         Vec::new()
     };
