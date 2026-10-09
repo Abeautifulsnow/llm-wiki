@@ -55,6 +55,7 @@ llm-wiki ask "认证流程是怎样的？"     # grounded answer with verified c
 llm-wiki lint                       # broken links, stale citations, hand edits, …
 llm-wiki status                     # sources, builds, active generation
 llm-wiki doctor                     # config / db / publish / FTS5 availability
+llm-wiki doctor --live              # …plus a real request per configured endpoint
 ```
 
 Output lives under `wiki/generations/{build_id}/*.md` with a `current.json`
@@ -65,8 +66,11 @@ state (config + SQLite `state.db`) lives under `.llm-wiki/`.
 
 The build fingerprint covers model + prompt + schema + parser + config
 versions. A drift stops the incremental build with `REPLAN_REQUIRED`
-(exit code 7) instead of rewriting pages behind your back. Review what
-changed, then opt in explicitly:
+(exit code 7) instead of rewriting pages behind your back — and so does a
+structural change to an existing page's outbound links (the §19 topology
+guard: a related-page graph that shifted cannot be extended incrementally
+without risking mixed generations). Review what changed, then opt in
+explicitly:
 
 ```bash
 llm-wiki replan --dry-run           # audit the plan diff + cost estimate, no writes
@@ -103,7 +107,7 @@ raise `[llm] max_output_tokens` (e.g. 32768) or analysis fails with
 | `lint [--semantic]` | Structural lint (citations, links, orphans, hand edits) — Error findings exit 11. `--semantic` adds the LLM-judged review (advisory only, costs model calls). |
 | `serve [--host <h>] [--port <p>]` | HTTP API (below). Local loopback-only unless `server.remote_enabled`. |
 | `status` | Source counts and the latest build. |
-| `doctor` | Config validation, source root, state db, publish integrity, FTS5 availability, API-key env. Reports, never repairs. |
+| `doctor [--live]` | Config validation, source root, state db, publish integrity, FTS5 availability, API-key env. Every FAIL prints the command that fixes it. `--live` additionally makes one real request per configured endpoint (chat, embedding, rerank) — the only way to tell a configured endpoint from a live one. Reports, never repairs. |
 
 ## Configuration
 

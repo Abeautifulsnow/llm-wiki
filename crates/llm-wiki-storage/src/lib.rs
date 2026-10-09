@@ -84,7 +84,7 @@ pub use state::{
     ACTIVE_BUILD_KEY, BUILD_STATUSES,
 };
 pub use wiki::{
-    generation_page_sources, generation_stats, load_generation_pages, load_generation_view,
-    persist_generation, GenerationPageView, GenerationStats, PageCitationRecord, PageLinkRecord,
-    WikiPageRecord,
+    generation_page_sources, generation_stats, load_generation_page_view, load_generation_pages,
+    load_generation_view, persist_generation, GenerationPageView, GenerationStats,
+    PageCitationRecord, PageLinkRecord, WikiPageRecord,
 };

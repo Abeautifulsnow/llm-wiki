@@ -61,6 +61,44 @@ impl CohereCompatibleReranker {
     }
 }
 
+/// What a live rerank round trip actually proved, for `llm-wiki doctor`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RerankProbeOutcome {
+    /// Highest relevance score of the two probe documents — reported so a
+    /// degenerate all-zero endpoint (a common misconfiguration: the rerank
+    /// path wired to a chat model) is visible in `doctor` output.
+    pub top_relevance: Option<f32>,
+    pub latency_ms: u128,
+}
+
+impl CohereCompatibleReranker {
+    /// One query against two trivial documents through the REAL `/rerank`
+    /// path, for `doctor`.
+    pub async fn probe(&self, model: &str) -> Result<RerankProbeOutcome, LlmError> {
+        let started = std::time::Instant::now();
+        let results = self
+            .rerank(
+                model,
+                "llm-wiki probe",
+                &["llm-wiki probe".to_owned(), "unrelated text".to_owned()],
+                2,
+            )
+            .await?;
+        if results.is_empty() {
+            return Err(LlmError::InvalidResponse(format!(
+                "the rerank endpoint returned no results for a 2-document probe; it is not serving '{model}'"
+            )));
+        }
+        Ok(RerankProbeOutcome {
+            top_relevance: results
+                .iter()
+                .map(|result| result.relevance_score)
+                .reduce(f32::max),
+            latency_ms: started.elapsed().as_millis(),
+        })
+    }
+}
+
 #[async_trait]
 impl RerankProvider for CohereCompatibleReranker {
     async fn rerank(
@@ -186,5 +224,67 @@ mod tests {
             CohereCompatibleReranker::new("http://127.0.0.1:1", "UNUSED_VAR", 10, 0).unwrap();
         let results = reranker.rerank("m", "q", &[], 0).await.unwrap();
         assert!(results.is_empty());
+    }
+
+    /// The doctor probe drives the real `/rerank` path with two documents and
+    /// reports the top score.
+    #[tokio::test]
+    async fn probe_reports_the_top_relevance_score() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = vec![0u8; 65536];
+            let n = stream.read(&mut buf).unwrap();
+            let raw = String::from_utf8_lossy(&buf[..n]).into_owned();
+            assert!(raw.contains("/rerank"), "{raw}");
+            let body = r#"{"results":[{"index":0,"relevance_score":0.7},{"index":1,"relevance_score":0.1}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let reranker =
+            CohereCompatibleReranker::new(&format!("http://127.0.0.1:{port}"), "UNUSED_VAR", 10, 0)
+                .unwrap();
+        let outcome = reranker.probe("rerank-model").await.unwrap();
+        assert_eq!(outcome.top_relevance, Some(0.7));
+        server.join().unwrap();
+    }
+
+    /// An endpoint that answers `/rerank` with an empty `results[]` is not
+    /// serving the model; the probe must fail rather than report green.
+    #[tokio::test]
+    async fn probe_fails_on_an_empty_result_set() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = vec![0u8; 65536];
+            let _ = stream.read(&mut buf).unwrap();
+            let body = r#"{"results":[]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let reranker =
+            CohereCompatibleReranker::new(&format!("http://127.0.0.1:{port}"), "UNUSED_VAR", 10, 0)
+                .unwrap();
+        let err = reranker.probe("rerank-model").await.unwrap_err();
+        assert!(err.to_string().contains("no results"), "{err}");
+        server.join().unwrap();
     }
 }

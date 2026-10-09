@@ -281,24 +281,51 @@ pub fn clear_journal(paths: &PublishPaths) -> Result<()> {
 /// alphanumeric + dashes, but pages compiled from other sources must never be
 /// able to escape the generation directory. Public so lint (§36) maps page
 /// rows back onto their generation files with the exact same rule.
+///
+/// A slug that needs no sanitizing is used verbatim. A slug that DOES need it
+/// ("..", separators, non-ASCII) keeps a readable sanitized prefix with a
+/// short hash of the FULL slug appended: sanitizing alone is not injective —
+/// `alpha-服务职责` and `服务职责-alpha` both collapse to `alpha` — and two
+/// distinct pages sharing a file name is a hard build failure (V1.0 field
+/// test: a two-document CJK corpus with cross-links died at exit 8 with no
+/// wiki published at all). The suffix is a pure function of the slug, so the
+/// reuse path and lint resolve the same name without cross-page state.
+///
+/// Length is bounded: non-ASCII slugs collapse into long dash runs, and an
+/// unbounded name from a long CJK title can exceed the Windows path limit.
 pub fn page_file_name(slug: &str, page_id: &str) -> String {
-    let safe: String = slug
+    if slug
         .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    let trimmed = safe.trim_matches('-');
-    if trimmed.is_empty() {
-        format!("{page_id}.md")
-    } else {
-        format!("{trimmed}.md")
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+        && !slug.is_empty()
+    {
+        // Already safe: use verbatim so pre-existing generations keep their
+        // file names (the publish reuse path looks pages up by this name).
+        return format!("{slug}.md");
     }
+    let mut safe = String::with_capacity(slug.len());
+    let mut last_dash = false;
+    for ch in slug.chars() {
+        let keep = ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_');
+        if keep {
+            safe.push(ch);
+            last_dash = ch == '-';
+        } else if !last_dash {
+            safe.push('-');
+            last_dash = true;
+        }
+    }
+    let trimmed = safe.trim_matches('-');
+    let prefix: String = trimmed.chars().take(MAX_SLUG_PREFIX).collect();
+    let trimmed = prefix.trim_matches('-');
+    if trimmed.is_empty() {
+        return format!("{page_id}.md");
+    }
+    format!("{trimmed}-{}.md", &sha256_hex(slug.as_bytes())[..8])
 }
+
+/// Cap on the readable part of a sanitized page file name, in characters.
+const MAX_SLUG_PREFIX: usize = 48;
 
 /// Computes the reuse set for one publish: pages whose (page_id, body_hash)
 /// pair exists in the previous generation AND whose previous-generation file
@@ -627,15 +654,31 @@ pub fn recover_if_needed(
         // Crash between steps 5 and 6: pointer moved, database not committed.
         // Complete the verified new version — INCLUDING the search index
         // rebuild, joined to the same commit-point transaction — when it
-        // still validates.
+        // still validates. Completing it can itself fail (a derived-index or
+        // graph rebuild error aborts the activate transaction): the journal
+        // records the explicit old version precisely so recovery can still
+        // reach a consistent state, so a failed completion falls back to
+        // rolling back instead of dead-ending. Without this, the workspace
+        // stays wedged — `doctor` says "run build to recover" and every build
+        // replays the same failure.
         if validate_generation_from_db(conn, &paths, &new_id).is_ok() {
-            activate_build_with_search_index(conn, &new_id, default_tokenizer())?;
-            clear_journal(&paths)?;
-            RecoveryReport {
-                action: RecoveryAction::CompletedNew,
-                detail: format!(
-                    "publish of {new_id} was interrupted after the pointer move; the generation re-validated and the database side was completed"
-                ),
+            match activate_build_with_search_index(conn, &new_id, default_tokenizer()) {
+                Ok(_) => {
+                    clear_journal(&paths)?;
+                    RecoveryReport {
+                        action: RecoveryAction::CompletedNew,
+                        detail: format!(
+                            "publish of {new_id} was interrupted after the pointer move; the generation re-validated and the database side was completed"
+                        ),
+                    }
+                }
+                Err(err) => rollback(
+                    conn,
+                    &paths,
+                    old_id.as_ref(),
+                    &new_id,
+                    &format!("completing the new generation failed ({err})"),
+                )?,
             }
         } else {
             rollback(
@@ -952,11 +995,50 @@ mod tests {
             page_file_name("plugin-runtime", "wp_1"),
             "plugin-runtime.md"
         );
-        // Path separators and dots collapse to dashes and are trimmed, so the
-        // name can never escape the generation directory (".." is impossible).
-        assert_eq!(page_file_name("../evil/slug", "wp_2"), "evil-slug.md");
+        // Path separators and dots collapse to dashes, so the name can never
+        // escape the generation directory (".." is impossible); the digest
+        // suffix keeps lossy slugs distinct from each other.
+        let traversal = page_file_name("../evil/slug", "wp_2");
+        assert!(traversal.starts_with("evil-slug-"), "{traversal}");
+        assert!(
+            !traversal.contains("..") && !traversal.contains('/'),
+            "{traversal}"
+        );
+        assert!(traversal.ends_with(".md"), "{traversal}");
         assert_eq!(page_file_name("", "wp_3"), "wp_3.md");
         assert_eq!(page_file_name("标题", "wp_4"), "wp_4.md");
+    }
+
+    /// Regression (V1.0 field test): sanitizing is not injective. Two distinct
+    /// slugs on a mixed CJK/Latin corpus both reduced to `alpha`, and
+    /// `write_generation` refused the whole generation — the build died at
+    /// exit 8 with nothing published, on a plain two-document corpus.
+    #[test]
+    fn distinct_slugs_that_sanitize_to_the_same_residue_get_distinct_files() {
+        let first = page_file_name("alpha-服务职责与依赖", "wp_1");
+        let second = page_file_name("服务超时与重试策略-alpha", "wp_2");
+        assert_ne!(first, second, "distinct slugs must not share a file name");
+        assert!(first.starts_with("alpha-"), "{first}");
+        assert!(second.starts_with("alpha-"), "{second}");
+
+        // ...and the generation actually writes both pages.
+        let dir = temp_wiki_dir("slug-residue");
+        let mut conn = open_in_memory().unwrap();
+        let build = seeded_build(&mut conn);
+        let mut a = page("alpha-服务职责与依赖", "# A");
+        a.page_id = llm_wiki_core::ids::WikiPageId::from_validated("wp_1".to_owned());
+        let mut b = page("服务超时与重试策略-alpha", "# B");
+        b.page_id = llm_wiki_core::ids::WikiPageId::from_validated("wp_2".to_owned());
+        let pages = vec![a, b];
+        let paths = PublishPaths::new(&dir);
+        let write = write_generation(&paths, &build, &pages, &BTreeMap::new());
+        assert!(write.is_ok(), "{write:?}");
+        let entries: Vec<String> = std::fs::read_dir(paths.generation_dir(&build))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries.len(), 2, "{entries:?}");
     }
 
     #[test]
@@ -1074,14 +1156,13 @@ mod tests {
         let dir = temp_wiki_dir("collision");
         let paths = PublishPaths::new(&dir);
         let build = BuildId::generate();
-        // "a b" and "a-b" sanitize onto the same file name.
-        let pages = vec![page("a b", "# A"), page("a-b", "# B")];
+        // Sanitizing is now injective for DISTINCT slugs (the digest suffix
+        // separates them), but a plan that produces the SAME slug twice still
+        // cannot be written losslessly — that is a plan bug, not a naming one.
+        let pages = vec![page("a-b", "# A"), page("a-b", "# B")];
         let err = write_generation(&paths, &build, &pages, &BTreeMap::new()).unwrap_err();
         let message = err.to_string();
-        assert!(
-            message.contains("\"a b\"") && message.contains("\"a-b\""),
-            "{message}"
-        );
+        assert!(message.contains("\"a-b\""), "{message}");
         assert!(
             !paths.generation_dir(&build).exists(),
             "nothing is written when a collision is detected"
@@ -1104,5 +1185,106 @@ mod tests {
             read_current_pointer(&paths).unwrap().is_none(),
             "nothing was published over the unresolved intent"
         );
+    }
+
+    /// Regression (V1.0 field test): the wedge where the pointer had moved to
+    /// the new generation but completing it FAILED (the graph rebuild aborted
+    /// the activate transaction). Recovery used to propagate that error while
+    /// leaving the journal in place, so `doctor` kept saying "run build to
+    /// recover" and every build replayed the same failure — the workspace was
+    /// stuck until someone hand-edited `current.json`. Recovery must fall back
+    /// to the explicit rollback target the journal records.
+    #[test]
+    fn failed_completion_rolls_back_to_the_journal_target() {
+        let dir = temp_wiki_dir("failed-completion");
+        let mut conn = open_in_memory().unwrap();
+        let paths = PublishPaths::new(&dir);
+
+        // Generation A publishes normally and becomes the rollback target.
+        let build_a = seeded_build(&mut conn);
+        let carried = page("runtime", "# Runtime");
+        let carried_id = carried.page_id.clone();
+        // `publish` owns everything from READY onward; the generation rows are
+        // the caller's job (see the function doc). Without this the activate
+        // transaction would build an empty graph and the planted collision
+        // below would fail its foreign key instead of the constraint under test.
+        llm_wiki_storage::persist_generation(&mut conn, &build_a, std::slice::from_ref(&carried))
+            .unwrap();
+        publish(&mut conn, &dir, &build_a, std::slice::from_ref(&carried), 3).unwrap();
+
+        // Generation B carries that page verbatim and adds one that links to
+        // it. The carried page is untouched, so the graph update deletes no
+        // edges around it — which is what lets the planted collision below
+        // survive into the insert.
+        let build_b = seeded_build(&mut conn);
+        let mut added = page("delivery", "# Delivery");
+        added.links = vec![llm_wiki_storage::PageLinkRecord {
+            to_page_id: carried_id.clone(),
+            target_title: "Runtime".into(),
+        }];
+        let pages_b = vec![carried, added];
+        llm_wiki_storage::persist_generation(&mut conn, &build_b, &pages_b).unwrap();
+        write_generation(&paths, &build_b, &pages_b, &BTreeMap::new()).unwrap();
+
+        // The page files validate (recovery's first check passes), but the
+        // derived-index rebuild cannot complete: a stale `graph_edges` row
+        // already occupies the edge id the new link needs. This is the shape
+        // of the real failure — the activate transaction aborts on a graph
+        // constraint AFTER the pointer moved.
+        let link_id: String = conn
+            .query_row(
+                "SELECT link_id FROM page_links WHERE build_id = ?1",
+                rusqlite::params![build_b.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO graph_edges (id, source_id, relation_type, target_id)
+             VALUES (?1, ?2, 'links_to', ?2)",
+            rusqlite::params![format!("link:{link_id}"), format!("page:{carried_id}")],
+        )
+        .unwrap();
+
+        // The crash window: intent recorded, pointer moved, DB not committed.
+        write_journal(&paths, Some(&build_a), &build_b).unwrap();
+        write_current_pointer(&paths, &build_b).unwrap();
+        assert_eq!(
+            llm_wiki_storage::get_active_build_id(&conn).unwrap(),
+            Some(build_a.clone())
+        );
+
+        let report = recover_if_needed(&mut conn, &dir)
+            .expect("recovery must reach a consistent state, not dead-end")
+            .expect("a journal means recovery ran");
+        assert_eq!(report.action, RecoveryAction::RolledBack);
+        assert!(!journal_exists(&paths), "the journal is resolved");
+        assert_eq!(
+            read_current_pointer(&paths).unwrap().map(|p| p.build_id),
+            Some(build_a.as_str().to_owned()),
+            "the pointer is back on the last consistent generation"
+        );
+        assert_eq!(
+            llm_wiki_storage::get_active_build_id(&conn).unwrap(),
+            Some(build_a.clone())
+        );
+        // The interrupted generation did not publish, so it is terminal.
+        assert_eq!(build_status_of(&conn, &build_b), "INTERRUPTED");
+        // ...and the wedged state is gone: the same recovery is now a no-op
+        // and a subsequent build proceeds instead of replaying the failure.
+        assert!(recover_if_needed(&mut conn, &dir).unwrap().is_none());
+    }
+
+    fn build_status_of(conn: &rusqlite::Connection, build: &BuildId) -> String {
+        llm_wiki_storage::latest_build(conn)
+            .unwrap()
+            .map(|record| record.status)
+            .unwrap_or_else(|| {
+                conn.query_row(
+                    "SELECT status FROM builds WHERE build_id = ?1",
+                    rusqlite::params![build.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap()
+            })
     }
 }

@@ -389,6 +389,7 @@ mod tests {
             slug: format!("page-{id}"),
             title: format!("Page {id}"),
             category: "concepts".into(),
+            language: "en".into(),
             body_hash: "hash".into(),
             content: format!("# Page {id}"),
             knowledge_refs: refs,

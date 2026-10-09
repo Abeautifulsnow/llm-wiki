@@ -1539,6 +1539,7 @@ mod tests {
             slug: slug.to_owned(),
             title: title.to_owned(),
             category: "concepts".into(),
+            language: "en".into(),
             body_hash: "hash".into(),
             content: format!("# {title}"),
             knowledge_refs: refs(tags),

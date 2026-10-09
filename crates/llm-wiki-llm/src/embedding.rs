@@ -41,6 +41,30 @@ impl OpenAiCompatibleEmbeddings {
     }
 }
 
+/// What a live embedding round trip actually proved, for `llm-wiki doctor`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingProbeOutcome {
+    /// Vector width the model returned — surfaced because the Vector layer
+    /// stores width-agnostic blobs, so a mixed-model corpus only shows up as
+    /// a dimension mismatch much later.
+    pub dimensions: usize,
+    pub latency_ms: u128,
+}
+
+impl OpenAiCompatibleEmbeddings {
+    /// One short text through the REAL embeddings path, for `doctor`.
+    pub async fn probe(&self, model: &str) -> Result<EmbeddingProbeOutcome, LlmError> {
+        let started = std::time::Instant::now();
+        let vectors =
+            post_embeddings(&self.transport, model, &["llm-wiki probe".to_owned()]).await?;
+        let dimensions = vectors.first().map(Vec::len).unwrap_or(0);
+        Ok(EmbeddingProbeOutcome {
+            dimensions,
+            latency_ms: started.elapsed().as_millis(),
+        })
+    }
+}
+
 #[async_trait]
 impl EmbeddingProvider for OpenAiCompatibleEmbeddings {
     async fn embed(&self, model: &str, texts: &[String]) -> Result<Vec<Vec<f32>>, LlmError> {
@@ -162,6 +186,44 @@ mod tests {
         assert_eq!(vectors.len(), 2);
         assert_eq!(vectors[0], vec![0.1, 0.2], "input order, not data order");
         assert_eq!(vectors[1], vec![0.4, 0.5]);
+        server.join().unwrap();
+    }
+
+    /// The doctor probe sends one short text and reports the vector width —
+    /// the only cheap way to catch a model swap that silently changes
+    /// dimensions underneath a corpus already embedded with the old model.
+    #[tokio::test]
+    async fn probe_reports_the_returned_dimensions() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = vec![0u8; 65536];
+            let n = stream.read(&mut buf).unwrap();
+            let raw = String::from_utf8_lossy(&buf[..n]).into_owned();
+            assert!(raw.contains("/embeddings"), "{raw}");
+            assert!(raw.contains("\"input\":[\"llm-wiki probe\"]"), "{raw}");
+            let body = r#"{"data":[{"index":0,"embedding":[0.1,0.2,0.3]}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let provider = OpenAiCompatibleEmbeddings::new(
+            &format!("http://127.0.0.1:{port}"),
+            "UNUSED_VAR",
+            10,
+            0,
+        )
+        .unwrap();
+        let outcome = provider.probe("emb-model").await.unwrap();
+        assert_eq!(outcome.dimensions, 3);
         server.join().unwrap();
     }
 }

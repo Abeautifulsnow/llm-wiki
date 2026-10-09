@@ -9,7 +9,9 @@ use clap::{Parser, Subcommand};
 
 use llm_wiki_core::config::{lexical_absolute, Config, LlmConfig};
 use llm_wiki_core::error::WikiError;
-use llm_wiki_llm::{OpenAiCompatibleEmbeddings, OpenAiCompatibleProvider};
+use llm_wiki_llm::{
+    CohereCompatibleReranker, OpenAiCompatibleEmbeddings, OpenAiCompatibleProvider,
+};
 use llm_wiki_search::FullTextSearch;
 use llm_wiki_source::{ScanDiagnostic, Scanner, SourceManifest};
 
@@ -57,7 +59,15 @@ enum Command {
         query: String,
     },
     /// Check configuration, filesystem layout, state db and provider env.
-    Doctor,
+    ///
+    /// Offline by default. `--live` additionally makes one real request per
+    /// configured endpoint (chat, and embedding/rerank when configured) — the
+    /// only way to tell a working endpoint from a configured-but-dead one.
+    Doctor {
+        /// Probe the LLM / embedding / rerank endpoints with real requests.
+        #[arg(long)]
+        live: bool,
+    },
     /// Ask the published wiki a question: retrieval-grounded synthesis with
     /// verified citations (audit FIX-020). Every cited claim must exist in
     /// the retrieved context; citations expand from stored anchors.
@@ -141,7 +151,7 @@ fn run(command: Command) -> Result<(), WikiError> {
         Command::Replan { dry_run } => replan(&workspace, dry_run),
         Command::Status => status(&workspace),
         Command::Search { query } => search(&workspace, &query),
-        Command::Doctor => doctor(&workspace),
+        Command::Doctor { live } => doctor(&workspace, live),
         Command::Ask {
             query,
             write_back,
@@ -873,14 +883,34 @@ fn status(workspace: &Path) -> Result<(), WikiError> {
     Ok(())
 }
 
-fn report(label: &str, result: Result<String, WikiError>) -> bool {
+/// A failed doctor check: what is wrong, and the command that fixes it. Every
+/// FAIL must carry a remedy that actually works — a bare "FAIL" left the V1.0
+/// field test guessing (and in the publish-wedge case there WAS no command,
+/// which is a defect in the recovery state machine, not a missing hint).
+#[derive(Debug)]
+struct Gap {
+    detail: String,
+    remedy: String,
+}
+
+impl Gap {
+    fn new(detail: impl Into<String>, remedy: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+            remedy: remedy.into(),
+        }
+    }
+}
+
+fn report_gap(label: &str, result: Result<String, Gap>) -> bool {
     match result {
         Ok(msg) => {
             println!("ok   {label} {msg}");
             true
         }
-        Err(msg) => {
-            println!("FAIL {label} {msg}");
+        Err(gap) => {
+            println!("FAIL {label} {}", gap.detail);
+            println!("     fix: {}", gap.remedy);
             false
         }
     }
@@ -888,44 +918,243 @@ fn report(label: &str, result: Result<String, WikiError>) -> bool {
 
 /// Publish-integrity check for `doctor` (PRD §29/§35): un-recovered publish
 /// journal and `current.json` vs DB `active_build_id` consistency. Reports
-/// the finding; never repairs anything.
+/// the finding with a remedy; never repairs anything itself.
 fn check_publish_state(
     conn: &llm_wiki_storage::Connection,
     wiki_dir: &Path,
-) -> Result<String, WikiError> {
+) -> Result<String, Gap> {
     let paths = llm_wiki_compiler::PublishPaths::new(wiki_dir);
+    let journal = paths.journal_path();
     if llm_wiki_compiler::journal_exists(&paths) {
-        return Err(WikiError::PublishRecovery(format!(
-            "un-recovered publish journal at {} — run `llm-wiki build` to let recovery resolve it",
-            paths.journal_path().display()
-        )));
+        return Err(Gap::new(
+            format!(
+                "an un-recovered publish journal is present at {} — the last publish was interrupted",
+                journal.display()
+            ),
+            "run `llm-wiki build`: publish recovery resolves the journal before the build starts, \
+             completing the new generation or rolling back to the previous one (never leaves the \
+             workspace wedged)",
+        ));
     }
-    let pointer = llm_wiki_compiler::read_current_pointer(&paths)?;
-    let db_active = llm_wiki_storage::get_active_build_id(conn)?;
+    let pointer = llm_wiki_compiler::read_current_pointer(&paths).map_err(|err| {
+        Gap::new(
+            err.to_string(),
+            format!(
+                "{} is unreadable or malformed; restore it from a backup (it is a one-line \
+                 build-id pointer into wiki/generations/), or delete the wiki/ directory \
+                 and run `llm-wiki build` to publish a fresh generation",
+                paths.pointer_path().display()
+            ),
+        )
+    })?;
+    let db_active = llm_wiki_storage::get_active_build_id(conn).map_err(|err| {
+        Gap::new(
+            err.to_string(),
+            "re-run `llm-wiki scan` to re-open the state db",
+        )
+    })?;
     match (pointer, db_active) {
-        (None, None) => Ok("no wiki published yet".to_owned()),
+        (None, None) => Ok("no wiki published yet (run `llm-wiki build`)".to_owned()),
         (Some(pointer), Some(active)) if pointer.build_id == active.as_str() => {
             Ok(format!("consistent (current generation {})", active))
         }
-        (Some(pointer), Some(active)) => Err(WikiError::PublishRecovery(format!(
-            "current.json points at {} but the database active_build_id is {}; refusing to guess",
-            pointer.build_id, active
-        ))),
-        (Some(pointer), None) => Err(WikiError::PublishRecovery(format!(
-            "current.json points at {} but the database has no active_build_id; refusing to guess",
-            pointer.build_id
-        ))),
-        (None, Some(active)) => Err(WikiError::PublishRecovery(format!(
-            "the database active_build_id is {} but {} is missing; refusing to guess",
-            active,
-            paths.pointer_path().display()
-        ))),
+        (Some(pointer), Some(active)) => Err(Gap::new(
+            format!(
+                "{} points at {} but the database active_build_id is {} (no publish journal), so \
+                 search/pages/ask would serve a different generation than the files on disk",
+                paths.pointer_path().display(),
+                pointer.build_id,
+                active
+            ),
+            format!(
+                "the two must be reconciled by hand — publish recovery refuses to guess which one \
+                 is right: either edit {} back to \"{}\", or rebuild the wiki (delete wiki/ and \
+                 .llm-wiki/state.db, then `llm-wiki build`)",
+                paths.pointer_path().display(),
+                active
+            ),
+        )),
+        (Some(pointer), None) => Err(Gap::new(
+            format!(
+                "{} points at {} but the database has no active generation",
+                paths.pointer_path().display(),
+                pointer.build_id
+            ),
+            "the database lost its active pointer while the wiki is still published: rebuild with \
+             `llm-wiki build` (the pipeline re-activates the published generation when it still \
+             validates)",
+        )),
+        (None, Some(active)) => Err(Gap::new(
+            format!(
+                "the database active_build_id is {} but {} is missing",
+                active,
+                paths.pointer_path().display()
+            ),
+            "re-publish with `llm-wiki build`; without the pointer the published files cannot be \
+             identified, so search/pages/ask have no generation to serve",
+        )),
     }
 }
 
-/// Length note: ~91 lines — a flat check list (config/root/db/fts/journal), each check one report() call.
-fn doctor(workspace: &Path) -> Result<(), WikiError> {
+/// Doctor endpoint probes must not inherit the build's per-request budget: a
+/// build may legitimately wait 120s for one completion, but a connectivity
+/// check that hangs that long on a dead host is indistinguishable from a hung
+/// `doctor`.
+const PROBE_TIMEOUT_SECONDS: u64 = 15;
+
+/// One live chat round trip (注意点: `/v1/models` alone is not evidence — a
+/// gateway can list a model it cannot serve, and serve one it does not list).
+fn probe_chat_endpoint(config: &Config) -> Result<String, Gap> {
+    let provider = OpenAiCompatibleProvider::new(
+        &config.llm.base_url,
+        &config.llm.model,
+        &config.llm.api_key_env,
+        config.llm.timeout_seconds.min(PROBE_TIMEOUT_SECONDS),
+        0,
+    )
+    .map_err(|err| {
+        Gap::new(
+            err.to_string(),
+            "check llm.base_url in .llm-wiki/config.toml",
+        )
+    })?;
+    let runtime = tokio_runtime()?;
+    let outcome = runtime.block_on(provider.probe()).map_err(|err| {
+        Gap::new(
+            format!(
+                "{} did not answer a chat request for model '{}': {err}",
+                config.llm.base_url, config.llm.model
+            ),
+            format!(
+                "check llm.base_url (must end at the API root, e.g. http://host/v1), \
+                 llm.model, and export {} with the endpoint's key",
+                config.llm.api_key_env
+            ),
+        )
+    })?;
+    let catalog = match outcome.model_listed {
+        Some(true) => "listed by /models".to_owned(),
+        Some(false) => {
+            "NOT in /models (the endpoint still served it — the catalog is advisory)".to_owned()
+        }
+        None => "/models unavailable (not checked)".to_owned(),
+    };
+    let served = match outcome.served_model {
+        Some(served) if served != config.llm.model => {
+            format!("served as '{served}' (different revision than requested)")
+        }
+        _ => "served the requested model".to_owned(),
+    };
+    Ok(format!("{}ms, {served}, {catalog}", outcome.latency_ms))
+}
+
+/// Live embedding probe. Runs whenever an embedding model resolves — the
+/// Vector layer is opt-in per command, so a configured-but-broken endpoint
+/// would otherwise stay invisible until the first `--hybrid` query.
+fn probe_embedding_endpoint(config: &Config) -> Result<String, Gap> {
+    let model =
+        match embedding_model(None, config) {
+            Ok(model) => model,
+            Err(_) => return Ok(
+                "not configured (set [embedding] model or $LLM_WIKI_EMBEDDING_MODEL to enable the \
+                 Vector layer)"
+                    .to_owned(),
+            ),
+        };
+    let endpoint = config.embedding.endpoint(&config.llm);
+    let provider = OpenAiCompatibleEmbeddings::new(
+        &endpoint.base_url,
+        &endpoint.api_key_env,
+        endpoint.timeout_seconds.min(PROBE_TIMEOUT_SECONDS),
+        0,
+    )
+    .map_err(|err| {
+        Gap::new(
+            err.to_string(),
+            "check [embedding] base_url in .llm-wiki/config.toml",
+        )
+    })?;
+    let runtime = tokio_runtime()?;
+    let outcome = runtime.block_on(provider.probe(&model)).map_err(|err| {
+        Gap::new(
+            format!(
+                "{} did not answer an embeddings request for model '{model}': {err}",
+                endpoint.base_url
+            ),
+            format!(
+                "check [embedding] base_url / model and export {}; run `llm-wiki embed` to verify",
+                endpoint.api_key_env
+            ),
+        )
+    })?;
+    Ok(format!(
+        "{}ms, model '{model}', {} dimensions",
+        outcome.latency_ms, outcome.dimensions
+    ))
+}
+
+/// Live rerank probe: only when the strategy is enabled — a rerank endpoint
+/// that is configured but unreachable silently degrades search to the fused
+/// order, which is exactly the kind of quiet failure `doctor` exists to name.
+fn probe_rerank_endpoint(config: &Config) -> Result<String, Gap> {
+    if config.search.rerank != "cohere-compatible" {
+        return Ok(format!(
+            "not configured (search.rerank = \"{}\")",
+            config.search.rerank
+        ));
+    }
+    let endpoint = config.rerank.endpoint(&config.llm);
+    let reranker = CohereCompatibleReranker::new(
+        &endpoint.base_url,
+        &endpoint.api_key_env,
+        endpoint.timeout_seconds.min(PROBE_TIMEOUT_SECONDS),
+        0,
+    )
+    .map_err(|err| {
+        Gap::new(
+            err.to_string(),
+            "check [rerank] base_url in .llm-wiki/config.toml",
+        )
+    })?;
+    let runtime = tokio_runtime()?;
+    let outcome = runtime
+        .block_on(reranker.probe(&config.rerank.model))
+        .map_err(|err| {
+            Gap::new(
+                format!(
+                    "{} did not answer a /rerank request for model '{}': {err}",
+                    endpoint.base_url, config.rerank.model
+                ),
+                format!(
+                    "check [rerank] base_url / model and export {}; the endpoint must speak the \
+                     Cohere /rerank wire format (vLLM, Jina, SiliconFlow, Voyage)",
+                    endpoint.api_key_env
+                ),
+            )
+        })?;
+    Ok(format!(
+        "{}ms, model '{}', top score {:?}",
+        outcome.latency_ms, config.rerank.model, outcome.top_relevance
+    ))
+}
+
+fn tokio_runtime() -> Result<tokio::runtime::Runtime, Gap> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| {
+            Gap::new(
+                format!("cannot start async runtime: {err}"),
+                "this is an environment problem, not a config one",
+            )
+        })
+}
+
+/// Length note: ~150 lines — a flat list of checks, one report per line, each
+/// FAIL carrying its own remedy; the helpers above keep every branch shallow.
+fn doctor(workspace: &Path, live: bool) -> Result<(), WikiError> {
     let config = load_config(workspace)?;
+    let config_path = state_dir(workspace).join("config.toml");
     let mut failures = 0usize;
 
     let valid = config.validate().map(|_| {
@@ -935,7 +1164,17 @@ fn doctor(workspace: &Path) -> Result<(), WikiError> {
             config.project.wiki_dir.display()
         )
     });
-    if !report("config", valid) {
+    let valid = valid.map_err(|err| {
+        Gap::new(
+            err.to_string(),
+            format!(
+                "fix the reported key in {} (delete it and re-run `llm-wiki init` for a documented \
+                 reference file)",
+                config_path.display()
+            ),
+        )
+    });
+    if !report_gap("config", valid) {
         failures += 1;
     }
 
@@ -943,19 +1182,33 @@ fn doctor(workspace: &Path) -> Result<(), WikiError> {
     let root_exists = if root.is_dir() {
         Ok(format!("exists ({})", root.display()))
     } else {
-        Err(WikiError::Config(format!("missing ({})", root.display())))
+        Err(Gap::new(
+            format!("missing ({})", root.display()),
+            format!(
+                "create that directory and drop your docs in, or point source.root (in {}) at the \
+                 right tree",
+                config_path.display()
+            ),
+        ))
     };
-    if !report("source root", root_exists) {
+    if !report_gap("source root", root_exists) {
         failures += 1;
     }
 
+    let db_path = state_db(workspace);
     let db = std::fs::create_dir_all(state_dir(workspace))
-        .map_err(|e| WikiError::Source(e.to_string()))
-        .and_then(|_| llm_wiki_storage::open(&state_db(workspace)));
+        .map_err(|e| e.to_string())
+        .and_then(|_| llm_wiki_storage::open(&db_path).map_err(|e| e.to_string()));
     let conn = match db {
         Ok(conn) => {
             let count = llm_wiki_storage::count_sources(&conn);
-            if !report(
+            let count = count.map_err(|err| {
+                Gap::new(
+                    err.to_string(),
+                    "the state db exists but is not readable as a wiki state db",
+                )
+            });
+            if !report_gap(
                 "state db",
                 count.map(|count| format!("open + migrated ({count} sources)")),
             ) {
@@ -964,18 +1217,27 @@ fn doctor(workspace: &Path) -> Result<(), WikiError> {
             Some(conn)
         }
         Err(err) => {
-            report("state db", Err(err));
+            report_gap(
+                "state db",
+                Err(Gap::new(
+                    format!("cannot open {}: {err}", db_path.display()),
+                    format!(
+                        "move {} aside and run `llm-wiki scan` to rebuild it (build state, cache \
+                         and index are all derived — nothing in it is hand-authored)",
+                        db_path.display()
+                    ),
+                )),
+            );
             failures += 1;
             None
         }
     };
 
-    // Publish integrity (PRD §35): report, never auto-fix. Failures here must
-    // be resolved by running a build (journal recovery) or manually.
+    // Publish integrity (PRD §35): report, never auto-fix.
     if let Some(conn) = conn {
         let wiki_abs = lexical_absolute(workspace, &config.project.wiki_dir);
         let publish_state = check_publish_state(&conn, &wiki_abs);
-        if !report("publish state", publish_state) {
+        if !report_gap("publish state", publish_state) {
             failures += 1;
         }
 
@@ -986,26 +1248,63 @@ fn doctor(workspace: &Path) -> Result<(), WikiError> {
         let fts_state = if llm_wiki_storage::probe_fts5(&conn) {
             Ok("fts5 available".to_owned())
         } else if config.search.full_text {
-            Err(WikiError::Index(
+            Err(Gap::new(
                 llm_wiki_storage::FTS5_UNAVAILABLE.to_owned(),
+                "this binary was linked against a SQLite without FTS5: rebuild with the default \
+                 `bundled` feature, or set search.full_text = false to accept lexical-less search",
             ))
         } else {
             Ok("fts5 unavailable (full-text search is disabled in config)".to_owned())
         };
-        if !report("fts", fts_state) {
+        if !report_gap("fts", fts_state) {
             failures += 1;
         }
     }
 
     let api_key = match std::env::var(&config.llm.api_key_env) {
         Ok(_) => Ok(format!("env {} is set", config.llm.api_key_env)),
-        Err(_) => Err(WikiError::Config(format!(
-            "env {} is not set (needed for build; scan/doctor do not call the model)",
-            config.llm.api_key_env
-        ))),
+        Err(_) => Err(Gap::new(
+            format!("env {} is not set", config.llm.api_key_env),
+            format!(
+                "export {}=<key> before `llm-wiki build` (scan/doctor never call the model; a local \
+                 endpoint that needs no key can ignore this)",
+                config.llm.api_key_env
+            ),
+        )),
     };
-    if !report("llm api key", api_key) {
+    if !report_gap("llm api key", api_key) {
         failures += 1;
+    }
+
+    // Endpoint connectivity: the checks above prove the config is COMPLETE,
+    // not that the endpoints are ALIVE. Opt-in because each probe is a real
+    // (billed) request.
+    if live {
+        if config.llm.model.trim().is_empty() {
+            report_gap(
+                "llm endpoint",
+                Err(Gap::new(
+                    "llm.model is empty, nothing to probe".to_owned(),
+                    format!("set llm.model in {}", config_path.display()),
+                )),
+            );
+            failures += 1;
+        } else {
+            let chat = probe_chat_endpoint(&config);
+            if !report_gap("llm endpoint", chat) {
+                failures += 1;
+            }
+        }
+        let embedding = probe_embedding_endpoint(&config);
+        if !report_gap("embedding endpoint", embedding) {
+            failures += 1;
+        }
+        let rerank = probe_rerank_endpoint(&config);
+        if !report_gap("rerank endpoint", rerank) {
+            failures += 1;
+        }
+    } else {
+        println!("skip endpoint connectivity (pass --live to probe llm/embedding/rerank for real)");
     }
 
     if failures == 0 {
@@ -1013,5 +1312,160 @@ fn doctor(workspace: &Path) -> Result<(), WikiError> {
         Ok(())
     } else {
         Err(WikiError::Config(format!("{failures} check(s) failed")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use llm_wiki_compiler::{write_current_pointer, write_journal, PublishPaths};
+    use llm_wiki_core::ids::BuildId;
+
+    /// V1.0 field test: `doctor` reported FAIL with no command that fixed it.
+    /// A wedge caused by the publish journal must name the re-entrant command
+    /// (`build` — recovery resolves the journal before the build starts), and
+    /// the pointer/DB mismatch must name the two hand-reconcilable options
+    /// (recovery deliberately refuses to guess).
+    #[test]
+    fn publish_state_failures_name_a_remedy_that_can_actually_run() {
+        let conn = llm_wiki_storage::open_in_memory().unwrap();
+        let build = BuildId::generate();
+
+        // Consistent state: nothing published, nothing to remedy.
+        let empty = doctor_temp_dir("doctor-clean");
+        assert!(check_publish_state(&conn, &empty).is_ok());
+
+        // A leftover journal is the wedge that used to dead-end. The remedy
+        // must be a command, not a description of the problem.
+        let wedged = doctor_temp_dir("doctor-journal");
+        let paths = PublishPaths::new(&wedged);
+        write_journal(&paths, None, &build).unwrap();
+        let gap = check_publish_state(&conn, &wedged).unwrap_err();
+        assert!(gap.detail.contains("journal"), "{}", gap.detail);
+        assert!(
+            gap.remedy.contains("llm-wiki build"),
+            "the remedy must be the command that resolves it: {}",
+            gap.remedy
+        );
+
+        // Pointer without a database generation: the pointer cannot be
+        // trusted alone, so the remedy is a re-publish.
+        let pointer_only = doctor_temp_dir("doctor-pointer");
+        let paths = PublishPaths::new(&pointer_only);
+        write_current_pointer(&paths, &build).unwrap();
+        let gap = check_publish_state(&conn, &pointer_only).unwrap_err();
+        assert!(gap.detail.contains(&build.to_string()), "{}", gap.detail);
+        assert!(gap.remedy.contains("llm-wiki build"), "{}", gap.remedy);
+    }
+
+    /// The live chat probe is the point of 注意点 3: an endpoint that lists a
+    /// model but cannot serve it, or serves a different revision, must be
+    /// distinguishable in `doctor` output — and a working endpoint must pass.
+    #[test]
+    fn live_chat_probe_passes_on_a_real_endpoint_and_names_a_revision_swap() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            // probe: GET /models then POST /chat/completions.
+            for path in ["/models", "/chat/completions"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = vec![0u8; 65536];
+                let _ = stream.read(&mut buf).unwrap();
+                let body = if path == "/models" {
+                    r#"{"data":[{"id":"tiny-thinker"}]}"#.to_owned()
+                } else {
+                    r#"{"model":"tiny-thinker-2026","choices":[{"message":{"content":""},"finish_reason":"length"}]}"#
+                        .to_owned()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let mut config = Config::default();
+        config.llm.base_url = format!("http://127.0.0.1:{port}");
+        config.llm.model = "tiny-thinker".to_owned();
+        config.llm.api_key_env = "UNUSED_VAR".to_owned();
+        config.llm.timeout_seconds = 10;
+
+        let verdict = probe_chat_endpoint(&config).unwrap();
+        assert!(
+            verdict.contains("served as 'tiny-thinker-2026'"),
+            "{verdict}"
+        );
+        assert!(verdict.contains("listed by /models"), "{verdict}");
+        server.join().unwrap();
+    }
+
+    /// A dead endpoint must FAIL the live probe with an actionable remedy —
+    /// this is the case `/v1/models` alone used to hide.
+    #[test]
+    fn live_chat_probe_fails_with_a_remedy_when_the_endpoint_is_dead() {
+        // Bind and drop: the port is (almost certainly) closed afterwards.
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+
+        let mut config = Config::default();
+        config.llm.base_url = format!("http://127.0.0.1:{port}");
+        config.llm.model = "tiny-thinker".to_owned();
+        config.llm.api_key_env = "UNUSED_VAR".to_owned();
+        config.llm.timeout_seconds = 2;
+
+        let gap = probe_chat_endpoint(&config).unwrap_err();
+        assert!(gap.detail.contains("did not answer"), "{}", gap.detail);
+        assert!(gap.remedy.contains("base_url"), "{}", gap.remedy);
+    }
+
+    /// Optional layers that are OFF must be reported, not failed — doctor
+    /// only red-flags what the user actually turned on.
+    #[test]
+    fn a_disabled_rerank_layer_is_reported_not_failed() {
+        let config = Config::default();
+        let rerank = probe_rerank_endpoint(&config).unwrap();
+        assert!(rerank.contains("not configured"), "{rerank}");
+    }
+
+    /// An embedding endpoint that is configured but dead must fail the live
+    /// probe with a remedy naming the config keys to check. (The embedding
+    /// model may also come from `LLM_WIKI_EMBEDDING_MODEL`, so the probe takes
+    /// the endpoint from config and the model from wherever it resolves.)
+    #[test]
+    fn live_embedding_probe_fails_with_a_remedy_on_a_dead_endpoint() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+
+        let mut config = Config::default();
+        config.embedding.base_url = format!("http://127.0.0.1:{port}");
+        config.embedding.model = "probe-embed".to_owned();
+        config.embedding.api_key_env = "UNUSED_VAR".to_owned();
+        config.embedding.timeout_seconds = 2;
+
+        let gap = probe_embedding_endpoint(&config).unwrap_err();
+        assert!(gap.detail.contains("did not answer"), "{}", gap.detail);
+        assert!(gap.remedy.contains("[embedding]"), "{}", gap.remedy);
+    }
+
+    fn doctor_temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "llm-wiki-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }

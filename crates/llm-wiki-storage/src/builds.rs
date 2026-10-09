@@ -72,6 +72,13 @@ pub fn start_build(conn: &mut Connection, draft: &BuildDraft) -> Result<BuildId>
 /// Transitions a build to a terminal state (COMPLETED / FAILED / INTERRUPTED /
 /// REPLAN_REQUIRED, PRD §31) with its fingerprint and the registry revision it
 /// committed at.
+///
+/// A `None` fingerprint or revision leaves the recorded value ALONE rather than
+/// clearing it. The build's planning-relevant inputs do not change because the
+/// build failed, and a build interrupted AFTER the pointer moved is later
+/// marked COMPLETED by publish recovery — which reads this column back for the
+/// §19 fingerprint guard. Clearing it there made the guard see "no fingerprint"
+/// on the next build and demand a full replan forever.
 pub fn finish_build(
     conn: &mut Connection,
     build_id: &BuildId,
@@ -84,7 +91,9 @@ pub fn finish_build(
         .map_err(|e| WikiError::Storage(format!("begin tx: {e}")))?;
     let changed = tx
         .execute(
-            "UPDATE builds SET status = ?1, finished_at = ?2, build_fingerprint = ?3, registry_revision = ?4 WHERE build_id = ?5",
+            "UPDATE builds SET status = ?1, finished_at = ?2, \
+             build_fingerprint = COALESCE(?3, build_fingerprint), \
+             registry_revision = COALESCE(?4, registry_revision) WHERE build_id = ?5",
             params![
                 status,
                 Utc::now().to_rfc3339(),
@@ -286,5 +295,49 @@ mod tests {
         let completed = latest_completed_build(&conn).unwrap().unwrap();
         assert_eq!(completed.build_id, first);
         assert_eq!(completed.build_fingerprint.as_deref(), Some("fp-1"));
+    }
+
+    /// Regression (V1.0 field test): a build that fails AFTER the pointer moved
+    /// is marked FAILED by the failure path and later completed by publish
+    /// recovery. The failure transition passes no fingerprint — it must not
+    /// CLEAR the one `start_build` recorded, or the §19 fingerprint guard sees
+    /// a completed build without a fingerprint and demands a full replan on
+    /// every subsequent build.
+    #[test]
+    fn a_terminal_transition_without_a_fingerprint_preserves_the_recorded_one() {
+        let mut conn = open_in_memory().unwrap();
+        let id = start_build(
+            &mut conn,
+            &BuildDraft {
+                build_fingerprint: Some("fp-recorded".into()),
+                ..BuildDraft::default()
+            },
+        )
+        .unwrap();
+
+        // The failure path (terminalize_failure) and then recovery's COMPLETED
+        // transition, both without a fingerprint.
+        finish_build(&mut conn, &id, "FAILED", None, None).unwrap();
+        assert_eq!(
+            latest_build(&conn)
+                .unwrap()
+                .unwrap()
+                .build_fingerprint
+                .as_deref(),
+            Some("fp-recorded"),
+            "the failure transition must not wipe the plan fingerprint"
+        );
+        crate::state::activate_build(&mut conn, &id).unwrap();
+
+        // An explicit fingerprint still overwrites.
+        finish_build(&mut conn, &id, "COMPLETED", Some("fp-new"), None).unwrap();
+        assert_eq!(
+            latest_completed_build(&conn)
+                .unwrap()
+                .unwrap()
+                .build_fingerprint
+                .as_deref(),
+            Some("fp-new")
+        );
     }
 }

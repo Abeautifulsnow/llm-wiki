@@ -63,6 +63,8 @@ pub struct GenerationPageView {
     pub slug: String,
     pub title: String,
     pub category: String,
+    /// Source-language tag persisted at compile time (PRD §8.2).
+    pub language: String,
     pub body_hash: String,
     pub content: String,
     pub knowledge_refs: Vec<KnowledgeNodeId>,
@@ -260,21 +262,54 @@ pub fn load_generation_view(
     conn: &Connection,
     build_id: &BuildId,
 ) -> Result<Vec<GenerationPageView>> {
+    let mut pages = load_page_headers(conn, build_id, None)?;
+    hydrate_generation_view(conn, build_id, &mut pages)?;
+    Ok(pages)
+}
+
+/// Loads ONE page of a generation with its citations, links (outbound and
+/// inbound) and knowledge refs — the `GET /v1/pages/{id}` read path. Same
+/// hydration as [`load_generation_view`], scoped to a single page so the
+/// agent-facing endpoint stays O(1) queries instead of one per page.
+///
+/// `id` matches either the page id or its slug (the protocol accepts both).
+pub fn load_generation_page_view(
+    conn: &Connection,
+    build_id: &BuildId,
+    id: &str,
+) -> Result<Option<GenerationPageView>> {
+    let mut pages = load_page_headers(conn, build_id, Some(id))?;
+    if pages.is_empty() {
+        return Ok(None);
+    }
+    hydrate_generation_view(conn, build_id, &mut pages)?;
+    Ok(pages.into_iter().next())
+}
+
+/// Page header rows for one generation, ordered by slug. `id` narrows to a
+/// single page (id OR slug); `None` loads the whole generation.
+fn load_page_headers(
+    conn: &Connection,
+    build_id: &BuildId,
+    id: Option<&str>,
+) -> Result<Vec<GenerationPageView>> {
     let mut pages: Vec<GenerationPageView> = Vec::new();
     {
         let mut stmt = conn
             .prepare(
-                "SELECT page_id, slug, title, category, body_hash, content, knowledge_refs_json
-                 FROM wiki_pages WHERE build_id = ?1 ORDER BY slug",
+                "SELECT page_id, slug, title, category, language, body_hash, content, knowledge_refs_json
+                 FROM wiki_pages WHERE build_id = ?1 AND (?2 IS NULL OR page_id = ?2 OR slug = ?2)
+                 ORDER BY slug",
             )
             .map_err(|e| WikiError::Storage(format!("prepare load_generation_view: {e}")))?;
         let rows = stmt
-            .query_map(params![build_id.as_str()], |row| {
+            .query_map(params![build_id.as_str(), id], |row| {
                 Ok((
                     WikiPageId::from_validated(row.get::<_, String>("page_id")?),
                     row.get::<_, String>("slug")?,
                     row.get::<_, String>("title")?,
                     row.get::<_, String>("category")?,
+                    row.get::<_, String>("language")?,
                     row.get::<_, String>("body_hash")?,
                     row.get::<_, String>("content")?,
                     row.get::<_, String>("knowledge_refs_json")?,
@@ -282,13 +317,14 @@ pub fn load_generation_view(
             })
             .map_err(|e| WikiError::Storage(format!("load_generation_view: {e}")))?;
         for row in rows {
-            let (page_id, slug, title, category, body_hash, content, refs_json) =
+            let (page_id, slug, title, category, language, body_hash, content, refs_json) =
                 row.map_err(db)?;
             pages.push(GenerationPageView {
                 page_id,
                 slug,
                 title,
                 category,
+                language,
                 body_hash,
                 content,
                 knowledge_refs: parse_knowledge_refs(&refs_json)?,
@@ -298,22 +334,30 @@ pub fn load_generation_view(
             });
         }
     }
+    Ok(pages)
+}
 
+/// Fills citations, outbound links and inbound link counts for an already
+/// loaded page set (PRD §36). Every child-row lookup is scoped to THIS
+/// generation's build_id because page ids persist across builds (PRD §45).
+fn hydrate_generation_view(
+    conn: &Connection,
+    build_id: &BuildId,
+    pages: &mut [GenerationPageView],
+) -> Result<()> {
     let mut index_of: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     for (idx, page) in pages.iter().enumerate() {
         index_of.insert(page.page_id.as_str().to_owned(), idx);
     }
 
     {
-        // Page ids persist across builds (PRD §45), so every child-row lookup
-        // is scoped to THIS generation's build_id.
         let mut stmt = conn
             .prepare(
                 "SELECT page_id, claim_node_id, source_id, section_id, range_start, range_end, source_hash, evidence_digest, heading_path_json
                  FROM page_citations WHERE build_id = ?1 AND page_id = ?2 ORDER BY rowid",
             )
             .map_err(|e| WikiError::Storage(format!("prepare view citations: {e}")))?;
-        for page in &mut pages {
+        for page in pages.iter_mut() {
             let rows = stmt
                 .query_map(
                     params![build_id.as_str(), page.page_id.as_str()],
@@ -333,7 +377,7 @@ pub fn load_generation_view(
                  WHERE build_id = ?1 AND from_page_id = ?2 ORDER BY rowid",
             )
             .map_err(|e| WikiError::Storage(format!("prepare view links: {e}")))?;
-        for page in &mut pages {
+        for page in pages.iter_mut() {
             let rows = stmt
                 .query_map(params![build_id.as_str(), page.page_id.as_str()], |row| {
                     Ok(PageLinkRecord {
@@ -370,7 +414,7 @@ pub fn load_generation_view(
         }
     }
 
-    Ok(pages)
+    Ok(())
 }
 
 fn map_citation_row(row: &rusqlite::Row) -> rusqlite::Result<PageCitationRecord> {
@@ -622,5 +666,44 @@ mod tests {
 
         let other = BuildId::generate();
         assert!(load_generation_view(&conn, &other).unwrap().is_empty());
+
+        // Single-page read (GET /v1/pages/{id}): the same hydration scoped to
+        // one page. Regression (V1.0 field test): the endpoint loaded only the
+        // header rows, so every page came back with EMPTY citations and links —
+        // the one call an agent makes to inspect a page was the one shape that
+        // never carried its provenance.
+        let by_id = load_generation_page_view(&conn, &build_id, page_a.as_str())
+            .unwrap()
+            .expect("page a by id");
+        assert_eq!(by_id.page_id, page_a);
+        assert_eq!(
+            by_id.citations.len(),
+            1,
+            "citations survive the narrow read"
+        );
+        assert_eq!(
+            by_id.links.len(),
+            1,
+            "outbound links survive the narrow read"
+        );
+        assert_eq!(by_id.language, "en", "language survives the narrow read");
+        assert_eq!(by_id.knowledge_refs, vec![claim_node.clone()]);
+
+        // Slugs address the same page; the inbound count is computed inside
+        // the scoped hydration, not inherited from a full-generation load.
+        let by_slug = load_generation_page_view(&conn, &build_id, "runtime")
+            .unwrap()
+            .expect("page b by slug");
+        assert_eq!(by_slug.page_id, page_b);
+        assert_eq!(by_slug.inbound_links, 1);
+
+        assert!(
+            load_generation_page_view(&conn, &build_id, "does-not-exist")
+                .unwrap()
+                .is_none()
+        );
+        assert!(load_generation_page_view(&conn, &other, page_a.as_str())
+            .unwrap()
+            .is_none());
     }
 }

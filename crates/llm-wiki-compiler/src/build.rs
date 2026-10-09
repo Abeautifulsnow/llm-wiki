@@ -1464,13 +1464,24 @@ fn assemble_surviving_plan(
     updated_refs: &BTreeMap<WikiPageId, Vec<KnowledgeNodeId>>,
     new_kb: &llm_wiki_core::plan::KnowledgeBase,
 ) -> (WikiPlan, BTreeSet<WikiPageId>) {
+    // The surviving set must be complete BEFORE any page's related pages are
+    // resolved: `prev_pages` is slug-ordered, so resolving against a set built
+    // in the same pass dropped every link whose target sorts after its source
+    // (a forward link). The recompiled page was then handed a plan without
+    // that neighbour, the compiler emitted no WikiLink for it, and
+    // `verify_related_page_topology` failed the build with REPLAN_REQUIRED
+    // for a purely one-sentence source edit.
+    let surviving_ids: BTreeSet<WikiPageId> = prev_pages
+        .iter()
+        .filter(|page| !obsolete.contains(&page.page_id))
+        .map(|page| page.page_id.clone())
+        .collect();
+
     let mut plan_pages: Vec<WikiPagePlan> = Vec::new();
-    let mut surviving_ids: BTreeSet<WikiPageId> = BTreeSet::new();
     for page in prev_pages {
         if obsolete.contains(&page.page_id) {
             continue; // §19.3.5: zero refs left — excluded from the generation
         }
-        surviving_ids.insert(page.page_id.clone());
         let knowledge_refs = updated_refs
             .get(&page.page_id)
             .cloned()
@@ -1770,5 +1781,67 @@ mod tests {
         assert_eq!(rows[0].outcome, "local-update");
         assert_eq!(rows[0].affected_pages, 2);
         assert_eq!(rows[0].trigger, None);
+    }
+
+    /// Regression: a page whose only outbound link points at a page that sorts
+    /// AFTER it in `prev_pages` (slug order) must keep that neighbour in its
+    /// plan. Resolving `related_pages` against a surviving set built in the
+    /// same pass dropped every forward link, so the recompiled page lost its
+    /// WikiLink and `verify_related_page_topology` raised REPLAN_REQUIRED for a
+    /// one-sentence source edit.
+    #[test]
+    fn surviving_plan_keeps_forward_outbound_links() {
+        let page = |slug: &str| GenerationPageView {
+            page_id: WikiPageId::generate(),
+            slug: slug.to_owned(),
+            title: slug.to_owned(),
+            category: "concepts".into(),
+            language: "en".into(),
+            body_hash: "hash".into(),
+            content: format!("# {slug}"),
+            knowledge_refs: Vec::new(),
+            citations: Vec::new(),
+            links: Vec::new(),
+            inbound_links: 0,
+        };
+        let link_to = |page: &GenerationPageView| llm_wiki_storage::PageLinkRecord {
+            to_page_id: page.page_id.clone(),
+            target_title: page.title.clone(),
+        };
+
+        // "alpha" sorts FIRST but links to "zeta"; "zeta" links back. The
+        // forward link (alpha → zeta) is the one the same-pass set dropped.
+        let mut alpha = page("alpha");
+        let mut zeta = page("zeta");
+        alpha.links = vec![link_to(&zeta)];
+        zeta.links = vec![link_to(&alpha)];
+        let (alpha_id, zeta_id) = (alpha.page_id.clone(), zeta.page_id.clone());
+
+        let prev_pages = vec![alpha, zeta];
+        // The knowledge base is irrelevant to link resolution — an empty one
+        // keeps the fixture to the behaviour under test.
+        let (plan, surviving) = assemble_surviving_plan(
+            &prev_pages,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &llm_wiki_core::plan::KnowledgeBase::default(),
+        );
+        assert_eq!(surviving.len(), 2);
+        let alpha_plan = plan
+            .pages
+            .iter()
+            .find(|page| page.slug == "alpha")
+            .expect("alpha in plan");
+        assert_eq!(
+            alpha_plan.related_pages,
+            vec![zeta_id],
+            "the forward link to the later-sorting page must survive"
+        );
+        let zeta_plan = plan
+            .pages
+            .iter()
+            .find(|page| page.slug == "zeta")
+            .expect("zeta in plan");
+        assert_eq!(zeta_plan.related_pages, vec![alpha_id]);
     }
 }

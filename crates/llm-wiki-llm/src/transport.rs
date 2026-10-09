@@ -57,10 +57,28 @@ impl HttpTransport {
         path: &str,
         body: &serde_json::Value,
     ) -> Result<reqwest::Response, LlmError> {
+        self.send_with_retry(path, Some(body)).await
+    }
+
+    /// GETs `{base_url}/{path}` with bearer auth and the same bounded backoff.
+    /// Used by the `doctor` endpoint probes (`GET /models`): a read must not
+    /// need a separate auth/timeout/proxy stack from the request paths.
+    pub async fn get(&self, path: &str) -> Result<reqwest::Response, LlmError> {
+        self.send_with_retry(path, None).await
+    }
+
+    async fn send_with_retry(
+        &self,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<reqwest::Response, LlmError> {
         let url = format!("{}/{path}", self.base_url);
         let mut attempt = 0u32;
         loop {
-            let mut request = self.client.post(&url).json(body);
+            let mut request = match body {
+                Some(body) => self.client.post(&url).json(body),
+                None => self.client.get(&url),
+            };
             if let Some(key) = &self.api_key {
                 request = request.bearer_auth(key);
             }

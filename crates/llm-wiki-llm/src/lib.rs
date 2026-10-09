@@ -14,12 +14,12 @@ pub mod structured;
 mod transport;
 
 pub use fake::FakeLlmProvider;
-pub use openai::OpenAiCompatibleProvider;
+pub use openai::{ChatProbeOutcome, OpenAiCompatibleProvider};
 
 pub mod embedding;
 
-pub use embedding::{EmbeddingProvider, OpenAiCompatibleEmbeddings};
-pub use rerank::{CohereCompatibleReranker, RerankProvider, RerankResult};
+pub use embedding::{EmbeddingProbeOutcome, EmbeddingProvider, OpenAiCompatibleEmbeddings};
+pub use rerank::{CohereCompatibleReranker, RerankProbeOutcome, RerankProvider, RerankResult};
 
 use async_trait::async_trait;
 use thiserror::Error;

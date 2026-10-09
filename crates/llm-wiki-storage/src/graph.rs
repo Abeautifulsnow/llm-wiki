@@ -492,6 +492,12 @@ pub fn update_graph(
     // Outgoing links_to for touched pages, from the NEW build's rows. A
     // changed page's incoming links from unchanged siblings are rebuilt too:
     // the (from → to) pair query covers both directions of the touch set.
+    //
+    // The per-page queries OVERLAP: a link between two touched pages matches
+    // both of them, so the same `page_links` row is visited twice. Collect by
+    // link id first (BTreeMap → deterministic insert order, one edge per link)
+    // so the edge set equals a full rebuild's exactly; inserting per visit
+    // aborts the whole activate transaction on `graph_edges.id`.
     {
         let mut select_links = tx
             .prepare(
@@ -499,12 +505,7 @@ pub fn update_graph(
                  WHERE build_id = ?1 AND (from_page_id = ?2 OR to_page_id = ?2)",
             )
             .map_err(db)?;
-        let mut insert_edge = tx
-            .prepare(
-                "INSERT INTO graph_edges (id, source_id, relation_type, target_id)
-                 VALUES (?1, ?2, ?3, ?4)",
-            )
-            .map_err(db)?;
+        let mut link_edges: BTreeMap<String, (String, String)> = BTreeMap::new();
         for (page_id, _) in &touched {
             let rows = select_links
                 .query_map(params![build_id.as_str(), page_id], |row| {
@@ -517,15 +518,25 @@ pub fn update_graph(
                 .map_err(db)?;
             for row in rows {
                 let (link_id, from, to) = row.map_err(db)?;
-                insert_edge
-                    .execute(params![
-                        format!("link:{link_id}"),
-                        format!("page:{from}"),
-                        RELATION_LINKS_TO,
-                        format!("page:{to}")
-                    ])
-                    .map_err(db)?;
+                link_edges.insert(link_id, (from, to));
             }
+        }
+        drop(select_links);
+        let mut insert_edge = tx
+            .prepare(
+                "INSERT INTO graph_edges (id, source_id, relation_type, target_id)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )
+            .map_err(db)?;
+        for (link_id, (from, to)) in &link_edges {
+            insert_edge
+                .execute(params![
+                    format!("link:{link_id}"),
+                    format!("page:{from}"),
+                    RELATION_LINKS_TO,
+                    format!("page:{to}")
+                ])
+                .map_err(db)?;
         }
     }
 
@@ -961,6 +972,29 @@ mod tests {
         (nodes as usize, edges as usize)
     }
 
+    /// The whole edge set, sorted — a comparable snapshot for "incremental
+    /// update must equal a full rebuild" assertions (same connection, so page
+    /// ids are directly comparable).
+    fn edge_rows(conn: &Connection) -> Vec<(String, String, String, String)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, source_id, relation_type, target_id FROM graph_edges
+                 ORDER BY id, source_id, target_id",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap();
+        rows.map(|row| row.unwrap()).collect()
+    }
+
     #[test]
     fn rebuild_populates_pages_links_and_vocabulary_nodes() {
         let (conn, _, _, _) = published_conn();
@@ -1363,6 +1397,111 @@ mod tests {
             left_edges, right_edges,
             "edge set must equal a full rebuild"
         );
+    }
+
+    /// Regression (T1/V1.0 field test): two pages that link to EACH OTHER and
+    /// are BOTH recompiled in one incremental update. The per-page link query
+    /// matches each page of the pair, so the same `page_links` row is seen
+    /// twice — a per-visit insert aborted the activate transaction with
+    /// `UNIQUE constraint failed: graph_edges.id` and left the workspace in an
+    /// un-recoverable publish state. The edge set must still equal a full
+    /// rebuild's.
+    #[test]
+    fn incremental_update_handles_mutual_links_between_two_touched_pages() {
+        let mut conn = crate::open_in_memory().unwrap();
+        let (source_id, _) = upsert_source(
+            &mut conn,
+            &SourceLocatorKey::compute("ws", "mutual.md"),
+            "mutual.md",
+            "hash-mutual",
+            10,
+            None,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO document_analyses (analysis_id, source_id, status, created_at)
+             VALUES ('an_mutual', ?1, 'completed', '2026-01-01')",
+            params![source_id.as_str()],
+        )
+        .unwrap();
+        let ids = crate::get_or_create_batch(
+            &mut conn,
+            &[NodeDraft {
+                kind: NodeKind::Entity,
+                canonical_key: "alpha".into(),
+                canonical_name: "Alpha".into(),
+                entity_type: None,
+                description: None,
+            }],
+            None,
+        )
+        .unwrap();
+
+        let make =
+            |a_id: Option<WikiPageId>, b_id: Option<WikiPageId>, a_title: &str, b_title: &str| {
+                let mut a = page("alpha", a_title, Vec::new());
+                let mut b = page("beta", b_title, Vec::new());
+                if let Some(id) = a_id {
+                    a.page_id = id;
+                }
+                if let Some(id) = b_id {
+                    b.page_id = id;
+                }
+                a.knowledge_refs = vec![ids[0].clone()];
+                b.knowledge_refs = vec![ids[0].clone()];
+                a.links = vec![PageLinkRecord {
+                    to_page_id: b.page_id.clone(),
+                    target_title: b_title.to_owned(),
+                }];
+                b.links = vec![PageLinkRecord {
+                    to_page_id: a.page_id.clone(),
+                    target_title: a_title.to_owned(),
+                }];
+                (a, b)
+            };
+
+        let build_a = start_build(&mut conn, &BuildDraft::default()).unwrap();
+        let (a, b) = make(None, None, "Alpha", "Beta");
+        let (a_id, b_id) = (a.page_id.clone(), b.page_id.clone());
+        persist_generation(&mut conn, &build_a, &[a, b]).unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            rebuild_graph(&tx, &build_a).unwrap();
+            tx.commit().unwrap();
+        }
+
+        // Both pages retitled → BOTH land in the touch set, and each of their
+        // two mutual links is then seen from BOTH ends (the from-or-to query
+        // matches twice per link). Inserting per visit aborts the activate
+        // transaction on `graph_edges.id`.
+        let build_b = start_build(&mut conn, &BuildDraft::default()).unwrap();
+        let (a2, b2) = make(Some(a_id), Some(b_id), "Alpha Renamed", "Beta Renamed");
+        persist_generation(&mut conn, &build_b, &[a2, b2]).unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            update_graph(&tx, Some(&build_a), &build_b).unwrap();
+            tx.commit().unwrap();
+        }
+        let incremental_edges = edge_rows(&conn);
+
+        // Same generation, full rebuild on the same connection (page ids are
+        // stable here, so raw rows compare directly).
+        conn.execute("DELETE FROM graph_edges", []).unwrap();
+        conn.execute("DELETE FROM graph_nodes", []).unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            rebuild_graph(&tx, &build_b).unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(
+            incremental_edges,
+            edge_rows(&conn),
+            "mutual-link incremental edge set must equal a full rebuild"
+        );
+        // Both directions of the mutual link survive (2 links_to) plus one
+        // `contains` edge per touched page (2) — no edge was dropped by the
+        // dedupe.
+        assert_eq!(incremental_edges.len(), 4, "{incremental_edges:?}");
     }
 
     #[test]

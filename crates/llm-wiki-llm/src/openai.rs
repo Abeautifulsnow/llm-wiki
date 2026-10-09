@@ -96,6 +96,74 @@ impl OpenAiCompatibleProvider {
     }
 }
 
+/// What a live chat round trip actually proved, for `llm-wiki doctor`
+/// (V1.0 field test: `doctor` reported the API KEY was set and said nothing
+/// about whether the endpoint served the configured model).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatProbeOutcome {
+    /// Model name the endpoint echoed back. A gateway may legally serve a
+    /// different revision than the one requested, so the caller reports a
+    /// substitution instead of failing it.
+    pub served_model: Option<String>,
+    /// Whether `GET /models` listed the requested model. `None` when the
+    /// catalog is unavailable or unparseable — NOT a failure: self-hosted
+    /// gateways commonly vary here, so the live request is the verdict.
+    pub model_listed: Option<bool>,
+    pub latency_ms: u128,
+}
+
+impl OpenAiCompatibleProvider {
+    /// One minimal round trip on the REAL chat path, for `doctor`. Unlike
+    /// [`LlmProvider::generate`] it does not require non-empty content: a
+    /// thinking model given a tiny output budget still proves the endpoint
+    /// serves the model, which is all a connectivity probe claims.
+    pub async fn probe(&self) -> Result<ChatProbeOutcome, LlmError> {
+        let started = std::time::Instant::now();
+        let model_listed = self.catalog_lists_model().await;
+        let body = json!({
+            "model": self.model,
+            "messages": [{ "role": "user", "content": "ping" }],
+            "max_tokens": 8,
+        });
+        let response = self.send("chat/completions", body).await?;
+        let payload: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| LlmError::InvalidResponse(format!("body is not JSON: {e}")))?;
+        if payload
+            .get("choices")
+            .and_then(|choices| choices.get(0))
+            .is_none()
+        {
+            return Err(LlmError::InvalidResponse(format!(
+                "the chat response carries no choices[0]; the endpoint answered but is not serving '{}'",
+                self.model
+            )));
+        }
+        Ok(ChatProbeOutcome {
+            served_model: payload
+                .get("model")
+                .and_then(|model| model.as_str())
+                .map(str::to_owned),
+            model_listed,
+            latency_ms: started.elapsed().as_millis(),
+        })
+    }
+
+    /// Best-effort `GET /models`. `None` (unavailable, non-JSON, no `data[]`)
+    /// is not an error — see [`ChatProbeOutcome::model_listed`].
+    async fn catalog_lists_model(&self) -> Option<bool> {
+        let response = self.transport.get("models").await.ok()?;
+        let payload: serde_json::Value = response.json().await.ok()?;
+        let ids = payload.get("data").and_then(|data| data.as_array())?;
+        Some(
+            ids.iter().any(|entry| {
+                entry.get("id").and_then(|id| id.as_str()) == Some(self.model.as_str())
+            }),
+        )
+    }
+}
+
 /// Writes the thinking controls into the request body (Ark/Doubao spelling
 /// for the on/off switch — probe-verified against the T1 gateway;
 /// OpenAI-style `reasoning_effort` for the effort knob). Returns whether any
@@ -346,6 +414,138 @@ Connection: close
         assert_eq!(ThinkingMode::parse(" OFF "), ThinkingMode::Off);
         assert_eq!(ThinkingMode::parse("enabled"), ThinkingMode::On);
         assert_eq!(ThinkingMode::parse("banana"), ThinkingMode::Auto);
+    }
+
+    /// A doctor probe must go through the real chat path and report both the
+    /// served model and whether the catalog lists the requested one. An empty
+    /// `content` (a thinking model that spent its 8-token budget on
+    /// chain-of-thought) is NOT a probe failure — the endpoint answered.
+    #[tokio::test]
+    async fn probe_reports_served_model_and_catalog_hit_with_empty_content() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            // The probe issues GET /models first, then POST /chat/completions.
+            for path in ["/models", "/chat/completions"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = vec![0u8; 65536];
+                let n = stream.read(&mut buf).unwrap();
+                let raw = String::from_utf8_lossy(&buf[..n]).into_owned();
+                assert!(raw.starts_with(if path == "/models" { "GET" } else { "POST" }));
+                assert!(raw.contains(path), "request line: {raw}");
+                let body = if path == "/models" {
+                    r#"{"data":[{"id":"other-model"},{"id":"m"}]}"#.to_owned()
+                } else {
+                    r#"{"model":"m-2026-01","choices":[{"message":{"content":""},"finish_reason":"length"}]}"#
+                        .to_owned()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let provider = OpenAiCompatibleProvider::new(
+            &format!("http://127.0.0.1:{port}"),
+            "m",
+            "UNUSED_VAR",
+            10,
+            0,
+        )
+        .unwrap();
+        let outcome = provider.probe().await.unwrap();
+        assert_eq!(outcome.served_model.as_deref(), Some("m-2026-01"));
+        assert_eq!(outcome.model_listed, Some(true));
+        server.join().unwrap();
+    }
+
+    /// An endpoint that answers without `choices[]` is not serving the model:
+    /// the probe must fail loudly rather than report a green check.
+    #[tokio::test]
+    async fn probe_fails_when_the_endpoint_serves_something_else() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = vec![0u8; 65536];
+                let _ = stream.read(&mut buf).unwrap();
+                let body = r#"{"error":{"message":"model not found"}}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let provider = OpenAiCompatibleProvider::new(
+            &format!("http://127.0.0.1:{port}"),
+            "m",
+            "UNUSED_VAR",
+            10,
+            0,
+        )
+        .unwrap();
+        let err = provider.probe().await.unwrap_err();
+        assert!(err.to_string().contains("choices[0]"), "{err}");
+        server.join().unwrap();
+    }
+
+    /// The `/models` catalog is advisory: a gateway that does not expose one
+    /// must leave `model_listed` at `None` and still pass on the live call.
+    #[tokio::test]
+    async fn probe_treats_a_missing_catalog_as_unknown_not_failure() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = vec![0u8; 65536];
+                let n = stream.read(&mut buf).unwrap();
+                let raw = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let (status, body) = if raw.starts_with("GET") {
+                    ("404 Not Found", "not found".to_owned())
+                } else {
+                    (
+                        "200 OK",
+                        r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#
+                            .to_owned(),
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let provider = OpenAiCompatibleProvider::new(
+            &format!("http://127.0.0.1:{port}"),
+            "m",
+            "UNUSED_VAR",
+            10,
+            0,
+        )
+        .unwrap();
+        let outcome = provider.probe().await.unwrap();
+        assert_eq!(outcome.model_listed, None);
+        server.join().unwrap();
     }
 
     /// Fault-tolerance contract: a provider that rejects the thinking

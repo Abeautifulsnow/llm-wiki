@@ -23,8 +23,8 @@ use llm_wiki_search::{rerank_search_hits, FullTextSearch, SqliteFullTextSearch};
 use llm_wiki_storage::{
     count_jobs_by_status, count_sources, finish_job, get_active_build_id,
     get_job as storage_get_job, get_job_by_idempotency_key, insert_job, insight_exists,
-    latest_build, list_insights_paged, list_jobs as storage_list_jobs, load_generation_pages, open,
-    FAILURE_CANCELLED, JOB_STATUSES,
+    latest_build, list_insights_paged, list_jobs as storage_list_jobs, load_generation_page_view,
+    load_generation_pages, open, FAILURE_CANCELLED, JOB_STATUSES,
 };
 
 use crate::error::ApiError;
@@ -893,10 +893,7 @@ pub async fn get_page(
         let Some(active) = get_active_build_id(conn)? else {
             return Ok(None);
         };
-        let records = load_generation_pages(conn, &active)?;
-        Ok(records
-            .into_iter()
-            .find(|page| page.slug == id || page.page_id.as_str() == id))
+        load_generation_page_view(conn, &active, &id)
     })
     .await?;
     let page = found.ok_or_else(|| {
