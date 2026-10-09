@@ -8,14 +8,18 @@
 
 pub mod fake;
 pub mod openai;
+pub mod rerank;
 pub mod structured;
+
+mod transport;
 
 pub use fake::FakeLlmProvider;
 pub use openai::OpenAiCompatibleProvider;
 
 pub mod embedding;
 
-pub use embedding::EmbeddingProvider;
+pub use embedding::{EmbeddingProvider, OpenAiCompatibleEmbeddings};
+pub use rerank::{CohereCompatibleReranker, RerankProvider, RerankResult};
 
 use async_trait::async_trait;
 use thiserror::Error;

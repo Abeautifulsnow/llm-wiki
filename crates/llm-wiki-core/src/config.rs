@@ -19,6 +19,10 @@ pub struct Config {
     #[serde(default)]
     pub llm: LlmConfig,
     #[serde(default)]
+    pub embedding: EmbeddingConfig,
+    #[serde(default)]
+    pub rerank: RerankConfig,
+    #[serde(default)]
     pub analysis: AnalysisConfig,
     #[serde(default)]
     pub planning: PlanningConfig,
@@ -85,6 +89,135 @@ pub struct LlmConfig {
     pub timeout_seconds: u64,
 }
 
+/// Connection parameters shared by the chat, embedding and rerank endpoint
+/// families: chat/embedding/rerank may live at THREE different providers, so
+/// each stage carries its own endpoint instead of assuming `[llm]`'s.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointConfig {
+    pub base_url: String,
+    /// Name of the env var holding the API key — never the key itself.
+    pub api_key_env: String,
+    pub timeout_seconds: u64,
+}
+
+/// Vector-layer provider overrides (§19.3). Every field left empty/0
+/// INHERITS the corresponding `[llm]` value: embedding may point at a
+/// different provider (different base_url / key / model) by filling in only
+/// what differs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EmbeddingConfig {
+    /// Endpoint family. Empty inherits `llm.provider`; currently only
+    /// `"openai-compatible"` is supported.
+    #[serde(default)]
+    pub provider: String,
+    /// Empty inherits `llm.base_url`.
+    #[serde(default)]
+    pub base_url: String,
+    /// Name of the env var holding the API key. Empty inherits
+    /// `llm.api_key_env`.
+    #[serde(default)]
+    pub api_key_env: String,
+    /// Embedding model. Empty falls back to `--embedding-model` /
+    /// `$LLM_WIKI_EMBEDDING_MODEL` at resolution time.
+    #[serde(default)]
+    pub model: String,
+    /// 0 inherits `llm.timeout_seconds`.
+    #[serde(default)]
+    pub timeout_seconds: u64,
+}
+
+/// Rerank-stage provider overrides (PRD §50 V0.5), used when
+/// `[search] rerank = "cohere-compatible"`. Every field left empty/0
+/// INHERITS the corresponding `[llm]` value — the rerank model may live at
+/// its own provider. There is deliberately no `provider` field: the wire
+/// protocol is named by the `[search] rerank` strategy itself.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RerankConfig {
+    /// Empty inherits `llm.base_url`.
+    #[serde(default)]
+    pub base_url: String,
+    /// Name of the env var holding the API key. Empty inherits
+    /// `llm.api_key_env`.
+    #[serde(default)]
+    pub api_key_env: String,
+    /// Rerank model (required when the strategy is enabled).
+    #[serde(default)]
+    pub model: String,
+    /// 0 inherits `llm.timeout_seconds`.
+    #[serde(default)]
+    pub timeout_seconds: u64,
+}
+
+impl LlmConfig {
+    /// The chat endpoint as the inheritance root for embedding/rerank.
+    pub fn endpoint(&self) -> EndpointConfig {
+        EndpointConfig {
+            base_url: self.base_url.clone(),
+            api_key_env: self.api_key_env.clone(),
+            timeout_seconds: self.timeout_seconds,
+        }
+    }
+}
+
+impl EmbeddingConfig {
+    /// Resolves the embedding endpoint: explicit values win, empty/0
+    /// inherits from the `[llm]` section.
+    pub fn endpoint(&self, llm: &LlmConfig) -> EndpointConfig {
+        let root = llm.endpoint();
+        EndpointConfig {
+            base_url: if self.base_url.trim().is_empty() {
+                root.base_url
+            } else {
+                self.base_url.clone()
+            },
+            api_key_env: if self.api_key_env.trim().is_empty() {
+                root.api_key_env
+            } else {
+                self.api_key_env.clone()
+            },
+            timeout_seconds: if self.timeout_seconds == 0 {
+                root.timeout_seconds
+            } else {
+                self.timeout_seconds
+            },
+        }
+    }
+
+    /// Resolved endpoint family; empty inherits `llm.provider`.
+    pub fn resolved_provider<'a>(&'a self, llm: &'a LlmConfig) -> &'a str {
+        if self.provider.trim().is_empty() {
+            &llm.provider
+        } else {
+            &self.provider
+        }
+    }
+}
+
+impl RerankConfig {
+    /// Resolves the rerank endpoint: explicit values win, empty/0 inherits
+    /// from the `[llm]` section.
+    pub fn endpoint(&self, llm: &LlmConfig) -> EndpointConfig {
+        let root = llm.endpoint();
+        EndpointConfig {
+            base_url: if self.base_url.trim().is_empty() {
+                root.base_url
+            } else {
+                self.base_url.clone()
+            },
+            api_key_env: if self.api_key_env.trim().is_empty() {
+                root.api_key_env
+            } else {
+                self.api_key_env.clone()
+            },
+            timeout_seconds: if self.timeout_seconds == 0 {
+                root.timeout_seconds
+            } else {
+                self.timeout_seconds
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalysisConfig {
     #[serde(default = "default_max_input_tokens")]
@@ -122,8 +255,10 @@ pub struct SearchConfig {
     #[serde(default = "default_true")]
     pub graph: bool,
     /// Rerank strategy applied after rank fusion (PRD §50 V0.5). `"none"`
-    /// keeps the deterministic fused order; other values are config errors
-    /// until a concrete strategy ships.
+    /// keeps the deterministic fused order; `"cohere-compatible"` calls the
+    /// Cohere/Jina-style `/rerank` endpoint described by the `[rerank]`
+    /// section (empty fields inherit `[llm]`). Unknown values are config
+    /// errors.
     #[serde(default = "default_rerank")]
     pub rerank: String,
 }
@@ -392,6 +527,22 @@ impl Config {
                     .into(),
             ));
         }
+        match self.search.rerank.as_str() {
+            "none" => {}
+            "cohere-compatible" => {
+                if self.rerank.model.trim().is_empty() {
+                    return Err(WikiError::Config(
+                        "[rerank] model must be set when search.rerank = \"cohere-compatible\""
+                            .into(),
+                    ));
+                }
+            }
+            other => {
+                return Err(WikiError::Config(format!(
+                    "unsupported search.rerank strategy '{other}' (supported: none, cohere-compatible)"
+                )));
+            }
+        }
 
         let root = lexical_absolute(Path::new(""), &self.source.root);
         let wiki = lexical_absolute(Path::new(""), &self.project.wiki_dir);
@@ -409,7 +560,7 @@ impl Config {
     /// construction: config only stores env-var names (PRD §32).
     pub fn effective_summary(&self) -> String {
         format!(
-            "project.name = {}\nproject.wiki_dir = {}\nsource.root = {}\nsource.include = {:?}\nsource.exclude = {:?}\nllm.provider = {}\nllm.base_url = {}\nllm.model = {}\nllm.api_key_env = <env name: redacted>\nllm.max_concurrency = {}\nanalysis.max_input_tokens = {}\nanalysis.max_plan_input_tokens = {}\nanalysis.max_rejected_claim_ratio = {}\nplanning.hierarchical = {}\nplanning.max_cluster_nodes = {}\nbuild.incremental = {}\nbuild.keep_generations = {}\nserver.bind = {}\nserver.remote_enabled = {}",
+            "project.name = {}\nproject.wiki_dir = {}\nsource.root = {}\nsource.include = {:?}\nsource.exclude = {:?}\nllm.provider = {}\nllm.base_url = {}\nllm.model = {}\nllm.api_key_env = <env name: redacted>\nllm.max_concurrency = {}\nembedding.provider = {}\nembedding.base_url = {}\nembedding.model = {}\nembedding.api_key_env = <env name: redacted>\nsearch.rerank = {}\nrerank.base_url = {}\nrerank.model = {}\nrerank.api_key_env = <env name: redacted>\nanalysis.max_input_tokens = {}\nanalysis.max_plan_input_tokens = {}\nanalysis.max_rejected_claim_ratio = {}\nplanning.hierarchical = {}\nplanning.max_cluster_nodes = {}\nbuild.incremental = {}\nbuild.keep_generations = {}\nserver.bind = {}\nserver.remote_enabled = {}",
             self.project.name,
             self.project.wiki_dir.display(),
             self.source.root.display(),
@@ -419,6 +570,12 @@ impl Config {
             self.llm.base_url,
             if self.llm.model.is_empty() { "<unset>" } else { &self.llm.model },
             self.llm.max_concurrency,
+            self.embedding.resolved_provider(&self.llm),
+            if self.embedding.base_url.is_empty() { &self.llm.base_url } else { &self.embedding.base_url },
+            if self.embedding.model.is_empty() { "<unset>" } else { &self.embedding.model },
+            self.search.rerank,
+            if self.rerank.base_url.is_empty() { &self.llm.base_url } else { &self.rerank.base_url },
+            if self.rerank.model.is_empty() { "<unset>" } else { &self.rerank.model },
             self.analysis.max_input_tokens,
             self.analysis.max_plan_input_tokens,
             self.analysis.max_rejected_claim_ratio,
@@ -580,6 +737,97 @@ max_rejected_claim_ratio = 0.10
         let summary = Config::default().effective_summary();
         assert!(!summary.contains("api_key ="));
         assert!(summary.contains("api_key_env = <env name: redacted>"));
+        assert!(summary.contains("embedding.provider = openai-compatible"));
+        assert!(summary.contains("rerank.model = <unset>"));
+    }
+
+    #[test]
+    fn embedding_and_rerank_inherit_llm_endpoint_when_unset() {
+        let mut cfg = Config::default();
+        cfg.llm.base_url = "https://chat.example.com/v1".into();
+        cfg.llm.api_key_env = "CHAT_KEY".into();
+        cfg.llm.timeout_seconds = 77;
+        // All-empty sections resolve to the [llm] endpoint.
+        assert_eq!(cfg.embedding.endpoint(&cfg.llm).base_url, cfg.llm.base_url);
+        assert_eq!(
+            cfg.embedding.endpoint(&cfg.llm).api_key_env,
+            cfg.llm.api_key_env
+        );
+        assert_eq!(cfg.rerank.endpoint(&cfg.llm).timeout_seconds, 77);
+        assert_eq!(
+            cfg.embedding.resolved_provider(&cfg.llm),
+            "openai-compatible"
+        );
+    }
+
+    #[test]
+    fn embedding_and_rerank_can_point_at_their_own_providers() {
+        let defaults = Config::default();
+        let mut cfg = Config {
+            embedding: EmbeddingConfig {
+                provider: "openai-compatible".into(),
+                base_url: "https://embed.example.com/v1".into(),
+                api_key_env: "EMBED_KEY".into(),
+                model: "bge-m3".into(),
+                timeout_seconds: 30,
+            },
+            rerank: RerankConfig {
+                base_url: "https://rerank.example.com/v1".into(),
+                api_key_env: "RERANK_KEY".into(),
+                model: "bge-reranker-v2-m3".into(),
+                timeout_seconds: 15,
+            },
+            search: SearchConfig {
+                rerank: "cohere-compatible".into(),
+                ..SearchConfig::default()
+            },
+            ..defaults
+        };
+        cfg.validate().unwrap();
+        let embedding = cfg.embedding.endpoint(&cfg.llm);
+        assert_eq!(embedding.base_url, "https://embed.example.com/v1");
+        assert_eq!(embedding.api_key_env, "EMBED_KEY");
+        assert_eq!(embedding.timeout_seconds, 30);
+        let rerank = cfg.rerank.endpoint(&cfg.llm);
+        assert_eq!(rerank.base_url, "https://rerank.example.com/v1");
+        assert_eq!(rerank.api_key_env, "RERANK_KEY");
+        // Partial override: only base_url set, the rest inherits [llm].
+        cfg.embedding.base_url = "https://only-embed.example.com/v1".into();
+        cfg.embedding.api_key_env = String::new();
+        let partial = cfg.embedding.endpoint(&cfg.llm);
+        assert_eq!(partial.base_url, "https://only-embed.example.com/v1");
+        assert_eq!(partial.api_key_env, "LLM_WIKI_API_KEY");
+    }
+
+    #[test]
+    fn rerank_strategy_validation() {
+        let config_with = |strategy: &str, model: &str| Config {
+            search: SearchConfig {
+                rerank: strategy.to_owned(),
+                ..SearchConfig::default()
+            },
+            rerank: RerankConfig {
+                model: model.to_owned(),
+                ..RerankConfig::default()
+            },
+            ..Config::default()
+        };
+
+        let err = config_with("cross-encoder", "any")
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unsupported search.rerank strategy"), "{err}");
+
+        let err = config_with("cohere-compatible", "")
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[rerank] model must be set"), "{err}");
+
+        config_with("cohere-compatible", "bge-reranker-v2-m3")
+            .validate()
+            .unwrap();
     }
 
     #[test]

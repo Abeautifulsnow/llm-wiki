@@ -6,20 +6,16 @@
 //! 429/5xx/network errors; other statuses fail fast.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::json;
 
+use crate::transport::HttpTransport;
 use crate::{LlmError, LlmProvider, LlmRequest, LlmResponse};
 
 pub struct OpenAiCompatibleProvider {
-    base_url: String,
     model: String,
-    api_key: Option<String>,
-    timeout: Duration,
-    max_retries: u32,
-    client: reqwest::Client,
+    transport: HttpTransport,
     thinking: ThinkingMode,
     thinking_effort: Option<String>,
     /// Set once the provider rejected the thinking parameters (HTTP 4xx):
@@ -59,17 +55,6 @@ impl ThinkingMode {
     }
 }
 
-/// True when the base URL points at a loopback host (localhost, 127.0.0.1,
-/// ::1): such endpoints are reached directly — a system proxy (http_proxy
-/// env) must never intercept them. Local gateways are a first-class target
-/// of this adapter.
-fn is_loopback_base_url(base_url: &str) -> bool {
-    match reqwest::Url::parse(base_url) {
-        Ok(url) => matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1")),
-        Err(_) => false,
-    }
-}
-
 impl OpenAiCompatibleProvider {
     /// Builds a provider. `api_key_env` is the config-declared env var name;
     /// a missing env var is only an error once a request actually needs it
@@ -81,26 +66,9 @@ impl OpenAiCompatibleProvider {
         timeout_seconds: u64,
         max_retries: u32,
     ) -> Result<Self, LlmError> {
-        let api_key = match std::env::var(api_key_env) {
-            Ok(key) if !key.trim().is_empty() => Some(key.trim().to_owned()),
-            Ok(_) => None,
-            Err(std::env::VarError::NotPresent) => None,
-            Err(e) => return Err(LlmError::MissingApiKey(format!("{api_key_env}: {e}"))),
-        };
-        let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(timeout_seconds));
-        if is_loopback_base_url(base_url) {
-            builder = builder.no_proxy();
-        }
-        let client = builder
-            .build()
-            .map_err(|e| LlmError::Http(format!("client build: {e}")))?;
         Ok(Self {
-            base_url: base_url.trim_end_matches('/').to_owned(),
             model: model.to_owned(),
-            api_key,
-            timeout: Duration::from_secs(timeout_seconds),
-            max_retries,
-            client,
+            transport: HttpTransport::new(base_url, api_key_env, timeout_seconds, max_retries)?,
             thinking: ThinkingMode::Auto,
             thinking_effort: None,
             thinking_downgraded: AtomicBool::new(false),
@@ -124,56 +92,7 @@ impl OpenAiCompatibleProvider {
         path: &str,
         body: serde_json::Value,
     ) -> Result<reqwest::Response, LlmError> {
-        let url = format!("{}/{path}", self.base_url);
-        let mut attempt = 0u32;
-        loop {
-            let mut request = self.client.post(&url).json(&body);
-            if let Some(key) = &self.api_key {
-                request = request.bearer_auth(key);
-            }
-            let result = request.send().await;
-
-            match result {
-                Ok(response) => {
-                    let status = response.status();
-                    if status.is_success() {
-                        return Ok(response);
-                    }
-                    let retryable = status.as_u16() == 429 || status.is_server_error();
-                    if !retryable || attempt >= self.max_retries {
-                        let message = response.text().await.unwrap_or_default();
-                        return Err(LlmError::Api {
-                            code: status.as_u16(),
-                            message,
-                        });
-                    }
-                    let retry_after = response
-                        .headers()
-                        .get("retry-after")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|v| v.parse::<u64>().ok());
-                    if let Some(seconds) = retry_after {
-                        tokio::time::sleep(Duration::from_secs(seconds.min(30))).await;
-                    } else {
-                        backoff(attempt).await;
-                    }
-                }
-                Err(err) => {
-                    let is_timeout = err.is_timeout();
-                    if attempt >= self.max_retries {
-                        return Err(if is_timeout {
-                            LlmError::Timeout {
-                                timeout_seconds: self.timeout.as_secs(),
-                            }
-                        } else {
-                            LlmError::Http(err.to_string())
-                        });
-                    }
-                    backoff(attempt).await;
-                }
-            }
-            attempt += 1;
-        }
+        self.transport.post(path, &body).await
     }
 }
 
@@ -211,11 +130,6 @@ fn strip_thinking_params(body: &mut serde_json::Value) {
         obj.remove("thinking");
         obj.remove("reasoning_effort");
     }
-}
-
-async fn backoff(attempt: u32) {
-    let millis = 500u64 * (1u64 << attempt.min(4));
-    tokio::time::sleep(Duration::from_millis(millis)).await;
 }
 
 #[async_trait]
@@ -319,118 +233,20 @@ impl LlmProvider for OpenAiCompatibleProvider {
     }
 }
 
-/// §19.3 Vector layer: batch embeddings over the same endpoint family
-/// (`POST {base_url}/embeddings`), reusing the transport's auth and
-/// 429/5xx backoff. The provider returns `data[]` in arbitrary order —
-/// responses are re-sorted by `index` so output order == input order.
+/// §19.3 Vector layer: the chat provider can double as an embedder on the
+/// SAME endpoint. Standalone embedding endpoints (`[embedding] base_url`)
+/// use [`crate::OpenAiCompatibleEmbeddings`] instead — both share the
+/// request/parse path in [`crate::embedding`].
 #[async_trait]
 impl crate::EmbeddingProvider for OpenAiCompatibleProvider {
     async fn embed(&self, model: &str, texts: &[String]) -> Result<Vec<Vec<f32>>, LlmError> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-        let body = serde_json::json!({ "model": model, "input": texts });
-        let response = self.send("embeddings", body).await?;
-        let payload: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| LlmError::InvalidResponse(format!("embeddings body is not JSON: {e}")))?;
-        let mut entries: Vec<(u64, Vec<f32>)> = payload
-            .get("data")
-            .and_then(|data| data.as_array())
-            .ok_or_else(|| {
-                LlmError::InvalidResponse("embeddings response missing data[]".to_owned())
-            })?
-            .iter()
-            .map(|entry| {
-                let index = entry
-                    .get("index")
-                    .and_then(|value| value.as_u64())
-                    .ok_or_else(|| {
-                        LlmError::InvalidResponse("embeddings entry missing index".to_owned())
-                    })?;
-                let vector = entry
-                    .get("embedding")
-                    .and_then(|value| value.as_array())
-                    .ok_or_else(|| {
-                        LlmError::InvalidResponse("embeddings entry missing embedding[]".to_owned())
-                    })?
-                    .iter()
-                    .map(|value| {
-                        value.as_f64().map(|number| number as f32).ok_or_else(|| {
-                            LlmError::InvalidResponse(
-                                "embeddings entry holds a non-numeric value".to_owned(),
-                            )
-                        })
-                    })
-                    .collect::<Result<Vec<f32>, LlmError>>()?;
-                Ok((index, vector))
-            })
-            .collect::<Result<Vec<(u64, Vec<f32>)>, LlmError>>()?;
-        entries.sort_by_key(|(index, _)| *index);
-        if entries.len() != texts.len() {
-            return Err(LlmError::InvalidResponse(format!(
-                "embeddings returned {} vectors for {} inputs",
-                entries.len(),
-                texts.len()
-            )));
-        }
-        Ok(entries.into_iter().map(|(_, vector)| vector).collect())
+        crate::embedding::post_embeddings(&self.transport, model, texts).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// §19.3: the embeddings endpoint contract — batch in, vectors out in
-    /// INPUT order (the provider returns data[] unordered; we sort by index).
-    #[tokio::test]
-    async fn embeddings_batch_returns_vectors_in_input_order() {
-        use std::io::{Read, Write};
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = vec![0u8; 65536];
-            let n = stream.read(&mut buf).unwrap();
-            let raw = String::from_utf8_lossy(&buf[..n]).into_owned();
-            assert!(raw.contains("/embeddings"), "hits the embeddings path");
-            assert!(raw.contains("\"input\":[\"b\",\"a\"]"), "batch body: {raw}");
-            // data[] deliberately OUT of input order; index field sorts it.
-            let body = r#"{"data":[
-                {"index":1,"embedding":[0.4,0.5]},
-                {"index":0,"embedding":[0.1,0.2]}
-            ]}"#;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-            stream.flush().unwrap();
-        });
-
-        let provider: std::sync::Arc<dyn crate::EmbeddingProvider> = std::sync::Arc::new(
-            OpenAiCompatibleProvider::new(
-                &format!("http://127.0.0.1:{port}"),
-                "m",
-                "UNUSED_VAR",
-                10,
-                0,
-            )
-            .unwrap(),
-        );
-        let vectors = provider
-            .embed("emb-model", &["b".to_owned(), "a".to_owned()])
-            .await
-            .unwrap();
-        assert_eq!(vectors.len(), 2);
-        assert_eq!(vectors[0], vec![0.1, 0.2], "input order, not data order");
-        assert_eq!(vectors[1], vec![0.4, 0.5]);
-        server.join().unwrap();
-    }
 
     #[test]
     fn thinking_params_apply_and_strip() {

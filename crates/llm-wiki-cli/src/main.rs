@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
 
 use llm_wiki_core::config::{lexical_absolute, Config, LlmConfig};
 use llm_wiki_core::error::WikiError;
-use llm_wiki_llm::OpenAiCompatibleProvider;
+use llm_wiki_llm::{OpenAiCompatibleEmbeddings, OpenAiCompatibleProvider};
 use llm_wiki_search::FullTextSearch;
 use llm_wiki_source::{ScanDiagnostic, Scanner, SourceManifest};
 
@@ -214,6 +214,27 @@ max_output_tokens = 4096
 max_concurrency = 4
 timeout_seconds = 120
 
+# Chat, embedding and rerank may live at THREE different providers: every
+# empty/0 field below inherits the [llm] value, so fill in only what
+# differs (a different base_url, API key env, model or timeout).
+
+[embedding]
+# provider = "openai-compatible"
+# base_url = "https://embeddings.example.com/v1"
+# api_key_env = "LLM_WIKI_EMBEDDING_API_KEY"
+# Model for hybrid retrieval / `llm-wiki embed` (falls back to the
+# --embedding-model flag or $LLM_WIKI_EMBEDDING_MODEL).
+# model = ""
+# timeout_seconds = 0
+
+# Used when [search] rerank = "cohere-compatible" (Cohere/Jina-style
+# POST {base_url}/rerank — vLLM, Jina, SiliconFlow, Voyage, …).
+[rerank]
+# base_url = "https://rerank.example.com/v1"
+# api_key_env = "LLM_WIKI_RERANK_API_KEY"
+# model = ""
+# timeout_seconds = 0
+
 [analysis]
 max_input_tokens = 32000
 section_target_tokens = 6000
@@ -224,8 +245,9 @@ max_rejected_claim_ratio = 0.10
 full_text = true
 vector = false
 graph = true
-# Rerank strategy applied after rank fusion (V0.5); "none" keeps the
-# deterministic fused order.
+# Rerank strategy applied after rank fusion (V0.5): "none" keeps the
+# deterministic fused order; "cohere-compatible" calls the endpoint from
+# the [rerank] section.
 rerank = "none"
 
 [build]
@@ -597,43 +619,45 @@ fn warn_diagnostic(diagnostic: &ScanDiagnostic) {
     );
 }
 
-/// Resolves the embedding model: flag → $LLM_WIKI_EMBEDDING_MODEL → error.
-fn embedding_model(flag: Option<&str>) -> Result<String, WikiError> {
+/// Resolves the embedding model: flag → $LLM_WIKI_EMBEDDING_MODEL →
+/// `[embedding] model` → error (explicit args beat env beats project config).
+fn embedding_model(flag: Option<&str>, config: &Config) -> Result<String, WikiError> {
+    let from_config = config.embedding.model.trim();
     flag.map(str::to_owned)
         .or_else(|| std::env::var("LLM_WIKI_EMBEDDING_MODEL").ok())
         .filter(|model| !model.trim().is_empty())
+        .or_else(|| {
+            (!from_config.is_empty()).then(|| from_config.to_owned())
+        })
         .ok_or_else(|| {
             WikiError::Config(
-                "no embedding model: pass --embedding-model <model> or set LLM_WIKI_EMBEDDING_MODEL"
+                "no embedding model: pass --embedding-model <model>, set LLM_WIKI_EMBEDDING_MODEL, or set [embedding] model in .llm-wiki/config.toml"
                     .into(),
             )
         })
 }
 
-/// Builds an embedding provider over the same endpoint family as the chat
-/// provider (base URL + API key env come from `[llm]` config).
+/// Builds an embedding provider from the `[embedding]` config section —
+/// empty fields inherit `[llm]`, so the embedding model may live at its own
+/// provider (own base_url / API key / timeout) without reconfiguring chat.
 fn build_embedding_provider(
-    llm: &LlmConfig,
+    config: &Config,
 ) -> Result<Arc<dyn llm_wiki_llm::EmbeddingProvider>, WikiError> {
-    if llm.model.trim().is_empty() {
-        return Err(WikiError::Config(
-            "llm.model must be set in .llm-wiki/config.toml before building".into(),
-        ));
-    }
-    match llm.provider.as_str() {
+    let llm = &config.llm;
+    let endpoint = config.embedding.endpoint(llm);
+    match config.embedding.resolved_provider(llm) {
         "openai-compatible" => {
-            let provider = OpenAiCompatibleProvider::new(
-                &llm.base_url,
-                &llm.model,
-                &llm.api_key_env,
-                llm.timeout_seconds,
+            let provider = OpenAiCompatibleEmbeddings::new(
+                &endpoint.base_url,
+                &endpoint.api_key_env,
+                endpoint.timeout_seconds,
                 2,
             )
             .map_err(|e| WikiError::Llm(e.to_string()))?;
             Ok(Arc::new(provider))
         }
         other => Err(WikiError::Config(format!(
-            "unsupported llm.provider '{other}' (supported: openai-compatible)"
+            "unsupported embedding.provider '{other}' (supported: openai-compatible)"
         ))),
     }
 }
@@ -656,12 +680,12 @@ fn ask(
         .map_err(|e| WikiError::Llm(format!("cannot start async runtime: {e}")))?;
     // Owned bindings so the HybridContext borrow outlives the call.
     let embedding_provider = if hybrid {
-        Some(build_embedding_provider(&config.llm)?)
+        Some(build_embedding_provider(&config)?)
     } else {
         None
     };
     let hybrid_context = if hybrid {
-        let model = embedding_model(embedding_model_flag.as_deref())?;
+        let model = embedding_model(embedding_model_flag.as_deref(), &config)?;
         Some(llm_wiki_compiler::HybridContext {
             provider: embedding_provider.as_ref().expect("checked above"),
             model,
@@ -698,8 +722,8 @@ fn ask(
 /// `llm-wiki embed` (§19.3): incremental embedding backfill.
 fn embed(workspace: &Path, model: Option<&str>, batch: usize) -> Result<(), WikiError> {
     let config = load_config(workspace)?;
-    let model = embedding_model(model)?;
-    let embedding_provider = build_embedding_provider(&config.llm)?;
+    let model = embedding_model(model, &config)?;
+    let embedding_provider = build_embedding_provider(&config)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

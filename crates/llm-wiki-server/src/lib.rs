@@ -19,6 +19,7 @@
 pub mod error;
 pub mod jobs;
 pub mod middleware;
+pub mod rerank;
 pub mod routes;
 pub mod state;
 

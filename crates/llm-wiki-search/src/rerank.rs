@@ -6,7 +6,7 @@
 //! and correct; concrete rerankers (LLM-judged, cross-encoder, …) plug in
 //! behind the trait without touching retrieval code.
 
-use llm_wiki_core::error::{Result, WikiError};
+use llm_wiki_core::error::Result;
 
 use crate::SearchHit;
 
@@ -54,17 +54,6 @@ impl Reranker for NoopReranker {
             item.score = item.fused_score;
         }
         Ok(items)
-    }
-}
-
-/// Resolves the `[search] rerank` strategy (PRD §32): `"none"` → no reranker;
-/// anything else is a config error until a concrete strategy ships.
-pub fn reranker_from_config(strategy: &str) -> Result<Option<Box<dyn Reranker>>> {
-    match strategy {
-        "none" => Ok(None),
-        other => Err(WikiError::Config(format!(
-            "unsupported search.rerank strategy '{other}' (supported: none)"
-        ))),
     }
 }
 
@@ -176,18 +165,5 @@ mod tests {
         // Without a reranker the input order survives untouched.
         let hits = vec![hit("first", 3.0), hit("second", 2.0)];
         assert_eq!(rerank_search_hits("q", hits, None).unwrap().len(), 2);
-    }
-
-    #[test]
-    fn config_strategy_resolves_none_and_rejects_unknown() {
-        assert!(reranker_from_config("none").unwrap().is_none());
-        let err = match reranker_from_config("cross-encoder") {
-            Err(err) => err,
-            Ok(_) => panic!("expected a config error for an unknown rerank strategy"),
-        };
-        assert!(
-            err.to_string().contains("unsupported search.rerank"),
-            "{err}"
-        );
     }
 }

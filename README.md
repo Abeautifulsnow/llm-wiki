@@ -82,6 +82,37 @@ models (deepseek-style) burn reasoning tokens from the request output budget:
 raise `[llm] max_output_tokens` (e.g. 32768) or analysis fails with
 `NO_JSON` before any visible output.
 
+### Separate providers for chat / embedding / rerank
+
+The three model families don't have to share a provider. `[embedding]` and
+`[rerank]` carry their own `base_url` / `api_key_env` / `model` /
+`timeout_seconds`; every field left empty inherits the `[llm]` value, so
+fill in only what differs:
+
+```toml
+[llm]
+base_url = "https://chat.example.com/v1"
+model = "gpt-x"
+api_key_env = "LLM_WIKI_API_KEY"
+
+[embedding]                          # hybrid retrieval / `llm-wiki embed`
+base_url = "https://embeddings.example.com/v1"
+api_key_env = "LLM_WIKI_EMBEDDING_API_KEY"
+model = "bge-m3"                     # or --embedding-model / $LLM_WIKI_EMBEDDING_MODEL
+
+[search]
+vector = true
+rerank = "cohere-compatible"         # Cohere/Jina-style POST {base_url}/rerank
+
+[rerank]                             # vLLM / Jina / SiliconFlow / Voyage / Cohere
+base_url = "https://rerank.example.com/v1"
+api_key_env = "LLM_WIKI_RERANK_API_KEY"
+model = "bge-reranker-v2-m3"
+```
+
+API keys always come from the environment variable *named* in config —
+never from the config file itself.
+
 ## Development
 
 ```bash

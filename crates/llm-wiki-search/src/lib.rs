@@ -25,9 +25,7 @@ pub use context::{
     context_section_hash, context_section_text, AssembledContext, ContextBudget, ContextChunk,
     ContextNeighbor, ContextSection, VectorCandidate,
 };
-pub use rerank::{
-    rerank_search_hits, reranker_from_config, NoopReranker, RerankCandidate, Reranker,
-};
+pub use rerank::{rerank_search_hits, NoopReranker, RerankCandidate, Reranker};
 
 /// Marks crate purpose.
 pub const V0_2_SCOPE: &str = "FTS with language-aware analyzers, rank fusion, graph expansion";

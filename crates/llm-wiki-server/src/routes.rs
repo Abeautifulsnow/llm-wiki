@@ -19,9 +19,7 @@ use axum::Extension;
 use llm_wiki_core::cancel::CancelFlag;
 use llm_wiki_core::ids::{InsightId, JobId};
 use llm_wiki_llm::LlmProvider;
-use llm_wiki_search::{
-    rerank_search_hits, reranker_from_config, FullTextSearch, SqliteFullTextSearch,
-};
+use llm_wiki_search::{rerank_search_hits, FullTextSearch, SqliteFullTextSearch};
 use llm_wiki_storage::{
     count_jobs_by_status, count_sources, finish_job, get_active_build_id,
     get_job as storage_get_job, get_job_by_idempotency_key, insert_job, insight_exists,
@@ -32,6 +30,7 @@ use llm_wiki_storage::{
 use crate::error::ApiError;
 use crate::jobs::spawn_build_job;
 use crate::middleware::RequestId;
+use crate::rerank::api_reranker_from_config;
 use crate::state::{ActiveJob, SharedState};
 use crate::PROTOCOL_VERSION;
 
@@ -421,7 +420,7 @@ pub async fn search(
         return Err(ApiError::bad_request("query must not be empty"));
     }
     let limit = request.limit.unwrap_or(10).clamp(1, 50);
-    let reranker = reranker_from_config(&state.config().search.rerank)?;
+    let reranker = api_reranker_from_config(state.config())?;
 
     let path = state.db_path();
     let query = request.query.clone();
@@ -439,7 +438,19 @@ pub async fn search(
         .search(&query, limit + 1)
         .await
         .map_err(ApiError::from)?;
-    hits = rerank_search_hits(&query, hits, reranker.as_deref())?;
+    // The API-backed reranker blocks on HTTP: keep it off the async workers.
+    hits = match reranker {
+        None => hits,
+        Some(reranker) => {
+            let query = query.clone();
+            tokio::task::spawn_blocking(move || {
+                rerank_search_hits(&query, hits, Some(reranker.as_ref()))
+            })
+            .await
+            .map_err(|e| ApiError::internal(format!("task join: {e}")))?
+            .map_err(ApiError::from)?
+        }
+    };
     let truncated = hits.len() > limit;
     if truncated {
         hits.truncate(limit);
@@ -588,7 +599,7 @@ pub async fn context(
         return Err(ApiError::bad_request("query must not be empty"));
     }
     let budget = requested_budget(request.budget.as_ref());
-    let reranker = reranker_from_config(&state.config().search.rerank)?;
+    let reranker = api_reranker_from_config(state.config())?;
 
     let vector = if request.hybrid {
         vector_candidates_for(&state, &request.query).await?
@@ -750,8 +761,10 @@ pub async fn query(
 }
 
 /// Resolves the embedding provider + model for `hybrid` requests (same rules
-/// as the CLI: `[llm]` endpoint family, `--embedding-model` override, then
-/// `LLM_WIKI_EMBEDDING_MODEL`). Returns the owning Arc so the caller can hold
+/// as the CLI: `[embedding]` section — empty fields inherit `[llm]`, so the
+/// embedding model may live at its own provider; then the request's
+/// `embedding_model` override, `LLM_WIKI_EMBEDDING_MODEL`, and
+/// `[embedding] model`). Returns the owning Arc so the caller can hold
 /// it across the await.
 fn hybrid_context(
     state: &SharedState,
@@ -762,35 +775,34 @@ fn hybrid_context(
         .map(str::to_owned)
         .or_else(|| std::env::var("LLM_WIKI_EMBEDDING_MODEL").ok())
         .filter(|m| !m.trim().is_empty())
+        .or_else(|| {
+            let configured = config.embedding.model.trim();
+            (!configured.is_empty()).then(|| configured.to_owned())
+        })
         .ok_or_else(|| {
             ApiError::bad_request(
-                "hybrid retrieval needs an embedding model: pass embedding_model or set LLM_WIKI_EMBEDDING_MODEL",
+                "hybrid retrieval needs an embedding model: pass embedding_model, set LLM_WIKI_EMBEDDING_MODEL, or set [embedding] model",
             )
         })?;
     // An injected provider (tests / embedders) wins over the config-derived
-    // one; the config check below still guards the model name.
+    // one; the model resolution above still guards the model name.
     if let Some(injected) = state.0.embedding.clone() {
         return Ok((injected, model));
     }
-    if config.llm.model.trim().is_empty() {
-        return Err(ApiError::bad_request(
-            "llm.model must be configured before hybrid retrieval",
-        ));
-    }
-    let provider = match config.llm.provider.as_str() {
+    let endpoint = config.embedding.endpoint(&config.llm);
+    let provider = match config.embedding.resolved_provider(&config.llm) {
         "openai-compatible" => Arc::new(
-            llm_wiki_llm::OpenAiCompatibleProvider::new(
-                &config.llm.base_url,
-                &config.llm.model,
-                &config.llm.api_key_env,
-                config.llm.timeout_seconds,
+            llm_wiki_llm::OpenAiCompatibleEmbeddings::new(
+                &endpoint.base_url,
+                &endpoint.api_key_env,
+                endpoint.timeout_seconds,
                 2,
             )
             .map_err(|e| ApiError::bad_request(format!("embedding provider init failed: {e}")))?,
         ),
         other => {
             return Err(ApiError::bad_request(format!(
-                "unsupported llm.provider '{other}'"
+                "unsupported embedding.provider '{other}'"
             )));
         }
     };
