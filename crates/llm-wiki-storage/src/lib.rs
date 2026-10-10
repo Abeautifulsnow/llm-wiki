@@ -36,8 +36,8 @@ pub use builds::{
 };
 pub use cache::{count_cache_entries, get_cached_response, put_cached_response, CacheRow};
 pub use chunks::{
-    rebuild_source_fts, replace_source_chunks, search_source_fts, ChunkInput, ReplaceStats,
-    SourceFtsHit,
+    carry_source_chunks, ensure_source_fts_matches_active, rebuild_source_fts,
+    replace_source_chunks, search_source_fts, ChunkInput, ReplaceStats, SourceFtsHit,
 };
 pub use connection::{open, open_in_memory, Connection};
 pub use decisions::{

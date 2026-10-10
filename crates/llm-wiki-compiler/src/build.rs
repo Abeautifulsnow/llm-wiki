@@ -30,18 +30,18 @@ use llm_wiki_core::ids::{BuildId, KnowledgeNodeId, SourceId, WikiPageId};
 use llm_wiki_core::matcher::{match_sections, PrevSection, SectionIdentity, SectionOutcome};
 use llm_wiki_core::model::{WikiPagePlan, WikiPlan};
 use llm_wiki_llm::LlmProvider;
-use llm_wiki_markdown::parse_document;
+use llm_wiki_markdown::{parse_document, split_section};
 use llm_wiki_source::{ScanDiagnostic, ScanOutput, Scanner, SourceManifest};
 use llm_wiki_storage::{
-    apply_section_matches, build_snapshot_hash, finish_build, generation_stats,
-    get_active_build_id, insert_plan_decision, latest_completed_build,
+    apply_section_matches, build_snapshot_hash, carry_source_chunks, finish_build,
+    generation_stats, get_active_build_id, insert_plan_decision, latest_completed_build,
     list_source_active_node_sections, list_sources, load_active_sections, load_generation_pages,
     load_generation_view, load_knowledge_base, load_plan_input, mark_removed,
-    mark_stale_builds_interrupted, open, persist_generation, retire_source_knowledge, start_build,
-    update_build_status, upsert_sources_batch, BuildDraft, GenerationPageView, GenerationStats,
-    PlanDecision, SourceRecord, SourceUpsert, WikiPageRecord, OUTCOME_FAST_PATH,
-    OUTCOME_LOCAL_UPDATE, OUTCOME_REPLAN_REQUIRED, TRIGGER_FINGERPRINT_CHANGED,
-    TRIGGER_STRUCTURAL_CHANGE,
+    mark_stale_builds_interrupted, open, persist_generation, replace_source_chunks,
+    retire_source_knowledge, start_build, update_build_status, upsert_sources_batch, BuildDraft,
+    ChunkInput, GenerationPageView, GenerationStats, PlanDecision, SourceRecord, SourceUpsert,
+    WikiPageRecord, OUTCOME_FAST_PATH, OUTCOME_LOCAL_UPDATE, OUTCOME_REPLAN_REQUIRED,
+    TRIGGER_FINGERPRINT_CHANGED, TRIGGER_STRUCTURAL_CHANGE,
 };
 
 use crate::analysis::{AnalysisOutcome, AnalyzedDocument, DocumentAnalyzer};
@@ -704,6 +704,28 @@ async fn compile_and_publish_incremental(
     // generation, pointer swap, previous generation intact on failure.
     // Critical section: no cancel checkpoints past this point. ----
     control.phase(conn, "INDEXING")?;
+    // EPIC A PR2 (the incremental-gap fix): only the changed sources were
+    // re-staged during analysis, but the publish-time activate transaction
+    // rebuilds `source_fts` from THIS build's staging rows only — without the
+    // carry, every unchanged source would silently vanish from the index.
+    // Changed (added+modified) and deleted sources are excluded: the former
+    // carry fresh rows, the latter never re-enter the new build.
+    let carry_exclude: Vec<SourceId> = change_set
+        .added
+        .iter()
+        .chain(change_set.modified.iter())
+        .chain(change_set.deleted.iter())
+        .cloned()
+        .collect();
+    {
+        let tx = conn
+            .transaction()
+            .map_err(|e| WikiError::Storage(format!("begin tx: {e}")))?;
+        let carried = carry_source_chunks(&tx, prev_build_id, build_id, &carry_exclude)?;
+        tx.commit()
+            .map_err(|e| WikiError::Storage(format!("commit carry_source_chunks: {e}")))?;
+        tracing::info!(build = %build_id, carried, "source chunks carried forward");
+    }
     let stats = persist_generation(conn, build_id, &new_pages)?;
     publish(
         conn,
@@ -1003,6 +1025,17 @@ async fn build_full_pipeline(
     let mut doc_inputs = Vec::with_capacity(parsed.len());
     for (file, source_id, parsed_doc) in &parsed {
         let sections = register_sections(conn, source_id, &parsed_doc.sections, Some(build_id))?;
+        // EPIC A PR2: the full build stages EVERY source, so the publish-time
+        // source_fts rebuild sees the complete corpus (no carry needed here).
+        write_source_chunks(
+            conn,
+            source_id,
+            build_id,
+            &file.rel_path,
+            Some(&parsed_doc.language),
+            &parsed_doc.sections,
+            config.analysis.section_target_tokens,
+        )?;
         doc_inputs.push(AnalyzedDocument {
             source_id: source_id.clone(),
             rel_path: file.rel_path.clone(),
@@ -1398,6 +1431,18 @@ async fn analyze_changed_sources(
             );
         }
         let sections = register_sections(conn, &source_id, &parsed_doc.sections, Some(build_id))?;
+        // EPIC A PR2: only the CHANGED sources re-stage here — the unchanged
+        // live sources are carried forward by the caller before publish, so
+        // the rebuilt source_fts keeps covering the whole corpus.
+        write_source_chunks(
+            conn,
+            &source_id,
+            build_id,
+            &file.rel_path,
+            Some(&parsed_doc.language),
+            &parsed_doc.sections,
+            config.analysis.section_target_tokens,
+        )?;
         doc_inputs.push(AnalyzedDocument {
             source_id: source_id.clone(),
             rel_path: file.rel_path.clone(),
@@ -1717,6 +1762,78 @@ pub(crate) fn normalized_rel_of(root: &Path, wiki_dir: &Path) -> Option<String> 
     })
 }
 
+/// One staged chunk with owned strings (the mapping buffer for
+/// [`write_source_chunks`], which borrows into `ChunkInput` afterwards).
+struct StagedChunk {
+    title: String,
+    heading_path: Vec<String>,
+    ordinal: usize,
+    range_start: usize,
+    range_end: usize,
+    body: String,
+}
+
+/// Stages the raw-source retrieval chunks for ONE parsed source (EPIC A PR2):
+/// every section is segmented at block boundaries with `split_section` (the
+/// SAME granularity the analyzer's units use, PRD §10) and written through
+/// `replace_source_chunks`. Hooked right after `register_sections` in all
+/// three pipelines — full build, incremental re-analysis, replan execute — so
+/// the build's staging set is complete before publish rebuilds `source_fts`
+/// inside the activate transaction. `locale` rides the parse product's
+/// detected language (parser.rs language detection; EPIC D consumes it).
+pub(crate) fn write_source_chunks(
+    conn: &mut rusqlite::Connection,
+    source_id: &SourceId,
+    build_id: &BuildId,
+    rel_path: &str,
+    locale: Option<&str>,
+    sections: &[llm_wiki_markdown::SectionOutput],
+    section_target_tokens: u32,
+) -> Result<()> {
+    // Same floor as the analyzer's unit packing (analysis::build_units).
+    let target = u64::from(section_target_tokens).max(64);
+    let mut staged: Vec<StagedChunk> = Vec::new();
+    for section in sections {
+        for segment in split_section(section, target) {
+            staged.push(StagedChunk {
+                // The leaf heading identifies the segment (PRD §1.2); a
+                // preamble section without headings indexes under an empty
+                // title (the column default) rather than being dropped.
+                title: section
+                    .heading_path
+                    .last()
+                    .cloned()
+                    .or_else(|| section.heading.clone())
+                    .unwrap_or_default(),
+                heading_path: section.heading_path.clone(),
+                ordinal: segment.ordinal,
+                range_start: segment.source_range.start,
+                range_end: segment.source_range.end,
+                body: segment.content,
+            });
+        }
+    }
+    let chunks: Vec<ChunkInput<'_>> = staged
+        .iter()
+        .map(|chunk| ChunkInput {
+            title: &chunk.title,
+            heading_path: &chunk.heading_path,
+            ordinal: chunk.ordinal,
+            range_start: chunk.range_start,
+            range_end: chunk.range_end,
+            body: &chunk.body,
+        })
+        .collect();
+    let stats = replace_source_chunks(conn, source_id, build_id, rel_path, locale, &chunks)?;
+    tracing::debug!(
+        source = %rel_path,
+        sections = sections.len(),
+        chunks = stats.written,
+        "source retrieval chunks staged"
+    );
+    Ok(())
+}
+
 pub(crate) fn warn_diagnostic(diagnostic: &ScanDiagnostic) {
     tracing::warn!(
         source = %diagnostic.rel_path,
@@ -1843,5 +1960,121 @@ mod tests {
             .find(|page| page.slug == "zeta")
             .expect("zeta in plan");
         assert_eq!(zeta_plan.related_pages, vec![alpha_id]);
+    }
+
+    /// EPIC A PR2: the staging helper segments oversized sections at block
+    /// boundaries, keys each chunk under its leaf heading, keeps per-section
+    /// ordinals, absolute offsets and the parse product's language — and a
+    /// repeat call replaces rather than duplicates.
+    #[test]
+    fn write_source_chunks_splits_sections_and_maps_columns() {
+        let mut conn = llm_wiki_storage::open_in_memory().unwrap();
+        let (source_id, _) = llm_wiki_storage::upsert_source(
+            &mut conn,
+            &llm_wiki_core::ids::SourceLocatorKey::compute("ws", "docs/a.md"),
+            "docs/a.md",
+            "hash",
+            1,
+            None,
+        )
+        .unwrap();
+        let build = start_build(&mut conn, &BuildDraft::default()).unwrap();
+
+        let para = "word ".repeat(60); // ~60 tokens, over the 40-token budget
+        let big = format!("{para}\n\n{para}\n");
+        let big_end = 100 + big.len();
+        let sections = vec![
+            llm_wiki_markdown::SectionOutput {
+                heading: Some("Intro".into()),
+                heading_level: 2,
+                heading_path: vec!["Doc".into(), "Intro".into()],
+                content: "small intro body".into(),
+                source_range: llm_wiki_core::model::SourceRange::new(0, 16),
+            },
+            llm_wiki_markdown::SectionOutput {
+                heading: Some("Deep".into()),
+                heading_level: 3,
+                heading_path: vec!["Doc".into(), "Deep".into()],
+                content: big,
+                source_range: llm_wiki_core::model::SourceRange::new(100, big_end),
+            },
+            // Preamble-style section without any heading: indexed with the
+            // empty title default, never dropped.
+            llm_wiki_markdown::SectionOutput {
+                heading: None,
+                heading_level: 0,
+                heading_path: Vec::new(),
+                content: "unheaded".into(),
+                source_range: llm_wiki_core::model::SourceRange::new(200, 208),
+            },
+        ];
+        write_source_chunks(
+            &mut conn,
+            &source_id,
+            &build,
+            "docs/a.md",
+            Some("zh-CN"),
+            &sections,
+            40,
+        )
+        .unwrap();
+
+        let rows = |conn: &rusqlite::Connection| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT title, heading_path_json, locale, ordinal, range_start, range_end, body
+                     FROM source_chunk_text WHERE build_id = ?1 ORDER BY chunk_id",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map(rusqlite::params![build.as_str()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                })
+                .unwrap();
+            rows.map(|row| row.unwrap()).collect::<Vec<_>>()
+        };
+        let staged = rows(&conn);
+        assert_eq!(staged.len(), 4, "1 + 2 (split) + 1 chunks");
+        // Small section: leaf heading as title, full heading path, ordinal 0.
+        assert_eq!(staged[0].0, "Intro");
+        assert_eq!(staged[0].1, r#"["Doc","Intro"]"#);
+        assert_eq!(staged[0].2.as_deref(), Some("zh-CN"));
+        assert_eq!(staged[0].3, 0);
+        assert_eq!((staged[0].4, staged[0].5), (0, 16));
+        // Oversized section split at the blank line: contiguous ranges inside
+        // the section, per-section ordinals, same leaf title/path.
+        assert_eq!(staged[1].0, "Deep");
+        assert_eq!(staged[1].3, 0);
+        assert!(staged[2].0 == "Deep" && staged[2].3 == 1);
+        assert_eq!(staged[1].1, staged[2].1, "split segments share the path");
+        assert!(
+            staged[1].4 >= 100 && staged[2].5 <= big_end as i64,
+            "absolute offsets stay inside the section range"
+        );
+        // Headingless section is staged, not dropped.
+        assert_eq!(staged[3].0, "");
+        assert_eq!(staged[3].6, "unheaded");
+
+        // Replace semantics: a second call for the same (source, build)
+        // swaps the rows instead of appending.
+        write_source_chunks(
+            &mut conn,
+            &source_id,
+            &build,
+            "docs/a.md",
+            Some("zh-CN"),
+            &sections[..1],
+            40,
+        )
+        .unwrap();
+        assert_eq!(rows(&conn).len(), 1);
     }
 }

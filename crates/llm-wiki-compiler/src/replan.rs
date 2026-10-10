@@ -27,19 +27,20 @@ use llm_wiki_llm::LlmProvider;
 use llm_wiki_markdown::parse_document;
 use llm_wiki_source::{ScanOutput, Scanner, SourceManifest};
 use llm_wiki_storage::{
-    finish_build, get_active_build_id, insert_page_id_maps, latest_completed_build,
-    list_recent_plan_decisions_by_outcome, list_sources, load_generation_pages,
-    load_generation_view, load_knowledge_base, load_plan_input, mark_removed,
-    mark_stale_builds_interrupted, open, persist_generation, retire_source_knowledge, start_build,
-    update_build_status, upsert_sources_batch, BuildDraft, GenerationPageView, PageIdMapRow,
-    SourceRecord, SourceUpsert, WikiPageRecord, MAP_KIND_KEEP, MAP_KIND_MERGE, MAP_KIND_RETIRE,
-    MAP_KIND_SPLIT, OUTCOME_REPLAN_DRY_RUN, OUTCOME_REPLAN_EXECUTED, OUTCOME_REPLAN_REQUIRED,
+    carry_source_chunks, finish_build, get_active_build_id, insert_page_id_maps,
+    latest_completed_build, list_recent_plan_decisions_by_outcome, list_sources,
+    load_generation_pages, load_generation_view, load_knowledge_base, load_plan_input,
+    mark_removed, mark_stale_builds_interrupted, open, persist_generation, retire_source_knowledge,
+    start_build, update_build_status, upsert_sources_batch, BuildDraft, GenerationPageView,
+    PageIdMapRow, SourceRecord, SourceUpsert, WikiPageRecord, MAP_KIND_KEEP, MAP_KIND_MERGE,
+    MAP_KIND_RETIRE, MAP_KIND_SPLIT, OUTCOME_REPLAN_DRY_RUN, OUTCOME_REPLAN_EXECUTED,
+    OUTCOME_REPLAN_REQUIRED,
 };
 
 use crate::analysis::{AnalysisOutcome, AnalyzedDocument, DocumentAnalyzer};
 use crate::build::{
     normalized_rel_of, prepare_pipeline_env, record_decision, register_sections,
-    terminal_status_for, warn_diagnostic, PipelineEnv,
+    terminal_status_for, warn_diagnostic, write_source_chunks, PipelineEnv,
 };
 use crate::cache::plan_cache_identity;
 use crate::cache::CacheStats;
@@ -730,8 +731,20 @@ async fn replan_inner(
     // ---- Scan (§8) + §19.1 ChangeSet + §19.3 deletions + registry upsert:
     // identical machinery to `build`, so cache keys and the knowledge state
     // agree across the two commands (PRD §28). ----
-    let (output, file_outcomes, _deleted_ids, upserted, sources) =
+    let (output, file_outcomes, deleted_ids, upserted, sources) =
         replan_sync_sources(conn, root, wiki_dir, build_id, env, config)?;
+
+    // EPIC A PR2: sources whose chunk rows this replan rewrites (added +
+    // modified) or retires (deleted) — `carry_source_chunks` excludes them so
+    // the publish-time source_fts rebuild serves exactly this build's rows.
+    let mut carry_exclude: std::collections::BTreeSet<SourceId> =
+        deleted_ids.iter().cloned().collect();
+    for (outcome, (source_id, _created)) in file_outcomes.iter().zip(&upserted) {
+        if matches!(outcome, FileOutcome::Added | FileOutcome::Modified(_)) {
+            carry_exclude.insert(source_id.clone());
+        }
+    }
+    let carry_exclude: Vec<SourceId> = carry_exclude.into_iter().collect();
 
     // ---- Selective re-analysis (§19.2): added + modified sources only, so
     // the fresh plan reflects current knowledge. ----
@@ -859,6 +872,7 @@ async fn replan_inner(
         tables,
         knowledge_loss_warnings,
         recovery_note,
+        carry_exclude,
     )
     .await
 }
@@ -882,6 +896,7 @@ async fn replan_execute(
     tables: ReplanTables,
     knowledge_loss_warnings: Vec<String>,
     recovery_note: Option<String>,
+    carry_exclude: Vec<SourceId>,
 ) -> Result<ReplanReport> {
     let new_kb = load_knowledge_base(conn)?;
     let (remapped_plan, recompile) = replan_remap_plan(&diff, plan);
@@ -948,6 +963,19 @@ async fn replan_execute(
 
     // Index (§31) + stable page-identity rows (§45) + publish (§35).
     update_build_status(conn, build_id, "INDEXING")?;
+    // EPIC A PR2: same carry contract as the incremental build — only the
+    // changed sources re-staged during analysis; the rest copy forward from
+    // the active build so the publish-time source_fts rebuild (inside the
+    // activate transaction) keeps them searchable.
+    {
+        let tx = conn
+            .transaction()
+            .map_err(|e| WikiError::Storage(format!("begin tx: {e}")))?;
+        let carried = carry_source_chunks(&tx, active_build, build_id, &carry_exclude)?;
+        tx.commit()
+            .map_err(|e| WikiError::Storage(format!("commit carry_source_chunks: {e}")))?;
+        tracing::info!(build = %build_id, carried, "source chunks carried forward");
+    }
     let stats = persist_generation(conn, build_id, &new_pages)?;
 
     // page_id_map (§45): written AFTER persist_generation so successor
@@ -1367,6 +1395,20 @@ async fn replan_analyze_pending(
     let mut doc_inputs = Vec::with_capacity(parsed.len());
     for (file, source_id, parsed_doc) in &parsed {
         let sections = register_sections(conn, source_id, &parsed_doc.sections, build_id)?;
+        // EPIC A PR2: the execute build stages the changed sources' retrieval
+        // chunks here (the unchanged ones carry forward before publish); a
+        // dry-run owns NO build artifacts and stages nothing.
+        if let Some(build_id) = build_id {
+            write_source_chunks(
+                conn,
+                source_id,
+                build_id,
+                &file.rel_path,
+                Some(&parsed_doc.language),
+                &parsed_doc.sections,
+                config.analysis.section_target_tokens,
+            )?;
+        }
         doc_inputs.push(AnalyzedDocument {
             source_id: source_id.clone(),
             rel_path: file.rel_path.clone(),

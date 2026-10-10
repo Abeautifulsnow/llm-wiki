@@ -986,3 +986,105 @@ async fn restored_source_reactivates_knowledge_and_replans_for_the_lost_page() {
         "the restored source's page is back in the visible generation"
     );
 }
+
+// ---------------------------------------------------------------------------
+// EPIC A PR2: the raw-source index survives incremental publishes
+// ---------------------------------------------------------------------------
+
+/// The PR2 gap regression (EPIC A PRD §2.1): an incremental build that changes
+/// exactly ONE source must leave EVERY unchanged source searchable through
+/// `search_source_fts` after publish. The publish-time activate transaction
+/// rebuilds `source_fts` from the ACTIVE build's staging rows only, so without
+/// the carry-forward of the unchanged sources' chunk rows this test is RED —
+/// the untouched content would silently vanish from the index.
+#[tokio::test]
+async fn incremental_publish_keeps_unchanged_sources_searchable_in_source_fts() {
+    let workspace = fixture_workspace("source-fts-carry");
+    let config = llm_wiki_core::config::Config::load(&workspace).unwrap();
+    let provider = incremental_llm();
+
+    let first = llm_wiki_compiler::run_build(&workspace, &config, provider.clone())
+        .await
+        .unwrap();
+    assert_eq!(first.pages, 2, "runtime + security pages");
+
+    // Modify ONE source (runtime.md); security.md stays byte-identical.
+    seed_runtime_doc(
+        &workspace,
+        "Events are delivered exactly once in v2 and handlers must stay idempotent.",
+    );
+    let config2 = llm_wiki_core::config::Config::load(&workspace).unwrap();
+    let second = llm_wiki_compiler::run_build(&workspace, &config2, provider)
+        .await
+        .unwrap();
+    let summary = second.incremental.expect("incremental summary present");
+    assert_eq!(summary.changed, 1, "exactly one source changed");
+    assert_eq!(summary.deleted, 0);
+
+    let conn = conn_of(&workspace);
+    assert_eq!(
+        get_active_build_id(&conn)
+            .unwrap()
+            .map(|b| b.as_str().to_owned()),
+        Some(second.build_id.as_str().to_owned()),
+        "the second build is active"
+    );
+
+    // THE invariant: the UNCHANGED source's content is still searchable, and
+    // every hit serves the ACTIVE build only.
+    let hits = llm_wiki_storage::search_source_fts(&conn, "immutable audit log", 10).unwrap();
+    assert!(
+        !hits.is_empty(),
+        "unchanged security.md content must remain searchable after an incremental publish"
+    );
+    let security_id: String = conn
+        .query_row(
+            "SELECT source_id FROM sources WHERE rel_path = 'guide/security.md'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        hits.iter()
+            .all(|hit| hit.build_id == second.build_id.as_str()),
+        "the source index serves the ACTIVE build only"
+    );
+    assert!(
+        hits.iter().any(|hit| hit.source_id.as_str() == security_id),
+        "the hit comes from the unchanged source itself"
+    );
+
+    // The modified source's NEW content is searchable through the same index.
+    let hits = llm_wiki_storage::search_source_fts(&conn, "exactly once in v2", 10).unwrap();
+    assert!(
+        !hits.is_empty(),
+        "the re-staged source's fresh content must be searchable"
+    );
+
+    // Staging completeness: the active build holds chunks for BOTH live
+    // sources (1 re-staged + 1 carried), and the previous build's staging is
+    // untouched (its lifecycle is EPIC H's concern).
+    let distinct: i64 = conn
+        .query_row(
+            "SELECT COUNT(DISTINCT source_id) FROM source_chunk_text WHERE build_id = ?1",
+            params![second.build_id.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        distinct, 2,
+        "the active build's staging covers every live source"
+    );
+    let stale: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM source_chunk_text WHERE build_id = ?1
+             AND source_id IN (SELECT source_id FROM sources WHERE rel_path = 'guide/security.md')",
+            params![first.build_id.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        stale > 0,
+        "the previous build's staging rows persist for EPIC H"
+    );
+}

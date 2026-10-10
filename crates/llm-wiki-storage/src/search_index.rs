@@ -490,8 +490,10 @@ fn insert_section_row(
 
 /// The §35 publish commit point (step 6) with the derived indexes joined in:
 /// ONE transaction switches `active_build_id` + marks the build COMPLETED,
-/// rebuilds the FTS index for the activated generation AND rebuilds the
-/// §17 Wiki Graph (`graph::rebuild_graph`). Any failure — including an
+/// rebuilds the FTS index for the activated generation, rebuilds the §17 Wiki
+/// Graph AND rebuilds the raw-source index (`chunks::rebuild_source_fts` —
+/// EPIC A PR2, FULLY for the activated build: staging is complete by then via
+/// the build-time writes + carry-forward). Any failure — including an
 /// FTS5-less SQLite — aborts the transaction, leaving the previous
 /// generation fully visible (PRD §35). The graph rebuild is deliberately
 /// NOT config-gated: `search.graph` gates query-side consumption only, the
@@ -507,16 +509,20 @@ pub fn activate_build_with_search_index(
     // The diff base is the CURRENT active generation, read before the swap:
     // the derived indexes move to the new state first (incrementally, audit
     // FIX-010/011 — O(changed), not O(total)), THEN the pointer flips, so the
-    // activation itself stays short (audit FIX-012).
+    // activation itself stays short (audit FIX-012). The source index is the
+    // deliberate exception: it rebuilds in full every publish (EPIC A PR2
+    // decision — the carry keeps staging correct; profiling waits for EPIC H).
     let prev_build = crate::state::get_active_build_id(&tx)?;
     let stats = update_search_index(&tx, prev_build.as_ref(), build_id, tokenizer)?;
     let graph_stats = crate::graph::update_graph(&tx, prev_build.as_ref(), build_id)?;
+    let source_fts_rows = crate::chunks::rebuild_source_fts(&tx, build_id)?;
     crate::state::activate_in_tx(&tx, build_id)?;
     tracing::debug!(
         nodes = graph_stats.nodes,
         edges = graph_stats.edges,
         skipped = graph_stats.skipped_edges,
-        "wiki graph updated with the activated generation"
+        source_chunks = source_fts_rows,
+        "wiki graph and source index updated with the activated generation"
     );
     tx.commit()
         .map_err(|e| WikiError::Storage(format!("commit activate_build: {e}")))?;
@@ -914,6 +920,98 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM wiki_page_text", [], |r| r.get(0))
             .unwrap();
         assert_eq!(rows, 0, "the index rebuild joined the aborted transaction");
+    }
+
+    /// EPIC A PR2: the raw-source index rebuild joins the SAME commit point —
+    /// an activation failure must leave `source_fts` serving the previous
+    /// state exactly like `wiki_fts`, never a half-flipped source index.
+    #[test]
+    fn source_fts_rebuild_joins_the_activation_transaction() {
+        let mut conn = open_in_memory().unwrap();
+        let (source_id, _) = crate::sources::upsert_source(
+            &mut conn,
+            &llm_wiki_core::ids::SourceLocatorKey::compute("ws", "a.md"),
+            "a.md",
+            "hash",
+            1,
+            None,
+        )
+        .unwrap();
+
+        // A previous build's source index exists and is searchable. (Staging
+        // needs no builds row; the ghost build below deliberately has none so
+        // activate_in_tx fails.)
+        let live = BuildId::generate();
+        crate::chunks::replace_source_chunks(
+            &mut conn,
+            &source_id,
+            &live,
+            "docs/a.md",
+            None,
+            &[crate::chunks::ChunkInput {
+                title: "Live",
+                heading_path: &[],
+                ordinal: 0,
+                range_start: 0,
+                range_end: 17,
+                body: "alpha legacy body",
+            }],
+        )
+        .unwrap();
+        crate::chunks::rebuild_source_fts(&conn, &live).unwrap();
+        assert_eq!(
+            crate::chunks::search_source_fts(&conn, "alpha", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // The ghost build would flip the source index to its own staging
+        // rows — but its activation fails, so the flip must roll back.
+        let ghost = BuildId::generate();
+        crate::chunks::replace_source_chunks(
+            &mut conn,
+            &source_id,
+            &ghost,
+            "docs/a.md",
+            None,
+            &[crate::chunks::ChunkInput {
+                title: "Ghost",
+                heading_path: &[],
+                ordinal: 0,
+                range_start: 0,
+                range_end: 15,
+                body: "ghost staging body",
+            }],
+        )
+        .unwrap();
+        persist(
+            &mut conn,
+            &ghost,
+            &[page("orphan", "Orphan", "# Orphan\n\norphan body")],
+        );
+
+        assert!(_activate(&mut conn, &ghost, default_tokenizer()).is_err());
+        assert!(get_active_build_id(&conn).unwrap().is_none());
+        // Sanity: the ghost staging rows existed, so the in-tx rebuild really
+        // had a full set to flip to before the rollback restored the old one.
+        let ghost_staged: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM source_chunk_text WHERE build_id = ?1",
+                params![ghost.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ghost_staged, 1);
+        assert!(
+            crate::chunks::search_source_fts(&conn, "ghost", 10)
+                .unwrap()
+                .is_empty(),
+            "the ghost index flip must not survive the failed activation"
+        );
+        let hits = crate::chunks::search_source_fts(&conn, "alpha", 10).unwrap();
+        assert_eq!(hits.len(), 1, "the aborted source rebuild rolled back");
+        assert_eq!(hits[0].build_id, live.as_str());
     }
 
     /// Audit FIX-010 acceptance: the incremental update path must land in

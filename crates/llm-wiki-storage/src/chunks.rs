@@ -18,12 +18,16 @@
 //! the same tokenizer behind a search-crate façade (dependency direction:
 //! search → storage; storage never depends on search).
 //!
-//! Publish integration (PR2): [`replace_source_chunks`] swaps one
-//! (source, build) staging pair atomically during the build; [`rebuild_source_fts`]
-//! takes `&Connection` so it can run INSIDE the §35 activate transaction,
-//! where a failure aborts the whole commit point. This module never touches
-//! `source_sections` (the Section Matcher registry) — the tables coexist by
-//! design (see the coexistence test below).
+//! Publish integration (PR2, wired): [`replace_source_chunks`] swaps one
+//! (source, build) staging pair atomically during the build; [`carry_source_chunks`]
+//! copies the UNCHANGED live sources' rows from the previous active build into
+//! the new one (the incremental and replan pipelines only re-stage changed
+//! sources — without the carry they would silently vanish from the rebuilt
+//! index); [`rebuild_source_fts`] and [`ensure_source_fts_matches_active`]
+//! take `&Connection`/own their transaction so the rebuild runs INSIDE the §35
+//! activate transaction, where a failure aborts the whole commit point. This
+//! module never touches `source_sections` (the Section Matcher registry) —
+//! the tables coexist by design (see the coexistence test below).
 
 use std::collections::BTreeSet;
 
@@ -121,6 +125,68 @@ pub fn replace_source_chunks(
     })
 }
 
+/// Copies the previous build's staging rows forward into `new_build_id` for
+/// every live source NOT in `exclude` (EPIC A PR2, the incremental-gap fix).
+/// The incremental and replan pipelines only re-stage CHANGED sources, while
+/// [`rebuild_source_fts`] indexes `build_id = new_build_id` rows only —
+/// without the carry, every unchanged source would silently disappear from
+/// the rebuilt index. `exclude` is added ∪ modified ∪ deleted: changed
+/// sources are re-staged by [`replace_source_chunks`], and deleted sources are
+/// never written, never carried (their rows simply do not re-enter the new
+/// build). One `INSERT … SELECT` copies ALL columns verbatim (locale,
+/// `canonical_url`, `product_version` included).
+///
+/// Idempotent: the carried set is delete-then-insert, so a repeated call
+/// (defensive build retry) never duplicates rows. Takes `&Connection` (PR1
+/// convention) — it joins the caller's transaction; call sites without an
+/// open transaction wrap it so the delete and the insert commit atomically.
+/// Returns the number of rows copied.
+pub fn carry_source_chunks(
+    conn: &Connection,
+    prev_build_id: &BuildId,
+    new_build_id: &BuildId,
+    exclude: &[SourceId],
+) -> Result<usize> {
+    // The NOT-IN predicate repeats for the defensive delete and the copy.
+    // The only interpolated SQL text is the `?` placeholder list — the ids
+    // themselves travel as bound parameters (spec §42).
+    let placeholders = vec!["?"; exclude.len()].join(", ");
+    let not_in = if exclude.is_empty() {
+        String::new()
+    } else {
+        format!(" AND source_id NOT IN ({placeholders})")
+    };
+    let exclude_ids: Vec<String> = exclude.iter().map(|id| id.as_str().to_owned()).collect();
+
+    // Rows this build carried on a previous attempt are removed first, so a
+    // retry lands on the same state instead of duplicating them.
+    let mut delete_params: Vec<&str> = vec![new_build_id.as_str()];
+    delete_params.extend(exclude_ids.iter().map(String::as_str));
+    conn.prepare(&format!(
+        "DELETE FROM source_chunk_text WHERE build_id = ?{not_in}"
+    ))
+    .map_err(|e| WikiError::Storage(format!("prepare carry delete: {e}")))?
+    .execute(rusqlite::params_from_iter(delete_params))
+    .map_err(db)?;
+
+    let mut insert_params: Vec<&str> = vec![new_build_id.as_str(), prev_build_id.as_str()];
+    insert_params.extend(exclude_ids.iter().map(String::as_str));
+    let copied = conn
+        .prepare(&format!(
+            "INSERT INTO source_chunk_text
+             (source_id, build_id, file_path, title, heading_path_json, locale,
+              ordinal, range_start, range_end, body, canonical_url, product_version)
+             SELECT source_id, ?, file_path, title, heading_path_json, locale,
+                    ordinal, range_start, range_end, body, canonical_url, product_version
+             FROM source_chunk_text
+             WHERE build_id = ?{not_in}"
+        ))
+        .map_err(|e| WikiError::Storage(format!("prepare carry insert: {e}")))?
+        .execute(rusqlite::params_from_iter(insert_params))
+        .map_err(db)?;
+    Ok(copied)
+}
+
 // ---------------------------------------------------------------------------
 // FTS rebuild (runs inside the publish / recovery transaction)
 // ---------------------------------------------------------------------------
@@ -182,6 +248,85 @@ pub fn rebuild_source_fts(conn: &Connection, active_build_id: &BuildId) -> Resul
         written += 1;
     }
     Ok(written)
+}
+
+/// Recovery-side parity check (PRD §1.3 of EPIC A PR2, the counterpart of
+/// `search_index::ensure_search_index_matches_active`): `source_fts` must
+/// cover exactly the ACTIVE build's `source_chunk_text` rows. A missing table
+/// or a row-count drift triggers [`rebuild_source_fts`] — the source index is
+/// deliberately rebuilt FULLY (no wiki-side hash-diff; the carry-forward keeps
+/// staging complete, so a full rebuild is correctness-equivalent). With
+/// nothing active, leftover rows are cleared so search reports the truth.
+/// Owns its transaction like the wiki-side check: the rebuild commits
+/// atomically or not at all. An FTS5-less runtime with an ACTIVE build fails
+/// loudly with `FTS5_UNAVAILABLE` (the probe in [`rebuild_source_fts`] is
+/// unconditional) — mirroring the wiki-side contract, never silent
+/// degradation; with nothing active the check is a no-op.
+pub fn ensure_source_fts_matches_active(conn: &mut Connection) -> Result<()> {
+    let Some(active) = crate::state::get_active_build_id(conn)? else {
+        if source_fts_exists(conn)? {
+            let rows: i64 = conn
+                .query_row("SELECT COUNT(*) FROM source_fts", [], |row| row.get(0))
+                .map_err(db)?;
+            if rows > 0 {
+                let tx = conn
+                    .transaction()
+                    .map_err(|e| WikiError::Storage(format!("begin tx: {e}")))?;
+                tx.execute("DELETE FROM source_fts", []).map_err(db)?;
+                tx.commit()
+                    .map_err(|e| WikiError::Storage(format!("commit clear source_fts: {e}")))?;
+                tracing::warn!("cleared source_fts: no build is active");
+            }
+        }
+        return Ok(());
+    };
+    let staged: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM source_chunk_text WHERE build_id = ?1",
+            params![active.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(db)?;
+    let indexed: Option<i64> = if source_fts_exists(conn)? {
+        Some(
+            conn.query_row("SELECT COUNT(*) FROM source_fts", [], |row| row.get(0))
+                .map_err(db)?,
+        )
+    } else {
+        None
+    };
+    // Count equality alone can pass a WRONG-build index (same row count, other
+    // build's content): consistency also requires every FTS row to map back to
+    // THIS build's staging rows (rebuild contract: fts rowid == chunk_id).
+    let foreign: i64 = if indexed.is_some() {
+        conn.query_row(
+            "SELECT COUNT(*) FROM source_fts WHERE rowid NOT IN
+             (SELECT chunk_id FROM source_chunk_text WHERE build_id = ?1)",
+            params![active.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(db)?
+    } else {
+        0
+    };
+    if indexed == Some(staged) && foreign == 0 {
+        return Ok(());
+    }
+    tracing::warn!(
+        build = %active,
+        staged,
+        indexed = indexed.unwrap_or_default(),
+        foreign,
+        "source_fts does not match the active build's staging rows; rebuilding"
+    );
+    let tx = conn
+        .transaction()
+        .map_err(|e| WikiError::Storage(format!("begin tx: {e}")))?;
+    let written = rebuild_source_fts(&tx, &active)?;
+    tx.commit()
+        .map_err(|e| WikiError::Storage(format!("commit source_fts rebuild: {e}")))?;
+    tracing::debug!(written, "source_fts rebuilt to the active build");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -336,6 +481,19 @@ mod tests {
             range_end: ordinal * 100 + body.len(),
             body,
         }
+    }
+
+    fn source(conn: &mut rusqlite::Connection, path: &str) -> SourceId {
+        crate::sources::upsert_source(
+            conn,
+            &llm_wiki_core::ids::SourceLocatorKey::compute("ws", path),
+            path,
+            "hash",
+            1,
+            None,
+        )
+        .unwrap()
+        .0
     }
 
     /// Applies the first `upto` migration scripts (1-based count) to a RAW
@@ -678,5 +836,196 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// PR2 incremental-gap fix: the carry copies the unchanged sources' rows
+    /// forward verbatim (every column), skips exclude (changed/deleted), and
+    /// is idempotent under a defensive retry.
+    #[test]
+    fn carry_source_chunks_copies_live_rows_verbatim_excludes_and_is_idempotent() {
+        let mut conn = open_in_memory().unwrap();
+        let s1 = source(&mut conn, "a.md");
+        let s2 = source(&mut conn, "b.md");
+        let s3 = source(&mut conn, "c.md");
+        let prev = start_build(&mut conn, &BuildDraft::default()).unwrap();
+        let next = start_build(&mut conn, &BuildDraft::default()).unwrap();
+
+        replace_source_chunks(
+            &mut conn,
+            &s1,
+            &prev,
+            "docs/a.md",
+            Some("zh"),
+            &[chunk("Alpha", "alpha unchanged 检查点 body", 0)],
+        )
+        .unwrap();
+        replace_source_chunks(
+            &mut conn,
+            &s2,
+            &prev,
+            "docs/b.md",
+            None,
+            &[chunk("Beta", "beta body", 0), chunk("Beta2", "second", 1)],
+        )
+        .unwrap();
+        replace_source_chunks(
+            &mut conn,
+            &s3,
+            &prev,
+            "docs/c.md",
+            Some("en"),
+            &[chunk("Gamma", "gamma body", 0)],
+        )
+        .unwrap();
+        // Forward-compat columns have no producer yet — set them by hand so
+        // the copy is proven to preserve them too.
+        conn.execute(
+            "UPDATE source_chunk_text SET canonical_url = 'https://example.test/a',
+             product_version = 'v1' WHERE source_id = ?1 AND build_id = ?2",
+            params![s1.as_str(), prev.as_str()],
+        )
+        .unwrap();
+
+        // The `next` build re-staged s2 (modified) and s3 left the workspace
+        // (deleted): both are excluded, only s1's rows carry forward.
+        replace_source_chunks(
+            &mut conn,
+            &s2,
+            &next,
+            "docs/b.md",
+            None,
+            &[chunk("Beta", "rewritten in next build", 0)],
+        )
+        .unwrap();
+        let exclude = vec![s2.clone(), s3.clone()];
+        let carried = carry_source_chunks(&conn, &prev, &next, &exclude).unwrap();
+        assert_eq!(carried, 1, "only the untouched source copies forward");
+
+        // Column fidelity: the carried row equals the prev row on EVERY column.
+        let column_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM source_chunk_text WHERE build_id = ?1",
+                params![next.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(column_count, 2, "1 carried + 1 re-staged row, never more");
+        let carried_pairs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM source_chunk_text prev
+                 JOIN source_chunk_text next
+                   ON next.source_id = prev.source_id AND next.ordinal = prev.ordinal
+                  AND next.build_id = ?2
+                 WHERE prev.build_id = ?1 AND prev.source_id = ?3",
+                params![prev.as_str(), next.as_str(), s1.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(carried_pairs, 1);
+        let mismatches: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM source_chunk_text prev
+                 JOIN source_chunk_text next
+                   ON next.source_id = prev.source_id AND next.ordinal = prev.ordinal
+                  AND next.build_id = ?1
+                 WHERE prev.build_id = ?2 AND prev.source_id = ?3
+                   AND (prev.file_path <> next.file_path
+                    OR prev.title <> next.title
+                    OR prev.heading_path_json <> next.heading_path_json
+                    OR prev.locale IS NOT next.locale
+                    OR prev.ordinal <> next.ordinal
+                    OR prev.range_start <> next.range_start
+                    OR prev.range_end <> next.range_end
+                    OR prev.body <> next.body
+                    OR prev.canonical_url IS NOT next.canonical_url
+                    OR prev.product_version IS NOT next.product_version)",
+                params![next.as_str(), prev.as_str(), s1.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(mismatches, 0, "carry must copy every column verbatim");
+
+        // Deleted source: never carried into the new build.
+        let deleted_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM source_chunk_text WHERE source_id = ?1 AND build_id = ?2",
+                params![s3.as_str(), next.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(deleted_rows, 0);
+
+        // Idempotent retry: same result, no duplicate rows; the re-staged
+        // source's rows are untouched by the carry.
+        let carried_again = carry_source_chunks(&conn, &prev, &next, &exclude).unwrap();
+        assert_eq!(carried_again, 1);
+        let column_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM source_chunk_text WHERE build_id = ?1",
+                params![next.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(column_count, 2, "a retry never duplicates rows");
+        let rewritten: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM source_chunk_text
+                 WHERE source_id = ?1 AND build_id = ?2 AND body = 'rewritten in next build'",
+                params![s2.as_str(), next.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rewritten, 1, "the re-staged source is not overwritten");
+    }
+
+    /// PR2 recovery parity: a drifted (or missing, or over-populated)
+    /// `source_fts` is repaired to exactly the ACTIVE build's staging rows;
+    /// a consistent index is a no-op; nothing active clears leftovers.
+    #[test]
+    fn ensure_source_fts_matches_active_repairs_drift_and_clears_without_active() {
+        let mut conn = open_in_memory().unwrap();
+        let s1 = source(&mut conn, "a.md");
+        let build_a = start_build(&mut conn, &BuildDraft::default()).unwrap();
+        let build_b = start_build(&mut conn, &BuildDraft::default()).unwrap();
+        replace_source_chunks(
+            &mut conn,
+            &s1,
+            &build_a,
+            "docs/a.md",
+            None,
+            &[chunk("Old", "alpha stale content", 0)],
+        )
+        .unwrap();
+        replace_source_chunks(
+            &mut conn,
+            &s1,
+            &build_b,
+            "docs/a.md",
+            Some("zh"),
+            &[chunk("New", "beta new 检查点 content", 0)],
+        )
+        .unwrap();
+        crate::state::activate_build(&mut conn, &build_b).unwrap();
+
+        // Stale index (built for the previous build): repaired on ensure.
+        rebuild_source_fts(&conn, &build_a).unwrap();
+        assert_eq!(search_source_fts(&conn, "alpha", 10).unwrap().len(), 1);
+        ensure_source_fts_matches_active(&mut conn).unwrap();
+        assert!(search_source_fts(&conn, "alpha", 10).unwrap().is_empty());
+        assert_eq!(search_source_fts(&conn, "beta", 10).unwrap().len(), 1);
+
+        // Missing table (e.g. wiped index): recreated and refilled.
+        conn.execute("DROP TABLE source_fts", []).unwrap();
+        ensure_source_fts_matches_active(&mut conn).unwrap();
+        assert_eq!(search_source_fts(&conn, "检查点", 10).unwrap().len(), 1);
+
+        // Consistent index: a no-op (idempotent).
+        ensure_source_fts_matches_active(&mut conn).unwrap();
+        assert_eq!(search_source_fts(&conn, "beta", 10).unwrap().len(), 1);
+
+        // Nothing active: leftover rows are cleared, not served.
+        crate::state::set_active_build(&mut conn, None).unwrap();
+        ensure_source_fts_matches_active(&mut conn).unwrap();
+        assert!(search_source_fts(&conn, "beta", 10).unwrap().is_empty());
     }
 }
