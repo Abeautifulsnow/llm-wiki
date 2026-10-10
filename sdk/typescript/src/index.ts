@@ -81,14 +81,54 @@ export interface JobRecord {
   finished_at: string | null;
 }
 
+/** Retrieval corpus modes (additive, protocol v1): the optional per-request
+ * override on search/context, echoed back by the server as the effective
+ * mode. Older servers ignore the request field and omit the echo. */
+export type SourceMode = "source" | "wiki" | "fusion";
+
+/** Per-side serving status (additive, protocol v1): why a corpus side did or
+ * did not serve. Degradation is visible, never silent. */
+export type ServedSide =
+  | "served"
+  | "not_published"
+  | "index_not_built"
+  | "no_matches"
+  | "disabled";
+
+export interface ServedSides {
+  wiki: ServedSide;
+  source: ServedSide;
+}
+
+/** Provenance of one raw-source evidence chunk (additive, protocol v1).
+ * Source hits NEVER carry page_id/slug — this locator is their identity. */
+export interface SourceRef {
+  source_id: string;
+  file_path: string;
+  heading_path: string[];
+  ordinal: number;
+  range_start: number;
+  range_end: number;
+}
+
 export interface SearchHit {
-  page_id: string;
-  slug: string;
+  /** Wiki hits only. Source hits carry `source_ref` instead and never expose
+   * page identity (protocol v1 containment rule). */
+  page_id?: string;
+  slug?: string;
   title: string;
   heading_path: string[];
   snippet: string;
   rank: number;
-  citation_count: number;
+  /** Wiki hits only. */
+  citation_count?: number;
+  /** Which corpus side produced this hit. Additive: absent on older servers
+   * (absent = wiki). */
+  evidence_kind?: "wiki" | "source";
+  /** Source hits only. */
+  source_ref?: SourceRef;
+  /** Source hits only: the chunk's source-relative path. */
+  file_path?: string;
 }
 
 export interface SearchResponse {
@@ -97,6 +137,10 @@ export interface SearchResponse {
   generation: string | null;
   hits: SearchHit[];
   truncated: boolean;
+  /** Additive: the EFFECTIVE retrieval mode (config default "wiki"). */
+  source_mode?: SourceMode;
+  /** Additive: per-side serving metadata. */
+  served?: ServedSides;
 }
 
 export interface ContextChunk {
@@ -106,6 +150,11 @@ export interface ContextChunk {
   snippet: string;
   score: number;
   sources: string[];
+  /** Which corpus side produced this chunk. Additive (protocol v1): absent
+   * on older servers (absent = wiki). Source chunks carry `source_ref` and
+   * no page identity — `slug` holds the file path there. */
+  evidence_kind?: "wiki" | "source";
+  source_ref?: SourceRef | null;
 }
 
 export interface ContextNeighbor {
@@ -133,6 +182,11 @@ export interface ContextResponse {
   estimated_tokens: number;
   dropped: number;
   truncated: boolean;
+  /** Additive (protocol v1): the effective retrieval mode. */
+  served_mode?: SourceMode;
+  /** Additive (protocol v1): per-side serving metadata; null for the legacy
+   * wiki-only path (it fails loudly instead of degrading). */
+  degraded?: ServedSides | null;
 }
 
 export interface QueryCitation {
@@ -201,14 +255,32 @@ export interface BuildAccepted {
   status: "queued";
 }
 
+/** Optional per-request retrieval overrides (additive, protocol v1). */
+export interface SearchOptions {
+  /** Which corpus to draw from; omit for the server's configured default
+   * (`search.source_mode`, itself defaulting to "wiki"). */
+  sourceMode?: SourceMode;
+}
+
+/** Optional per-request retrieval overrides (additive, protocol v1). */
+export interface ContextOptions {
+  /** Which corpus to draw from; omit for the server's configured default. */
+  sourceMode?: SourceMode;
+}
+
 // ---------------------------------------------------------------------------
 // The KnowledgeProvider
 // ---------------------------------------------------------------------------
 
 export interface KnowledgeProvider {
   status(): Promise<ServerStatus>;
-  search(query: string, limit?: number): Promise<SearchResponse>;
-  context(query: string, budget?: ContextBudget, hybrid?: boolean): Promise<ContextResponse>;
+  search(query: string, limit?: number, options?: SearchOptions): Promise<SearchResponse>;
+  context(
+    query: string,
+    budget?: ContextBudget,
+    hybrid?: boolean,
+    options?: ContextOptions,
+  ): Promise<ContextResponse>;
   ask(query: string, opts?: { writeBack?: boolean; hybrid?: boolean; embeddingModel?: string }): Promise<QueryResponse>;
   insights(limit?: number, cursor?: string): Promise<InsightsResponse>;
   pages(limit?: number, cursor?: string): Promise<PagesResponse>;
@@ -260,12 +332,26 @@ export class LlmWikiClient implements KnowledgeProvider {
     return this.get<ServerStatus>("/v1/status");
   }
 
-  async search(query: string, limit = 10): Promise<SearchResponse> {
-    return this.post<SearchResponse>("/v1/search", { query, limit });
+  async search(query: string, limit = 10, options?: SearchOptions): Promise<SearchResponse> {
+    return this.post<SearchResponse>("/v1/search", {
+      query,
+      limit,
+      source_mode: options?.sourceMode,
+    });
   }
 
-  async context(query: string, budget?: ContextBudget, hybrid = false): Promise<ContextResponse> {
-    return this.post<ContextResponse>("/v1/context", { query, budget, hybrid });
+  async context(
+    query: string,
+    budget?: ContextBudget,
+    hybrid = false,
+    options?: ContextOptions,
+  ): Promise<ContextResponse> {
+    return this.post<ContextResponse>("/v1/context", {
+      query,
+      budget,
+      hybrid,
+      source_mode: options?.sourceMode,
+    });
   }
 
   async ask(

@@ -17,8 +17,10 @@ use serde_json::json;
 use axum::Extension;
 
 use llm_wiki_core::cancel::CancelFlag;
+use llm_wiki_core::config::SearchSourceMode;
 use llm_wiki_core::ids::{InsightId, JobId};
 use llm_wiki_llm::LlmProvider;
+use llm_wiki_search::fusion::{self, Evidence};
 use llm_wiki_search::{rerank_search_hits, FullTextSearch, SqliteFullTextSearch};
 use llm_wiki_storage::{
     count_jobs_by_status, count_sources, finish_job, get_active_build_id,
@@ -405,11 +407,67 @@ fn cancel_running<'a>(
 pub struct SearchRequest {
     pub query: String,
     pub limit: Option<usize>,
+    /// Optional per-request retrieval corpus override (EPIC A PR4). Absent →
+    /// the configured `search.source_mode` (default `wiki`); an invalid value
+    /// fails deserialization → 400 invalid_request, never a panic.
+    pub source_mode: Option<SearchSourceMode>,
+}
+
+/// Resolves the effective retrieval mode: the per-request field wins, else
+/// the configured default (`search.source_mode`, default `wiki` — an
+/// unconfigured server keeps the exact pre-fusion protocol behavior).
+fn effective_source_mode(
+    request: Option<SearchSourceMode>,
+    configured: SearchSourceMode,
+) -> SearchSourceMode {
+    request.unwrap_or(configured)
+}
+
+/// Maps the config/protocol vocabulary onto the fusion engine's enum (the
+/// wire strings are identical; core cannot depend on the search crate, so
+/// the two enums mirror each other deliberately).
+fn fusion_mode(mode: SearchSourceMode) -> fusion::SourceMode {
+    match mode {
+        SearchSourceMode::Source => fusion::SourceMode::Source,
+        SearchSourceMode::Wiki => fusion::SourceMode::Wiki,
+        SearchSourceMode::Fusion => fusion::SourceMode::Fusion,
+    }
+}
+
+/// Distinct citation counts per page across the ACTIVE generation (the
+/// `citation_count` field of wiki hits). Extracted so both search paths and
+/// tests share one definition.
+fn citation_counts(
+    conn: &llm_wiki_storage::Connection,
+) -> llm_wiki_core::error::Result<BTreeMap<String, u32>> {
+    fn db_err(e: rusqlite::Error) -> llm_wiki_core::error::WikiError {
+        llm_wiki_core::error::WikiError::Storage(e.to_string())
+    }
+    let Some(active) = get_active_build_id(conn)? else {
+        return Ok(BTreeMap::new());
+    };
+    let mut stmt = conn
+        .prepare(
+            "SELECT page_id, COUNT(*) FROM page_citations \
+             WHERE page_id IN (SELECT page_id FROM wiki_pages WHERE build_id = ?1) \
+             GROUP BY page_id",
+        )
+        .map_err(db_err)?;
+    let mut rows = stmt.query([active.as_str()]).map_err(db_err)?;
+    let mut counts = BTreeMap::new();
+    while let Some(row) = rows.next().map_err(db_err)? {
+        let page_id: String = row.get(0).map_err(db_err)?;
+        let count: u32 = row.get(1).map_err(db_err)?;
+        counts.insert(page_id, count);
+    }
+    Ok(counts)
 }
 
 /// `POST /v1/search` (PRD §5.5): page/section hits — never answers. Returns
 /// the generation actually used, a truncation flag and per-hit citation
-/// counts.
+/// counts. EPIC A PR4: the optional `source_mode` field picks the corpus —
+/// `wiki` (default) keeps the legacy path field-for-field, `source`/`fusion`
+/// route through `fusion::retrieve` with visible per-side degradation.
 pub async fn search(
     State(state): State<SharedState>,
     Extension(request_id): Extension<RequestId>,
@@ -420,13 +478,32 @@ pub async fn search(
         return Err(ApiError::bad_request("query must not be empty"));
     }
     let limit = request.limit.unwrap_or(10).clamp(1, 50);
-    let reranker = api_reranker_from_config(state.config())?;
+    let mode = effective_source_mode(request.source_mode, state.config().search.source_mode);
+    let query = request.query;
+    if mode == SearchSourceMode::Wiki {
+        search_wiki(state, request_id, query, limit).await
+    } else {
+        search_fused(state, request_id, query, limit, mode).await
+    }
+}
 
-    let path = state.db_path();
-    let query = request.query.clone();
+/// The wiki-only search path — the pre-PR4 handler verbatim (FTS over the
+/// ACTIVE generation → optional API rerank → truncate), plus the additive
+/// `evidence_kind:"wiki"` hit marker and the top-level `source_mode`/`served`
+/// metadata. Nothing here degrades: no published generation stays a 404.
+///
+/// Length note: ~55 lines — FTS + rerank hop + serialization.
+async fn search_wiki(
+    state: SharedState,
+    request_id: RequestId,
+    query: String,
+    limit: usize,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let reranker = api_reranker_from_config(state.config())?;
     let full_text = state.config().search.full_text;
     // FTS + graph stay behind the blocking pool (the search crate's own
     // blocking hop needs a live runtime, which the async context provides).
+    let path = state.db_path();
     let conn = tokio::task::spawn_blocking(move || open(&path).map_err(ApiError::from))
         .await
         .map_err(|e| ApiError::internal(format!("task join: {e}")))?;
@@ -456,32 +533,17 @@ pub async fn search(
         hits.truncate(limit);
     }
 
-    let citation_counts = db(&state, |conn| {
-        fn db_err(e: rusqlite::Error) -> llm_wiki_core::error::WikiError {
-            llm_wiki_core::error::WikiError::Storage(e.to_string())
-        }
-        let Some(active) = get_active_build_id(conn)? else {
-            return Ok(BTreeMap::new());
-        };
-        let mut stmt = conn
-            .prepare(
-                "SELECT page_id, COUNT(*) FROM page_citations \
-                 WHERE page_id IN (SELECT page_id FROM wiki_pages WHERE build_id = ?1) \
-                 GROUP BY page_id",
-            )
-            .map_err(db_err)?;
-        let mut rows = stmt.query([active.as_str()]).map_err(db_err)?;
-        let mut counts = BTreeMap::new();
-        while let Some(row) = rows.next().map_err(db_err)? {
-            let page_id: String = row.get(0).map_err(db_err)?;
-            let count: u32 = row.get(1).map_err(db_err)?;
-            counts.insert(page_id, count);
-        }
-        Ok(counts)
-    })
-    .await?;
+    let citation_counts = db(&state, citation_counts).await?;
     let generation = db(&state, get_active_build_id).await?;
 
+    let served = fusion::ServedSides {
+        wiki: if hits.is_empty() {
+            fusion::SideStatus::NoMatches
+        } else {
+            fusion::SideStatus::Served
+        },
+        source: fusion::SideStatus::Disabled,
+    };
     let hits_json: Vec<serde_json::Value> = hits
         .iter()
         .map(|hit| {
@@ -493,6 +555,8 @@ pub async fn search(
                 "snippet": hit.snippet,
                 "rank": hit.rank,
                 "citation_count": citation_counts.get(hit.page_id.as_str()).copied().unwrap_or(0),
+                // EPIC A PR4 additive marker; the legacy fields are untouched.
+                "evidence_kind": "wiki",
             })
         })
         .collect();
@@ -500,6 +564,78 @@ pub async fn search(
         "protocol_version": PROTOCOL_VERSION,
         "request_id": request_id.0.as_str(),
         "generation": generation.as_ref().map(llm_wiki_core::ids::BuildId::as_str),
+        "source_mode": SearchSourceMode::Wiki,
+        "served": served,
+        "hits": hits_json,
+        "truncated": truncated,
+    })))
+}
+
+/// The `source`/`fusion` search path (EPIC A PR4): retrieval order is owned
+/// by `fusion::retrieve` (top-level RRF + exact-match protection) and is
+/// never re-sorted here; the reranker does not apply (it is a wiki-side
+/// feature — source-side reranking is EPIC G). Degradation is visible: both
+/// sides' statuses travel in `served`, including a never-built workspace
+/// (`200` + `not_published` instead of the wiki path's 404).
+///
+/// Length note: ~50 lines — one blocking fusion call + serialization.
+async fn search_fused(
+    state: SharedState,
+    request_id: RequestId,
+    query: String,
+    limit: usize,
+    mode: SearchSourceMode,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let path = state.db_path();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let conn = open(&path).map_err(ApiError::from)?;
+        let generation = get_active_build_id(&conn).map_err(ApiError::from)?;
+        // Over-fetch per side (the wiki path's limit+1 shape) so `truncated`
+        // stays honest after the top-level merge.
+        let fused = fusion::retrieve(&conn, &query, fusion_mode(mode), limit + 1)
+            .map_err(ApiError::from)?;
+        let counts = citation_counts(&conn).map_err(ApiError::from)?;
+        Ok::<_, ApiError>((generation, fused, counts))
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("task join: {e}")))??;
+    let (generation, fused, citation_counts) = outcome;
+
+    let truncated = fused.entries.len() > limit;
+    let hits_json: Vec<serde_json::Value> = fused
+        .entries
+        .iter()
+        .take(limit)
+        .map(|entry| match &entry.evidence {
+            Evidence::Wiki(wiki) => json!({
+                "page_id": wiki.page_id.as_str(),
+                "slug": wiki.slug,
+                "title": wiki.title,
+                "heading_path": wiki.heading_path,
+                "snippet": wiki.snippet,
+                "rank": wiki.rank,
+                "citation_count": citation_counts.get(wiki.page_id.as_str()).copied().unwrap_or(0),
+                "evidence_kind": "wiki",
+            }),
+            Evidence::Source(source) => json!({
+                // Containment rule (PR3/PR4): a source hit NEVER carries
+                // page_id/slug — its identity is the source_ref locator.
+                "evidence_kind": "source",
+                "source_ref": source.source_ref,
+                "file_path": source.source_ref.file_path,
+                "title": source.title,
+                "heading_path": source.source_ref.heading_path,
+                "snippet": source.snippet,
+                "rank": source.rank,
+            }),
+        })
+        .collect();
+    Ok(Json(json!({
+        "protocol_version": PROTOCOL_VERSION,
+        "request_id": request_id.0.as_str(),
+        "generation": generation.as_ref().map(llm_wiki_core::ids::BuildId::as_str),
+        "source_mode": mode,
+        "served": fused.served,
         "hits": hits_json,
         "truncated": truncated,
     })))
@@ -511,6 +647,11 @@ pub struct ContextRequest {
     #[serde(default)]
     pub hybrid: bool,
     pub budget: Option<ContextBudgetRequest>,
+    /// Optional per-request retrieval corpus override (EPIC A PR4). Absent →
+    /// the configured `search.source_mode` (default `wiki` — the legacy
+    /// builder, untouched); `source`/`fusion` route through the PR3 fused
+    /// retrieval with `per_side_limit = budget.max_chunks`.
+    pub source_mode: Option<SearchSourceMode>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -585,7 +726,10 @@ async fn vector_candidates_for(
 
 /// `POST /v1/context` (PRD §24/§30, the Agent-integration surface): the
 /// budgeted, diversity-aware retrieval bundle with citations and truncation
-/// transparency.
+/// transparency. EPIC A PR4: the optional `source_mode` field selects the
+/// corpus; the response fields themselves shipped additively in PR3
+/// (`evidence_kind`/`source_ref` per chunk, `served_mode`/`degraded` at the
+/// top level).
 ///
 /// Length note: ~85 lines — parse → budget/vector helpers → one blocking
 /// assembly call → serialization (incl. the PR3 additive pass-through
@@ -600,6 +744,7 @@ pub async fn context(
         return Err(ApiError::bad_request("query must not be empty"));
     }
     let budget = requested_budget(request.budget.as_ref());
+    let mode = effective_source_mode(request.source_mode, state.config().search.source_mode);
     let reranker = api_reranker_from_config(state.config())?;
 
     let vector = if request.hybrid {
@@ -613,12 +758,24 @@ pub async fn context(
     let assembled = tokio::task::spawn_blocking(move || {
         let conn = open(&path).map_err(ApiError::from)?;
         let generation = get_active_build_id(&conn).map_err(ApiError::from)?;
-        llm_wiki_search::build_context_with_reranker(
+        // Wiki mode keeps the legacy builder untouched (fused = None);
+        // source/fusion run the PR3 fused retrieval first, per-side limit =
+        // the chunk budget (PRD §1.2).
+        let fused = if mode == SearchSourceMode::Wiki {
+            None
+        } else {
+            Some(
+                fusion::retrieve(&conn, &query, fusion_mode(mode), budget.max_chunks)
+                    .map_err(ApiError::from)?,
+            )
+        };
+        llm_wiki_search::build_context_with_sources(
             &conn,
             &query,
             &budget,
             &vector,
             reranker.as_deref(),
+            fused.as_ref(),
         )
         .map(|assembled| (generation, assembled))
         .map_err(ApiError::from)
@@ -638,8 +795,9 @@ pub async fn context(
                 "snippet": chunk.snippet,
                 "score": chunk.score,
                 "sources": chunk.sources,
-                // EPIC A PR3 pass-through (additive response fields; no new
-                // request fields until PR4).
+                // EPIC A PR3 additive evidence fields; source chunks carry
+                // their locator in source_ref and NEVER page_id/slug (PR4
+                // wired the source_mode request field that selects them).
                 "evidence_kind": chunk.evidence_kind,
                 "source_ref": chunk.source_ref,
             })

@@ -838,3 +838,389 @@ async fn panicking_pipeline_releases_the_build_slot() {
     let (status, body) = post(app, "/v1/build", "{}", None).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
 }
+
+// ---------------------------------------------------------------------------
+// EPIC A PR4 — source_mode wiring + the additive evidence protocol
+// (contract tests for docs/agent-protocol.md "Retrieval source modes")
+// ---------------------------------------------------------------------------
+
+use llm_wiki_core::ids::SourceLocatorKey;
+use llm_wiki_storage::chunks::{replace_source_chunks, ChunkInput};
+use llm_wiki_storage::{activate_build_with_search_index, default_tokenizer, upsert_source};
+
+/// Seeds a generation with BOTH corpora live — a wiki page and a source chunk
+/// sharing one topic (the chunk carries every query token, so exact-match
+/// protection applies) — and flips the search indexes active. Mirrors the
+/// storage-level `dual_conn` fixture of llm-wiki-search.
+fn seed_fusion_generation(workspace: &std::path::Path) {
+    let db_path = workspace.join(".llm-wiki").join("state.db");
+    let mut conn = open(&db_path).unwrap();
+    let build_id = start_build(&mut conn, &llm_wiki_storage::BuildDraft::default()).unwrap();
+    let content = "# Streaming Guide\n\nThe scheduler retries failed tasks with checkpointing.\n";
+    let page = WikiPageRecord {
+        page_id: WikiPageId::generate(),
+        slug: "streaming-guide".into(),
+        title: "Streaming Guide".into(),
+        category: "concepts".into(),
+        language: "en".into(),
+        body_hash: sha256_hex(content.as_bytes()),
+        content: content.to_owned(),
+        knowledge_refs: Vec::new(),
+        citations: Vec::new(),
+        links: Vec::new(),
+    };
+    persist_generation(&mut conn, &build_id, &[page]).unwrap();
+
+    let locator = SourceLocatorKey::compute("ws", "docs/streaming.md");
+    let (source_id, _) =
+        upsert_source(&mut conn, &locator, "docs/streaming.md", "hash", 10, None).unwrap();
+    let heading = vec!["Guide".to_owned()];
+    let chunks = vec![ChunkInput {
+        title: "Streaming",
+        heading_path: &heading,
+        ordinal: 0,
+        range_start: 0,
+        range_end: 34,
+        body: "the scheduler retries failed tasks",
+    }];
+    replace_source_chunks(
+        &mut conn,
+        &source_id,
+        &build_id,
+        "docs/streaming.md",
+        None,
+        &chunks,
+    )
+    .unwrap();
+
+    // The activation rebuilds BOTH search indexes (staging before activate
+    // needs no explicit rebuild — the publish-flow shape).
+    activate_build_with_search_index(&mut conn, &build_id, default_tokenizer()).unwrap();
+    std::fs::create_dir_all(workspace.join("wiki")).unwrap();
+    write_current_pointer(&PublishPaths::new(&workspace.join("wiki")), &build_id).unwrap();
+}
+
+/// Contract: the default request (no source_mode) on an unconfigured server
+/// keeps the legacy wiki path — every pre-PR4 field survives with its shape,
+/// the only additions being the documented additive ones (top-level
+/// `source_mode`/`served`, per-hit `evidence_kind`), and unknown request
+/// fields stay tolerated.
+#[tokio::test]
+async fn search_default_mode_keeps_the_legacy_contract() {
+    let workspace = fixture_workspace("search-legacy-contract");
+    seed_fusion_generation(&workspace);
+    let app = build_router(state_for(workspace));
+
+    let (status, body) = post(
+        app,
+        "/v1/search",
+        r#"{"query":"scheduler retries","unknown_field":1}"#,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    // The additive set is EXACTLY the documented one (PRD §0/§1.2): the legacy
+    // five top-level fields plus `source_mode`/`served` — no extra field, none
+    // missing. Key order is irrelevant; the SET is the contract.
+    let mut top_keys: Vec<&str> = payload
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    top_keys.sort_unstable();
+    assert_eq!(
+        top_keys,
+        [
+            "generation",
+            "hits",
+            "protocol_version",
+            "request_id",
+            "served",
+            "source_mode",
+            "truncated",
+        ],
+        "top-level field set drifted: {body}"
+    );
+    let mut served_keys: Vec<&str> = payload["served"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    served_keys.sort_unstable();
+    assert_eq!(served_keys, ["source", "wiki"], "{body}");
+
+    // Legacy top-level fields, then the additive pair.
+    assert_eq!(payload["protocol_version"], 1);
+    assert!(payload["request_id"].is_string(), "{body}");
+    assert!(payload["generation"].is_string(), "{body}");
+    assert_eq!(payload["truncated"], false);
+    assert_eq!(payload["source_mode"], "wiki");
+    assert_eq!(payload["served"]["wiki"], "served");
+    assert_eq!(payload["served"]["source"], "disabled");
+
+    let hits = payload["hits"].as_array().unwrap();
+    assert!(!hits.is_empty(), "{body}");
+    assert!(
+        hits.iter().any(|hit| hit["slug"] == "streaming-guide"),
+        "the wiki side answers: {body}"
+    );
+    for hit in hits {
+        let mut hit_keys: Vec<&str> = hit
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        hit_keys.sort_unstable();
+        assert_eq!(
+            hit_keys,
+            [
+                "citation_count",
+                "evidence_kind",
+                "heading_path",
+                "page_id",
+                "rank",
+                "slug",
+                "snippet",
+                "title",
+            ],
+            "wiki hit field set drifted: {hit}"
+        );
+        for legacy in [
+            "page_id",
+            "slug",
+            "title",
+            "heading_path",
+            "snippet",
+            "rank",
+            "citation_count",
+        ] {
+            assert!(
+                hit.get(legacy).is_some(),
+                "legacy field {legacy} missing: {hit}"
+            );
+        }
+        assert_eq!(hit["evidence_kind"], "wiki", "{hit}");
+    }
+}
+
+/// Contract: source_mode "source" returns source evidence — full locator in
+/// source_ref — and NEVER page_id/slug (the PR3 containment rule).
+#[tokio::test]
+async fn search_source_mode_returns_source_evidence_without_page_identity() {
+    let workspace = fixture_workspace("search-source-mode");
+    seed_fusion_generation(&workspace);
+    let app = build_router(state_for(workspace));
+
+    let (status, body) = post(
+        app,
+        "/v1/search",
+        r#"{"query":"scheduler retries","source_mode":"source"}"#,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(payload["source_mode"], "source");
+    assert_eq!(payload["served"]["wiki"], "disabled");
+    assert_eq!(payload["served"]["source"], "served");
+
+    let hits = payload["hits"].as_array().unwrap();
+    assert!(!hits.is_empty(), "{body}");
+    for hit in hits {
+        let keys = hit.as_object().unwrap();
+        assert!(
+            !keys.contains_key("page_id"),
+            "source hit leaked page_id: {hit}"
+        );
+        assert!(!keys.contains_key("slug"), "source hit leaked slug: {hit}");
+        for field in [
+            "evidence_kind",
+            "source_ref",
+            "file_path",
+            "title",
+            "heading_path",
+            "snippet",
+            "rank",
+        ] {
+            assert!(keys.contains_key(field), "field {field} missing: {hit}");
+        }
+        assert_eq!(hit["evidence_kind"], "source", "{hit}");
+        for field in [
+            "source_id",
+            "file_path",
+            "heading_path",
+            "ordinal",
+            "range_start",
+            "range_end",
+        ] {
+            assert!(
+                hit["source_ref"].get(field).is_some(),
+                "source_ref.{field} missing: {hit}"
+            );
+        }
+        assert_eq!(hit["file_path"], "docs/streaming.md", "{hit}");
+    }
+}
+
+/// Contract: source_mode "fusion" merges both sides in the retrieval engine's
+/// fused order — the exact-match source chunk fronts, and the server never
+/// re-sorts — with both sides reported served.
+#[tokio::test]
+async fn search_fusion_mode_merges_both_sides_in_fused_order() {
+    let workspace = fixture_workspace("search-fusion-mode");
+    seed_fusion_generation(&workspace);
+    let app = build_router(state_for(workspace));
+
+    let (status, body) = post(
+        app,
+        "/v1/search",
+        r#"{"query":"scheduler retries","source_mode":"fusion"}"#,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(payload["source_mode"], "fusion");
+    assert_eq!(payload["served"]["wiki"], "served");
+    assert_eq!(payload["served"]["source"], "served");
+
+    let kinds: Vec<&str> = payload["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| hit["evidence_kind"].as_str().unwrap())
+        .collect();
+    assert!(kinds.contains(&"wiki"), "{body}");
+    assert!(kinds.contains(&"source"), "{body}");
+    // Exact-match protection: the dual-side source chunk fronts the fused
+    // order (PR3 semantics, untouched by the server).
+    assert_eq!(kinds[0], "source", "{body}");
+}
+
+/// Contract: an invalid source_mode is a 400 invalid_request with the stable
+/// error envelope — never a panic, never a silent fallback.
+#[tokio::test]
+async fn search_rejects_an_invalid_source_mode() {
+    let workspace = fixture_workspace("search-bad-mode");
+    let app = build_router(state_for(workspace));
+    let (status, body) = post(
+        app,
+        "/v1/search",
+        r#"{"query":"x","source_mode":"hybrid"}"#,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(payload["error"]["code"], "invalid_request", "{body}");
+}
+
+/// Contract: the configured `search.source_mode` feeds the effective mode
+/// when the request field is absent.
+#[tokio::test]
+async fn search_configured_source_mode_applies_when_the_request_field_is_absent() {
+    let workspace = fixture_workspace("search-config-mode");
+    let config_path = workspace.join(".llm-wiki").join("config.toml");
+    let mut config = std::fs::read_to_string(&config_path).unwrap();
+    config.push_str("\n[search]\nsource_mode = \"fusion\"\n");
+    std::fs::write(&config_path, config).unwrap();
+    seed_fusion_generation(&workspace);
+    let app = build_router(state_for(workspace));
+
+    let (status, body) = post(app, "/v1/search", r#"{"query":"scheduler retries"}"#, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        payload["source_mode"], "fusion",
+        "config default applies: {body}"
+    );
+    assert_eq!(payload["served"]["wiki"], "served");
+    assert_eq!(payload["served"]["source"], "served");
+}
+
+/// Contract: degradation is visible. A never-built workspace answers the
+/// wiki default with the legacy 404, but source mode degrades honestly —
+/// 200 with empty hits and the per-side reasons.
+#[tokio::test]
+async fn search_source_mode_on_a_never_built_workspace_degrades_visibly() {
+    let workspace = fixture_workspace("search-degraded");
+    let app = build_router(state_for(workspace));
+    let (status, body) = post(
+        app,
+        "/v1/search",
+        r#"{"query":"x","source_mode":"source"}"#,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(payload["hits"].as_array().unwrap().is_empty(), "{body}");
+    assert_eq!(payload["served"]["source"], "not_published");
+    assert_eq!(payload["served"]["wiki"], "disabled");
+
+    // The wiki default keeps the legacy loud 404 (zero regression).
+    let app = build_router(state_for(fixture_workspace("search-degraded-wiki")));
+    let (status, body) = post(app, "/v1/search", r#"{"query":"x"}"#, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(body.contains("nothing_published"), "{body}");
+}
+
+/// Contract: /v1/context — the default keeps the legacy wiki path
+/// (`served_mode:"wiki"`, `degraded:null`, chunks carry no page identity),
+/// while `source_mode:"source"` serves raw-source chunks through the PR3
+/// builder with visible per-side metadata.
+#[tokio::test]
+async fn context_source_mode_serves_source_chunks_with_served_metadata() {
+    let workspace = fixture_workspace("context-source-mode");
+    seed_fusion_generation(&workspace);
+    let app = build_router(state_for(workspace));
+
+    let (status, body) = post(
+        app.clone(),
+        "/v1/context",
+        r#"{"query":"scheduler retries"}"#,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(payload["served_mode"], "wiki");
+    assert_eq!(payload["degraded"], serde_json::Value::Null);
+    let chunks = payload["chunks"].as_array().unwrap();
+    assert!(!chunks.is_empty(), "{body}");
+    for chunk in chunks {
+        assert!(
+            !chunk.as_object().unwrap().contains_key("page_id"),
+            "context chunk leaked page_id: {chunk}"
+        );
+        assert_eq!(chunk["evidence_kind"], "wiki", "{chunk}");
+    }
+
+    let (status, body) = post(
+        app,
+        "/v1/context",
+        r#"{"query":"scheduler retries","source_mode":"source"}"#,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(payload["served_mode"], "source");
+    assert_eq!(payload["degraded"]["wiki"], "disabled");
+    assert_eq!(payload["degraded"]["source"], "served");
+    let chunks = payload["chunks"].as_array().unwrap();
+    assert!(!chunks.is_empty(), "{body}");
+    for chunk in chunks {
+        let keys = chunk.as_object().unwrap();
+        assert!(!keys.contains_key("page_id"), "{chunk}");
+        assert_eq!(chunk["evidence_kind"], "source", "{chunk}");
+        assert!(keys.contains_key("source_ref"), "{chunk}");
+        // The chunk's slug IS the file path for source chunks (PR3).
+        assert_eq!(chunk["slug"], "docs/streaming.md", "{chunk}");
+    }
+}

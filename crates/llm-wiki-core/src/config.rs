@@ -242,6 +242,40 @@ pub struct PlanningConfig {
     pub max_cluster_nodes: u32,
 }
 
+/// Which corpus side(s) the retrieval endpoints draw from — the config AND
+/// protocol vocabulary is `"source" | "wiki" | "fusion"` (serde lowercase).
+/// `wiki` is the historical default, so a workspace without this key behaves
+/// exactly like the pre-fusion protocol (EPIC A PR4). The HTTP request field
+/// `source_mode` on `/v1/search` and `/v1/context` overrides this per call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchSourceMode {
+    /// Raw-source chunks only (`source_fts`).
+    Source,
+    /// Compiled wiki sections of the ACTIVE generation only — the default.
+    #[default]
+    Wiki,
+    /// Both sides merged by the top-level RRF (exact-match protection kept).
+    Fusion,
+}
+
+impl SearchSourceMode {
+    /// The wire/config string (the same form serde emits).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SearchSourceMode::Source => "source",
+            SearchSourceMode::Wiki => "wiki",
+            SearchSourceMode::Fusion => "fusion",
+        }
+    }
+}
+
+impl std::fmt::Display for SearchSourceMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchConfig {
     #[serde(default = "default_true")]
@@ -261,6 +295,11 @@ pub struct SearchConfig {
     /// errors.
     #[serde(default = "default_rerank")]
     pub rerank: String,
+    /// Which corpus the retrieval endpoints draw from by default (EPIC A
+    /// PR4). Defaults to `wiki`: an unconfigured server keeps the exact
+    /// pre-fusion protocol behavior.
+    #[serde(default = "default_source_mode")]
+    pub source_mode: SearchSourceMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -382,6 +421,9 @@ fn default_auth_token_env() -> String {
 fn default_rerank() -> String {
     "none".to_owned()
 }
+fn default_source_mode() -> SearchSourceMode {
+    SearchSourceMode::Wiki
+}
 
 impl Default for ProjectConfig {
     fn default() -> Self {
@@ -445,6 +487,7 @@ impl Default for SearchConfig {
             vector: false,
             graph: true,
             rerank: default_rerank(),
+            source_mode: default_source_mode(),
         }
     }
 }
@@ -560,7 +603,7 @@ impl Config {
     /// construction: config only stores env-var names (PRD §32).
     pub fn effective_summary(&self) -> String {
         format!(
-            "project.name = {}\nproject.wiki_dir = {}\nsource.root = {}\nsource.include = {:?}\nsource.exclude = {:?}\nllm.provider = {}\nllm.base_url = {}\nllm.model = {}\nllm.api_key_env = <env name: redacted>\nllm.max_concurrency = {}\nembedding.provider = {}\nembedding.base_url = {}\nembedding.model = {}\nembedding.api_key_env = <env name: redacted>\nsearch.rerank = {}\nrerank.base_url = {}\nrerank.model = {}\nrerank.api_key_env = <env name: redacted>\nanalysis.max_input_tokens = {}\nanalysis.max_plan_input_tokens = {}\nanalysis.max_rejected_claim_ratio = {}\nplanning.hierarchical = {}\nplanning.max_cluster_nodes = {}\nbuild.incremental = {}\nbuild.keep_generations = {}\nserver.bind = {}\nserver.remote_enabled = {}",
+            "project.name = {}\nproject.wiki_dir = {}\nsource.root = {}\nsource.include = {:?}\nsource.exclude = {:?}\nllm.provider = {}\nllm.base_url = {}\nllm.model = {}\nllm.api_key_env = <env name: redacted>\nllm.max_concurrency = {}\nembedding.provider = {}\nembedding.base_url = {}\nembedding.model = {}\nembedding.api_key_env = <env name: redacted>\nsearch.rerank = {}\nsearch.source_mode = {}\nrerank.base_url = {}\nrerank.model = {}\nrerank.api_key_env = <env name: redacted>\nanalysis.max_input_tokens = {}\nanalysis.max_plan_input_tokens = {}\nanalysis.max_rejected_claim_ratio = {}\nplanning.hierarchical = {}\nplanning.max_cluster_nodes = {}\nbuild.incremental = {}\nbuild.keep_generations = {}\nserver.bind = {}\nserver.remote_enabled = {}",
             self.project.name,
             self.project.wiki_dir.display(),
             self.source.root.display(),
@@ -574,6 +617,7 @@ impl Config {
             if self.embedding.base_url.is_empty() { &self.llm.base_url } else { &self.embedding.base_url },
             if self.embedding.model.is_empty() { "<unset>" } else { &self.embedding.model },
             self.search.rerank,
+            self.search.source_mode,
             if self.rerank.base_url.is_empty() { &self.llm.base_url } else { &self.rerank.base_url },
             if self.rerank.model.is_empty() { "<unset>" } else { &self.rerank.model },
             self.analysis.max_input_tokens,
@@ -797,6 +841,24 @@ max_rejected_claim_ratio = 0.10
         let partial = cfg.embedding.endpoint(&cfg.llm);
         assert_eq!(partial.base_url, "https://only-embed.example.com/v1");
         assert_eq!(partial.api_key_env, "LLM_WIKI_API_KEY");
+    }
+
+    #[test]
+    fn search_source_mode_defaults_to_wiki_and_rejects_unknown_values() {
+        // The locked default: no config key = the pre-fusion `wiki` behavior.
+        assert_eq!(Config::default().search.source_mode, SearchSourceMode::Wiki);
+
+        let parsed = Config::parse_toml("[search]\nsource_mode = \"fusion\"\n").unwrap();
+        assert_eq!(parsed.search.source_mode, SearchSourceMode::Fusion);
+        let parsed = Config::parse_toml("[search]\nsource_mode = \"source\"\n").unwrap();
+        assert_eq!(parsed.search.source_mode, SearchSourceMode::Source);
+
+        // Unknown values are config errors (stable message), never a silent
+        // fallback to the default.
+        let err = Config::parse_toml("[search]\nsource_mode = \"hybrid\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid TOML"), "{err}");
     }
 
     #[test]

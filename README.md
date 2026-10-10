@@ -173,6 +173,8 @@ vector = false                      # reserved for the vector layer; hybrid retr
                                     # itself is opt-in per query (--hybrid / "hybrid": true)
 graph = true                        # one-hop related pages in search output
 rerank = "none"                     # "none" | "cohere-compatible"
+source_mode = "wiki"                # retrieval corpus: "source" | "wiki" | "fusion";
+                                    # the HTTP request field source_mode overrides per call
 
 [build]
 incremental = true
@@ -267,7 +269,7 @@ carry `protocol_version`, `request_id` and `x-request-id`.
 | `/v1/build` | POST | Queue a build job (202). Honors `Idempotency-Key` (same key → same job, `replayed: true`); one build at a time; queue cap applies. |
 | `/v1/jobs` · `/v1/jobs/{id}` | GET | List (cursor-paginated, `?status=` filter) / inspect jobs. |
 | `/v1/jobs/{id}/cancel` | POST | Cooperative cancel: QUEUED cancels immediately, RUNNING stops at the next pipeline checkpoint, terminal → 409. |
-| `/v1/search` | POST | Page/section hits — never answers. Applies the configured rerank strategy. |
+| `/v1/search` | POST | Page/section hits — never answers. Optional `source_mode` (`source`/`wiki`/`fusion`, default from `search.source_mode`). Rerank applies in wiki mode only; source/fusion keep retrieval order. |
 | `/v1/context` | POST | **The agent-integration surface**: budgeted, diversity-aware retrieval bundle (`budget: {max_chunks, max_tokens, max_pages, max_per_source, graph_limit}`), with citations, graph neighbors and truncation transparency. `hybrid: true` adds vector candidates. |
 | `/v1/query` | POST | Grounded, citation-verified answers (the `ask` service). `write_back: true` persists the insight. |
 | `/v1/pages` · `/v1/pages/{id}` | GET | Active generation's page metadata (cursor-paginated) / one full page with citations and links (by id or slug). |
