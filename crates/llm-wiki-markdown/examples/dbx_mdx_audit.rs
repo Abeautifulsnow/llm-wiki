@@ -22,12 +22,18 @@
 //! 2. every `parse_document` diagnostic verbatim (kind + message + byte range);
 //! 3. a dependency-free, fence-aware census of the JSX components
 //!    `Tabs/Tab/Steps/Step/Callout/Cards/Card/Accordion/Accordions`, each
-//!    classified as preserved / downgraded-with-diagnostic / **SILENT LOSS**.
+//!    classified as structurally-downgraded / downgraded-with-diagnostic /
+//!    preserved-verbatim / **SILENT LOSS**.
 //!
 //! `SILENT LOSS` means the component appears in the raw text (outside fenced
-//! code blocks) yet the parse produced neither a diagnostic nor a surviving
-//! occurrence of its tag: the tag and the component's boundary/semantics are
-//! dropped with no signal. This is the key finding for EPIC C.
+//! code blocks) yet the parse produced none of: a diagnostic, a surviving
+//! occurrence of its tag, or a recorded structural downgrade. In other words
+//! the tag and the component's boundary/semantics were dropped with no signal.
+//!
+//! Since EPIC C the parser downgrades structural JSX to Markdown that carries
+//! its semantics (`Callout` → a label, `Card` → a link, `Step` → an ordered
+//! item …). Such components leave no tag behind, so the census detects them
+//! through [`ParseOutput::jsx_downgrades`] rather than by tag survival.
 //!
 //! Only `std` and `llm-wiki-markdown` are used (no regex, no walkdir).
 
@@ -71,8 +77,8 @@ fn main() {
     ));
     out.push_str(
         "Legend: **SILENT LOSS** = the component is present in the raw text (outside\n\
-         fenced code blocks) but the parse produced neither a diagnostic nor a\n\
-         surviving occurrence of its tag — dropped with no signal.\n\n---\n\n",
+         fenced code blocks) but the parse produced no diagnostic, no surviving tag and\n\
+         no recorded structural downgrade — dropped with no signal.\n\n---\n\n",
     );
 
     for file in &files {
@@ -306,9 +312,9 @@ fn render_jsx_census(raw: &str, doc: &ParseOutput, out: &mut String) {
 
     out.push_str("### JSX census (raw text, fenced code blocks excluded)\n\n");
     out.push_str(
-        "| component | raw open | raw close | diagnostics | tag survived | disposition |\n",
+        "| component | raw open | raw close | diagnostics | structured | tag survived | disposition |\n",
     );
-    out.push_str("|---|---:|---:|---|---|---|\n");
+    out.push_str("|---|---:|---:|---:|---:|---|---|\n");
 
     let mut silent: Vec<String> = Vec::new();
     for name in COMPONENTS {
@@ -321,9 +327,16 @@ fn render_jsx_census(raw: &str, doc: &ParseOutput, out: &mut String) {
             .iter()
             .filter(|d| mentions_component(&d.message, name))
             .count();
+        let structured = doc
+            .jsx_downgrades
+            .iter()
+            .filter(|record| record.component == *name)
+            .count();
         let survived = count_tags(&analyzed_scan, name).0 > 0;
 
-        let disposition = if diag_mentions > 0 {
+        let disposition = if structured > 0 {
+            "downgraded (structured)"
+        } else if diag_mentions > 0 {
             "downgraded (diagnostic)"
         } else if survived {
             "preserved verbatim"
@@ -335,16 +348,16 @@ fn render_jsx_census(raw: &str, doc: &ParseOutput, out: &mut String) {
         }
 
         out.push_str(&format!(
-            "| `{name}` | {raw_open} | {raw_close} | {diag_mentions} | {survived} | {disposition} |\n"
+            "| `{name}` | {raw_open} | {raw_close} | {diag_mentions} | {structured} | {survived} | {disposition} |\n"
         ));
     }
 
     out.push('\n');
     if silent.is_empty() {
-        out.push_str("**SILENT LOSS: none** — every census component was surfaced by a diagnostic or survived verbatim.\n\n");
+        out.push_str("**SILENT LOSS: none** — every census component was accounted for by a structured downgrade, a diagnostic, or a surviving tag.\n\n");
     } else {
         out.push_str(&format!(
-            "**SILENT LOSS: {} component(s)** — present in raw text, yet the parse produced neither a diagnostic nor a surviving tag: {}.\n\n",
+            "**SILENT LOSS: {} component(s)** — present in raw text, yet the parse produced no structured downgrade, no diagnostic and no surviving tag: {}.\n\n",
             silent.len(),
             silent
                 .iter()

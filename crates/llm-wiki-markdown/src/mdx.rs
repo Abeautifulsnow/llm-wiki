@@ -1,49 +1,93 @@
-//! Deterministic MDX JSX component downgrade (PRD §9).
+//! Deterministic MDX JSX component downgrade (PRD §9, EPIC C).
 //!
 //! `.mdx` files are parsed as Markdown *after* their embedded JSX components
 //! are downgraded. Rules:
-//! - JSX components (capitalized or namespaced tag names, e.g. `<Callout>`,
-//!   `<Tabs>`, `</Tabs>`, `<Badge label="x" />`) are unwrapped: text children
-//!   remain, string attribute values are kept as readable text.
+//! - **Structural components** — `Callout`, `Steps`/`Step`, `Cards`/`Card`,
+//!   `Accordions`/`Accordion`, `Tabs`/`Tab` — are downgraded to Markdown that
+//!   *carries their semantics*, never leaking a bare attribute keyword:
+//!   - `Callout` → a readable label (`<Callout type="warn">` → `**Warning:**`),
+//!     with the type → label map below;
+//!   - `Step` → an ordered-list marker (`1.`, `2.`, …), so step order survives
+//!     and the step body (indented under the marker) becomes the list item;
+//!   - `Card` → a real link `[title](href)` (so `href`s count as links);
+//!   - `Accordion` → its `title` as a bold label, body kept in order;
+//!   - `Tab` → its `label` as a bold label, each branch kept;
+//!   - containers (`Steps`, `Cards`, `Accordions`, `Tabs`) are unwrapped — the
+//!     ordered/labelled children carry the structure.
+//! - **Other JSX components** (e.g. `Badge`) keep the legacy behavior:
+//!   unwrapped with string attribute values kept as readable text.
 //! - Standard HTML tags (`<div>`, `<br>`, …) are left as-is.
 //! - JSX comments (`{/* ... */}`) are dropped — they are recognized markup,
 //!   not content.
-//! - Anything unrecognized (unterminated tags, non-literal expressions) is
-//!   **never silently dropped**: the raw text is kept and a diagnostic is
-//!   produced.
+//! - Anything unrecognized (unterminated tags) or **unrepresentable** (a
+//!   structural component whose needed attributes are non-literal, e.g.
+//!   `href={expr}`) is **never silently dropped**: the raw text is kept and a
+//!   diagnostic is produced.
+//!
+//! Everything is deterministic: the same body yields the same text, the same
+//! diagnostics and the same records.
 //!
 //! The downgrade only affects the text handed to analysis; the Source itself
 //! is never rewritten (PRD §9). Note that `source_range`s of the parsed
 //! document refer to the *downgraded* text returned by [`downgrade_jsx`].
 
+use std::ops::Range;
+
 use pulldown_cmark::{Event, Options, Parser};
 
 use crate::parser::{ParseDiagnostic, ParseDiagnosticKind};
 
+/// One structural component that was downgraded to Markdown. Recorded so
+/// callers (and the fidelity audit) can account for every component occurrence
+/// instead of having to guess from the downgraded text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsxDowngradeRecord {
+    /// The JSX component name, e.g. `"Callout"` or `"Step"`.
+    pub component: String,
+}
+
+/// Result of a full JSX downgrade pass.
+#[derive(Debug, Clone)]
+pub struct DowngradeOutcome {
+    /// The downgraded text (all downstream ranges refer to this).
+    pub text: String,
+    pub diagnostics: Vec<ParseDiagnostic>,
+    /// One entry per structural component occurrence that was downgraded, in
+    /// document order.
+    pub records: Vec<JsxDowngradeRecord>,
+}
+
 /// Downgrades JSX in a document body. Returns the downgraded text and the
 /// list of diagnostics (empty when the downgrade was lossless).
 pub fn downgrade_jsx(body: &str) -> (String, Vec<ParseDiagnostic>) {
+    let outcome = downgrade_jsx_detailed(body);
+    (outcome.text, outcome.diagnostics)
+}
+
+/// Full downgrade result, including the record of every structural component
+/// that was downgraded (EPIC C fidelity accounting).
+pub fn downgrade_jsx_detailed(body: &str) -> DowngradeOutcome {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_STRIKETHROUGH);
 
-    let mut replacements: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    let mut replacements: Vec<(Range<usize>, String)> = Vec::new();
     let mut diagnostics: Vec<ParseDiagnostic> = Vec::new();
+    let mut records: Vec<JsxDowngradeRecord> = Vec::new();
+    let mut state = State::default();
 
     for (event, range) in Parser::new_ext(body, options).into_offset_iter() {
         let html = match event {
             Event::Html(h) | Event::InlineHtml(h) => h,
             _ => continue,
         };
-        match downgrade_chunk(&html) {
+        match downgrade_chunk(&html, range.clone(), &mut state) {
             ChunkResult::Replace(new_text) => {
-                // A block-level chunk usually ends with the line's newline;
-                // keep it so the following line does not glue onto this one.
-                let mut new_text = new_text;
-                if html.ends_with('\n') && !new_text.ends_with('\n') {
-                    new_text.push('\n');
-                }
-                replacements.push((range, new_text));
+                replacements.push((range, with_trailing_newline(&html, new_text)));
+            }
+            ChunkResult::Structured { text, component } => {
+                replacements.push((range, with_trailing_newline(&html, text)));
+                records.push(JsxDowngradeRecord { component });
             }
             ChunkResult::KeepRaw => {}
             ChunkResult::KeepWithDiagnostic(message) => {
@@ -59,6 +103,16 @@ pub fn downgrade_jsx(body: &str) -> (String, Vec<ParseDiagnostic>) {
         }
     }
 
+    // Structural components that were opened but never closed are unbalanced:
+    // surface them instead of letting the tag vanish silently (PRD §2.1).
+    for (name, at) in state.open_stack.drain(..) {
+        diagnostics.push(ParseDiagnostic {
+            kind: ParseDiagnosticKind::UnrecognizedJsx,
+            message: format!("unbalanced JSX component without a closing tag: <{name}>"),
+            range: Some(llm_wiki_core::model::SourceRange::new(at, at)),
+        });
+    }
+
     // Genuinely broken JSX never reaches the parser as HTML — CommonMark
     // passes it through as plain text. A raw line scan (fence-aware) makes
     // sure such constructs still produce a diagnostic instead of a silent
@@ -71,7 +125,20 @@ pub fn downgrade_jsx(body: &str) -> (String, Vec<ParseDiagnostic>) {
         out.replace_range(range, &new_text);
     }
     out = drop_jsx_comment_lines(&out);
-    (out, diagnostics)
+    DowngradeOutcome {
+        text: out,
+        diagnostics,
+        records,
+    }
+}
+
+/// A block-level chunk usually ends with the line's newline; keep it so the
+/// following line does not glue onto this one.
+fn with_trailing_newline(html: &str, mut new_text: String) -> String {
+    if html.ends_with('\n') && !new_text.ends_with('\n') {
+        new_text.push('\n');
+    }
+    new_text
 }
 
 /// Removes single-line `{/* … */}` JSX comment lines (fence-aware). They are
@@ -175,12 +242,27 @@ fn has_complete_tag_end(tag_part: &str) -> bool {
 
 enum ChunkResult {
     Replace(String),
+    /// A structural component was downgraded; `component` is recorded.
+    Structured {
+        text: String,
+        component: String,
+    },
     KeepRaw,
     KeepWithDiagnostic(String),
 }
 
-/// Downgrades one HTML event chunk.
-fn downgrade_chunk(html: &str) -> ChunkResult {
+/// Mutable state threaded across HTML chunks: the ordered-list counter for
+/// `Steps`/`Step`, plus the stack of structural components that have been
+/// opened but not yet closed (used to diagnose unbalanced tags).
+#[derive(Default)]
+struct State {
+    step_counter: u32,
+    /// `(component name, byte offset of the opening tag)`.
+    open_stack: Vec<(String, usize)>,
+}
+
+/// Downgrades one HTML event chunk. `range` locates the chunk in the body.
+fn downgrade_chunk(html: &str, range: Range<usize>, state: &mut State) -> ChunkResult {
     let trimmed = html.trim_start();
     if trimmed.starts_with("<!--") {
         return ChunkResult::Replace(String::new()); // HTML comment
@@ -215,6 +297,14 @@ fn downgrade_chunk(html: &str) -> ChunkResult {
     }
 
     if closing {
+        if is_structural(&name) && !pop_matching(&mut state.open_stack, &name) {
+            // An orphan closing tag for a structural component: keep it and
+            // say so, rather than dropping the tag with no signal.
+            return ChunkResult::KeepWithDiagnostic(format!(
+                "unbalanced closing JSX tag kept verbatim: {}",
+                first_line(html)
+            ));
+        }
         return ChunkResult::Replace(String::new());
     }
 
@@ -227,6 +317,11 @@ fn downgrade_chunk(html: &str) -> ChunkResult {
         Some(gt) => {
             let self_closing = trimmed[..gt].trim_end().ends_with('/');
             let attrs = &trimmed[name_end..if self_closing { gt - 1 } else { gt }];
+
+            if is_structural(&name) {
+                return downgrade_structural(&name, attrs, gt, self_closing, trimmed, state, range);
+            }
+
             match collect_readable_attrs(attrs) {
                 AttrScan::Readable(values) => {
                     let mut new_text = values.join(" ");
@@ -250,6 +345,163 @@ fn downgrade_chunk(html: &str) -> ChunkResult {
             }
         }
     }
+}
+
+/// Pops the innermost open component if it matches `name`. Returns whether a
+/// matching open tag was found.
+fn pop_matching(stack: &mut Vec<(String, usize)>, name: &str) -> bool {
+    if stack.last().map(|(open, _)| open.as_str()) == Some(name) {
+        stack.pop();
+        true
+    } else {
+        false
+    }
+}
+
+/// Components with a dedicated structural downgrade (EPIC C). Anything else
+/// keeps the legacy "unwrap + readable values" behavior.
+fn is_structural(name: &str) -> bool {
+    matches!(
+        name,
+        "Callout"
+            | "Steps"
+            | "Step"
+            | "Cards"
+            | "Card"
+            | "Accordions"
+            | "Accordion"
+            | "Tabs"
+            | "Tab"
+    )
+}
+
+/// Builds the Markdown for one structural component. `gt` is the index of the
+/// tag's closing `>` within `trimmed`; `trimmed` is the chunk with leading
+/// whitespace removed.
+fn downgrade_structural(
+    name: &str,
+    attrs: &str,
+    gt: usize,
+    self_closing: bool,
+    trimmed: &str,
+    state: &mut State,
+    range: Range<usize>,
+) -> ChunkResult {
+    let pairs = match collect_named_attrs(attrs) {
+        Ok(pairs) => pairs,
+        Err(what) => {
+            return ChunkResult::KeepWithDiagnostic(format!(
+                "unrecognized JSX attribute ({what}) kept verbatim: {name}"
+            ))
+        }
+    };
+
+    let marker = match structural_marker(name, &pairs, state) {
+        Ok(marker) => marker,
+        Err(message) => return ChunkResult::KeepWithDiagnostic(message),
+    };
+
+    let mut text = marker;
+    if self_closing {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+    } else {
+        let after = &trimmed[gt + 1..];
+        // A same-chunk closing tag means the component is balanced right here;
+        // otherwise remember that it is still open so an unmatched close (or a
+        // missing close) can be diagnosed.
+        if !after.contains(&format!("</{name}")) {
+            state.open_stack.push((name.to_owned(), range.start));
+        }
+        let rest = strip_closing_tag(after, name);
+        // Keep the body in place. A body that starts on the next line
+        // (`\n…`) is written verbatim; an inline body gets one separating
+        // space so `**Warning:**` and the text do not glue together.
+        if !text.is_empty() && !rest.starts_with('\n') {
+            text.push(' ');
+        }
+        text.push_str(rest);
+    }
+
+    ChunkResult::Structured {
+        text,
+        component: name.to_owned(),
+    }
+}
+
+/// The Markdown marker that replaces a structural component's tag.
+fn structural_marker(
+    name: &str,
+    pairs: &[(String, String)],
+    state: &mut State,
+) -> Result<String, String> {
+    match name {
+        "Callout" => Ok(match attr(pairs, "type") {
+            Some(kind) => format!("**{}:**", callout_label(kind)),
+            None => String::new(),
+        }),
+        "Steps" => {
+            state.step_counter = 0;
+            Ok(String::new())
+        }
+        "Step" => {
+            state.step_counter += 1;
+            Ok(format!("{}.", state.step_counter))
+        }
+        "Card" => match (attr(pairs, "title"), attr(pairs, "href")) {
+            (Some(title), Some(href)) => Ok(format!("[{title}]({href})")),
+            (Some(title), None) => Ok(format!("**{title}**")),
+            _ => Err(
+                "structural JSX component without a literal title/href kept verbatim: <Card>"
+                    .to_string(),
+            ),
+        },
+        "Accordion" => Ok(match attr(pairs, "title") {
+            Some(title) => format!("**{title}**"),
+            None => String::new(),
+        }),
+        "Tab" => Ok(
+            match attr(pairs, "label").or_else(|| attr(pairs, "title")) {
+                Some(label) => format!("**{label}**"),
+                None => String::new(),
+            },
+        ),
+        // Containers carry no text of their own; their children hold the
+        // structure (ordered items / labelled cards / …).
+        "Cards" | "Accordions" | "Tabs" => Ok(String::new()),
+        _ => Ok(String::new()),
+    }
+}
+
+/// Maps a `Callout type` value to a readable label (never the bare keyword).
+fn callout_label(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "info" | "note" => "Note".to_owned(),
+        "warn" | "warning" => "Warning".to_owned(),
+        "tip" => "Tip".to_owned(),
+        "danger" => "Danger".to_owned(),
+        "error" => "Error".to_owned(),
+        "success" => "Success".to_owned(),
+        "caution" => "Caution".to_owned(),
+        other => capitalize(other),
+    }
+}
+
+fn capitalize(value: &str) -> String {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// First literal value of `key`, if present.
+fn attr<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    pairs
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
 }
 
 fn first_line(s: &str) -> String {
@@ -338,8 +590,20 @@ enum AttrScan {
     Unrecognized(String),
 }
 
+/// Legacy behavior for non-structural components: readable string attribute
+/// values, in order (bare keys ignored, expressions rejected).
 fn collect_readable_attrs(attrs: &str) -> AttrScan {
-    let mut values = Vec::new();
+    match collect_named_attrs(attrs) {
+        Ok(pairs) => AttrScan::Readable(pairs.into_iter().map(|(_, value)| value).collect()),
+        Err(what) => AttrScan::Unrecognized(what),
+    }
+}
+
+/// Parses attributes into literal `key = value` pairs. Bare keys are ignored
+/// (no readable value); JSX comments are allowed; any expression value or
+/// unterminated string/expression is an error.
+fn collect_named_attrs(attrs: &str) -> Result<Vec<(String, String)>, String> {
+    let mut pairs = Vec::new();
     let bytes = attrs.as_bytes();
     let mut i = 0usize;
     while i < bytes.len() {
@@ -373,11 +637,11 @@ fn collect_readable_attrs(attrs: &str) -> AttrScan {
                     j += 1;
                 }
                 if depth != 0 {
-                    return AttrScan::Unrecognized("unterminated expression".to_owned());
+                    return Err("unterminated expression".to_owned());
                 }
                 let inner = attrs[inner_start..j - 1].trim();
                 if !inner.starts_with("/*") {
-                    return AttrScan::Unrecognized(format!("expression: {{ {inner} }}"));
+                    return Err(format!("expression: {{ {inner} }}"));
                 }
                 i = j;
             }
@@ -401,7 +665,7 @@ fn collect_readable_attrs(attrs: &str) -> AttrScan {
                         i += 1;
                     }
                     if i >= bytes.len() {
-                        return AttrScan::Unrecognized(format!("unterminated value for '{key}'"));
+                        return Err(format!("unterminated value for '{key}'"));
                     }
                     match bytes[i] {
                         quote_char @ (b'"' | b'\'') => {
@@ -414,24 +678,20 @@ fn collect_readable_attrs(attrs: &str) -> AttrScan {
                                 i += 1;
                             }
                             if i >= bytes.len() {
-                                return AttrScan::Unrecognized(format!(
-                                    "unterminated string for '{key}'"
-                                ));
+                                return Err(format!("unterminated string for '{key}'"));
                             }
-                            values.push(attrs[val_start..i].to_owned());
+                            pairs.push((key.to_owned(), attrs[val_start..i].to_owned()));
                             i += 1;
                         }
                         b'{' => {
-                            return AttrScan::Unrecognized(format!(
-                                "non-literal value for '{key}'"
-                            ));
+                            return Err(format!("non-literal value for '{key}'"));
                         }
                         _ => {
                             let val_start = i;
                             while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
                                 i += 1;
                             }
-                            values.push(attrs[val_start..i].to_owned());
+                            pairs.push((key.to_owned(), attrs[val_start..i].to_owned()));
                         }
                     }
                 }
@@ -439,7 +699,7 @@ fn collect_readable_attrs(attrs: &str) -> AttrScan {
             }
         }
     }
-    AttrScan::Readable(values)
+    Ok(pairs)
 }
 
 #[cfg(test)]
@@ -506,5 +766,142 @@ mod tests {
         let (out, diags) = downgrade_jsx(body);
         assert_eq!(out, body);
         assert_eq!(diags.len(), 1);
+    }
+
+    // --- EPIC C: structural downgrade -------------------------------------
+
+    #[test]
+    fn callout_type_becomes_a_readable_label() {
+        let outcome = downgrade_jsx_detailed("<Callout type=\"warn\">Watch out.</Callout>\n");
+        assert_eq!(outcome.text, "**Warning:** Watch out.\n");
+        assert!(
+            !outcome.text.contains("warn"),
+            "bare type leaked: {}",
+            outcome.text
+        );
+        assert_eq!(outcome.records.len(), 1);
+        assert_eq!(outcome.records[0].component, "Callout");
+    }
+
+    #[test]
+    fn callout_type_map_covers_common_values() {
+        assert_eq!(callout_label("info"), "Note");
+        assert_eq!(callout_label("warn"), "Warning");
+        assert_eq!(callout_label("tip"), "Tip");
+        assert_eq!(callout_label("danger"), "Danger");
+        assert_eq!(callout_label("error"), "Error");
+    }
+
+    #[test]
+    fn step_becomes_an_ordered_item_and_keeps_order() {
+        let body = "<Steps>\n  <Step>\n    ### First\n\n    alpha\n\n  </Step>\n  <Step>\n    ### Second\n\n    beta\n\n  </Step>\n</Steps>\n";
+        let outcome = downgrade_jsx_detailed(body);
+        assert!(
+            outcome.text.contains("1.\n    ### First"),
+            "{}",
+            outcome.text
+        );
+        assert!(
+            outcome.text.contains("2.\n    ### Second"),
+            "{}",
+            outcome.text
+        );
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+        let components: Vec<&str> = outcome
+            .records
+            .iter()
+            .map(|r| r.component.as_str())
+            .collect();
+        assert_eq!(components, vec!["Steps", "Step", "Step"]);
+    }
+
+    #[test]
+    fn card_href_becomes_a_real_link() {
+        let body = "<Cards>\n  <Card title=\"Prod\" href=\"/p\">\n    guard\n  </Card>\n</Cards>\n";
+        let outcome = downgrade_jsx_detailed(body);
+        assert!(outcome.text.contains("[Prod](/p)"), "{}", outcome.text);
+        assert!(outcome.diagnostics.is_empty());
+        let components: Vec<&str> = outcome
+            .records
+            .iter()
+            .map(|r| r.component.as_str())
+            .collect();
+        assert_eq!(components, vec!["Cards", "Card"]);
+    }
+
+    #[test]
+    fn accordion_title_is_preserved() {
+        let outcome = downgrade_jsx_detailed(
+            "<Accordions>\n  <Accordion title=\"Q1\">A1</Accordion>\n</Accordions>\n",
+        );
+        assert!(outcome.text.contains("**Q1**"), "{}", outcome.text);
+        assert!(outcome.text.contains("A1"), "{}", outcome.text);
+    }
+
+    #[test]
+    fn tab_label_is_preserved() {
+        let outcome = downgrade_jsx_detailed(
+            "<Tabs>\n  <Tab label=\"Node\">n</Tab>\n  <Tab label=\"CLI\">c</Tab>\n</Tabs>\n",
+        );
+        assert!(outcome.text.contains("**Node**"), "{}", outcome.text);
+        assert!(outcome.text.contains("**CLI**"), "{}", outcome.text);
+    }
+
+    #[test]
+    fn nested_components_keep_their_labels() {
+        // A nested component is only real JSX to the CommonMark layer when it
+        // is indented fewer than four spaces (four spaces is an indented code
+        // block, which the downgrade must not touch).
+        let body = "<Steps>\n  <Step>\n    ### Do it\n\n  <Callout type=\"warn\">Careful.</Callout>\n\n  </Step>\n</Steps>\n";
+        let outcome = downgrade_jsx_detailed(body);
+        assert!(outcome.text.contains("1."), "{}", outcome.text);
+        assert!(
+            outcome.text.contains("**Warning:** Careful."),
+            "{}",
+            outcome.text
+        );
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+    }
+
+    #[test]
+    fn non_literal_structural_attribute_keeps_raw_and_diagnoses() {
+        let body = "<Card title=\"T\" href={link} />\n";
+        let (out, diags) = downgrade_jsx(body);
+        assert_eq!(
+            out, body,
+            "unrepresentable structural JSX must not be dropped"
+        );
+        assert_eq!(diags.len(), 1, "{diags:?}");
+    }
+
+    #[test]
+    fn unbalanced_tags_are_kept_with_diagnostics() {
+        // Orphan closing tag: kept verbatim and diagnosed.
+        let (out, diags) = downgrade_jsx("</Callout>\n");
+        assert_eq!(out, "</Callout>\n");
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].message.contains("unbalanced closing"), "{diags:?}");
+
+        // Unclosed opening tag: downgraded, but the imbalance is diagnosed.
+        let (out, diags) = downgrade_jsx("<Callout type=\"warn\">\nbody\n");
+        assert!(out.contains("**Warning:**"), "{out}");
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(
+            diags[0].message.contains("without a closing tag"),
+            "{diags:?}"
+        );
+
+        // Balanced input stays diagnostic-free.
+        let (_, diags) = downgrade_jsx("<Callout type=\"warn\">ok</Callout>\n");
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn structural_downgrade_is_deterministic() {
+        let body = "<Steps>\n  <Step>\n    a\n\n  </Step>\n</Steps>\n\n<Callout type=\"info\">x</Callout>\n";
+        let first = downgrade_jsx_detailed(body);
+        let second = downgrade_jsx_detailed(body);
+        assert_eq!(first.text, second.text);
+        assert_eq!(first.records, second.records);
     }
 }

@@ -3,10 +3,13 @@
 //!
 //! The parser preserves heading paths, source ranges, links and frontmatter
 //! as restricted metadata. `.mdx` input first goes through a deterministic
-//! JSX component downgrade: text children and readable attribute values are
-//! kept, everything unrecognized produces a diagnostic — never a silent drop.
-//! The downgrade only affects the text handed to analysis; the Source itself
-//! is never rewritten (PRD §9).
+//! JSX component downgrade: structural components (`Callout`, `Steps`/`Step`,
+//! `Cards`/`Card`, `Accordions`/`Accordion`, `Tabs`/`Tab`) are rewritten to
+//! Markdown that carries their semantics (labels, ordered items, links); all
+//! other components keep their text children and readable attribute values;
+//! everything unrecognized or unrepresentable produces a diagnostic — never a
+//! silent drop. The downgrade only affects the text handed to analysis; the
+//! Source itself is never rewritten (PRD §9).
 
 pub mod frontmatter;
 pub mod language;
@@ -21,7 +24,7 @@ pub const PARSER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub use frontmatter::Frontmatter;
 pub use language::detect_language;
-pub use mdx::downgrade_jsx;
+pub use mdx::{downgrade_jsx, downgrade_jsx_detailed, DowngradeOutcome, JsxDowngradeRecord};
 pub use parser::{
     parse_document, LinkOutput, ParseDiagnostic, ParseDiagnosticKind, ParseOutput, SectionOutput,
 };

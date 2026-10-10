@@ -12,7 +12,7 @@ use llm_wiki_core::model::SourceRange;
 
 use crate::frontmatter::{strip_and_parse, Frontmatter};
 use crate::language::detect_language;
-use crate::mdx::downgrade_jsx;
+use crate::mdx::{downgrade_jsx_detailed, JsxDowngradeRecord};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ParseDiagnosticKind {
@@ -56,6 +56,10 @@ pub struct ParseOutput {
     pub sections: Vec<SectionOutput>,
     pub links: Vec<LinkOutput>,
     pub diagnostics: Vec<ParseDiagnostic>,
+    /// Every structural JSX component that the MDX downgrade turned into
+    /// Markdown, in document order (empty for non-`.mdx` input). Lets callers
+    /// account for components that were downgraded rather than dropped.
+    pub jsx_downgrades: Vec<JsxDowngradeRecord>,
 }
 
 /// Parses one document.
@@ -67,18 +71,19 @@ pub fn parse_document(raw: &str, file_name: &str) -> ParseOutput {
 
     let (frontmatter, body, fm_diagnostic) = strip_and_parse(raw);
 
-    let (analyzed_text, diagnostics) = if is_mdx {
-        let (downgraded, mut diags) = downgrade_jsx(&body);
+    let (analyzed_text, diagnostics, jsx_downgrades) = if is_mdx {
+        let outcome = downgrade_jsx_detailed(&body);
+        let mut diags = outcome.diagnostics;
         if let Some(d) = fm_diagnostic {
             diags.push(d);
         }
-        (downgraded, diags)
+        (outcome.text, diags, outcome.records)
     } else {
         let mut diags = Vec::new();
         if let Some(d) = fm_diagnostic {
             diags.push(d);
         }
-        (body, diags)
+        (body, diags, Vec::new())
     };
 
     let title = frontmatter
@@ -98,6 +103,7 @@ pub fn parse_document(raw: &str, file_name: &str) -> ParseOutput {
         sections,
         links,
         diagnostics,
+        jsx_downgrades,
     }
 }
 
