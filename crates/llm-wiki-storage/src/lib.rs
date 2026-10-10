@@ -8,6 +8,7 @@
 pub mod analysis;
 pub mod builds;
 pub mod cache;
+pub mod chunks;
 pub mod connection;
 pub mod decisions;
 pub mod embeddings;
@@ -34,6 +35,10 @@ pub use builds::{
     set_build_snapshot_hash, start_build, BuildDraft, BuildRecord,
 };
 pub use cache::{count_cache_entries, get_cached_response, put_cached_response, CacheRow};
+pub use chunks::{
+    rebuild_source_fts, replace_source_chunks, search_source_fts, ChunkInput, ReplaceStats,
+    SourceFtsHit,
+};
 pub use connection::{open, open_in_memory, Connection};
 pub use decisions::{
     insert_plan_decision, list_plan_decisions, list_recent_plan_decisions_by_outcome, PlanDecision,
