@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! Search layer (PRD §20, §5.5): the [`TextAnalyzer`] shared-normalization
-//! abstraction, the [`FullTextSearch`] API and its SQLite FTS5 implementation.
+//! abstraction, the [`FullTextSearch`] API and its SQLite FTS5 implementation,
+//! plus the EPIC A PR3 top-level source↔wiki fusion ([`fusion::retrieve`]).
 //!
 //! Dependency direction: search → {core, storage} only. The tokenization
 //! rules live in `llm-wiki-storage::search_index` so the publish-transaction
@@ -18,12 +19,18 @@ use llm_wiki_storage::search_index::{self, SearchTokenizer};
 use tokio::task::spawn_blocking;
 
 pub mod context;
+pub mod fusion;
 pub mod rerank;
 
 pub use context::{
-    active_context_sections, build_context, build_context_with_reranker, chunks_tokens,
-    context_section_hash, context_section_text, AssembledContext, ContextBudget, ContextChunk,
-    ContextNeighbor, ContextSection, VectorCandidate,
+    active_context_sections, build_context, build_context_with_reranker,
+    build_context_with_sources, chunks_tokens, context_section_hash, context_section_text,
+    AssembledContext, ContextBudget, ContextChunk, ContextNeighbor, ContextSection,
+    VectorCandidate,
+};
+pub use fusion::{
+    retrieve, wiki_identity, Evidence, EvidenceEntry, EvidenceKind, FusedRetrieval, ServedSides,
+    SideStatus, SourceEvidence, SourceMode, SourceRef, WikiEvidence, RRF_K,
 };
 pub use rerank::{rerank_search_hits, NoopReranker, RerankCandidate, Reranker};
 

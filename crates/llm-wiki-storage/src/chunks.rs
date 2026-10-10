@@ -342,6 +342,9 @@ pub struct SourceFtsHit {
     /// the [`rebuild_source_fts`] contract).
     pub build_id: String,
     pub file_path: String,
+    /// The staged chunk title (PR3 fusion: context titling + exact-match
+    /// protection input).
+    pub title: String,
     pub heading_path: Vec<String>,
     pub ordinal: usize,
     /// Absolute offsets into the normalized source text.
@@ -351,10 +354,15 @@ pub struct SourceFtsHit {
     pub snippet: String,
     /// FTS5 `bm25()` rank — numerically SMALLER is a better match.
     pub rank: f64,
+    /// The staged chunk body (PR3 exact-match protection input; never
+    /// serialized into responses — the snippet is the display text).
+    pub body: String,
 }
 
 /// True when the lazily-created FTS5 table exists (i.e. some rebuild ran).
-fn source_fts_exists(conn: &Connection) -> Result<bool> {
+/// Public since PR3: the fusion layer probes it to report an HONEST
+/// `IndexNotBuilt` degradation instead of an ambiguous no-match.
+pub fn source_fts_exists(conn: &Connection) -> Result<bool> {
     let count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'source_fts'",
@@ -403,9 +411,9 @@ pub fn search_source_fts(
 
     let mut stmt = conn
         .prepare(
-            "SELECT t.chunk_id, t.source_id, t.build_id, t.file_path, t.heading_path_json,
+            "SELECT t.chunk_id, t.source_id, t.build_id, t.file_path, t.title, t.heading_path_json,
                     t.ordinal, t.range_start, t.range_end,
-                    snippet(source_fts, 2, '[', ']', ' … ', 16), bm25(source_fts)
+                    snippet(source_fts, 2, '[', ']', ' … ', 16), bm25(source_fts), t.body
              FROM source_fts
              JOIN source_chunk_text t ON t.chunk_id = source_fts.rowid
              WHERE source_fts MATCH ?1
@@ -421,11 +429,13 @@ pub fn search_source_fts(
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
-                row.get::<_, i64>(5)?,
+                row.get::<_, String>(5)?,
                 row.get::<_, i64>(6)?,
                 row.get::<_, i64>(7)?,
-                row.get::<_, String>(8)?,
-                row.get::<_, f64>(9)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, f64>(10)?,
+                row.get::<_, String>(11)?,
             ))
         })
         .map_err(|e| WikiError::Storage(format!("source search: {e}")))?;
@@ -437,12 +447,14 @@ pub fn search_source_fts(
             source_id,
             build_id,
             file_path,
+            title,
             heading_json,
             ordinal,
             range_start,
             range_end,
             snippet,
             rank,
+            body,
         ) = row.map_err(db)?;
         let heading_path: Vec<String> = serde_json::from_str(&heading_json).unwrap_or_default();
         out.push(SourceFtsHit {
@@ -450,12 +462,14 @@ pub fn search_source_fts(
             source_id: SourceId::from_validated(source_id),
             build_id,
             file_path,
+            title,
             heading_path,
             ordinal: ordinal as usize,
             range_start: range_start as usize,
             range_end: range_end as usize,
             snippet,
             rank,
+            body,
         });
     }
     Ok(out)

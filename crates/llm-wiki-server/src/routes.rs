@@ -587,8 +587,9 @@ async fn vector_candidates_for(
 /// budgeted, diversity-aware retrieval bundle with citations and truncation
 /// transparency.
 ///
-/// Length note: ~75 lines — parse → budget/vector helpers → one blocking
-/// assembly call → serialization; no logic deeper than the outcome `??`s.
+/// Length note: ~85 lines — parse → budget/vector helpers → one blocking
+/// assembly call → serialization (incl. the PR3 additive pass-through
+/// fields); no logic deeper than the outcome `??`s.
 pub async fn context(
     State(state): State<SharedState>,
     Extension(request_id): Extension<RequestId>,
@@ -637,6 +638,10 @@ pub async fn context(
                 "snippet": chunk.snippet,
                 "score": chunk.score,
                 "sources": chunk.sources,
+                // EPIC A PR3 pass-through (additive response fields; no new
+                // request fields until PR4).
+                "evidence_kind": chunk.evidence_kind,
+                "source_ref": chunk.source_ref,
             })
         })
         .collect();
@@ -662,6 +667,10 @@ pub async fn context(
         "estimated_tokens": assembled.estimated_tokens,
         "dropped": assembled.dropped,
         "truncated": assembled.dropped > 0,
+        // EPIC A PR3 pass-through: the retrieval mode and the per-side
+        // serving metadata (null for the legacy wiki-only path).
+        "served_mode": assembled.served_mode,
+        "degraded": assembled.degraded,
     })))
 }
 

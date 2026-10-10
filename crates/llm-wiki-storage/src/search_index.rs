@@ -153,7 +153,10 @@ pub fn probe_fts5(conn: &Connection) -> bool {
     available
 }
 
-fn fts_table_exists(conn: &Connection) -> Result<bool> {
+/// True when the lazily-created `wiki_fts` virtual table exists (i.e. some
+/// rebuild ran). Public since PR3: the fusion layer probes it to report an
+/// HONEST `IndexNotBuilt` degradation instead of an ambiguous no-match.
+pub fn fts_table_exists(conn: &Connection) -> Result<bool> {
     let count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'wiki_fts'",
