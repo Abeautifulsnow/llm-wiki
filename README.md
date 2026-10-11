@@ -166,6 +166,8 @@ max_rejected_claim_ratio = 0.10     # build fails above this unverifiable-output
 [planning]
 hierarchical = true                 # required for large trees; disabling fails loudly
 max_cluster_nodes = 24              # subdivide clusters beyond this (never truncate)
+reconcile_rounds = 64               # fail-closed ceiling on the progress-driven
+                                    # reconciliation loop; 0/omitted = 64
 
 [search]
 full_text = true

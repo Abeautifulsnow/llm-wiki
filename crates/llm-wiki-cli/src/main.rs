@@ -251,6 +251,12 @@ section_target_tokens = 6000
 max_plan_input_tokens = 32000
 max_rejected_claim_ratio = 0.10
 
+[planning]
+# Fail-closed safety ceiling on the batched reconciliation loop (the loop
+# itself is progress-driven and stops as soon as the payload fits one
+# request). 0 or omitted = 64; raise it for a model that merges slowly.
+reconcile_rounds = 64
+
 [search]
 full_text = true
 vector = false

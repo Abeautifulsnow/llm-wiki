@@ -240,6 +240,28 @@ pub struct PlanningConfig {
     /// Subdivide clusters beyond this node count (never truncate).
     #[serde(default = "default_max_cluster_nodes")]
     pub max_cluster_nodes: u32,
+    /// Fail-closed safety ceiling on the batched reconciliation loop
+    /// (PRD §14). The loop is progress-driven: it keeps going while each
+    /// round strictly shrinks the outstanding work (proposal count and
+    /// payload bytes) and stops as soon as the payload fits one request, so
+    /// this ceiling only bounds a pathological model that merges too slowly.
+    /// `0` or an omitted key means [`DEFAULT_RECONCILE_ROUNDS`].
+    #[serde(default = "default_reconcile_rounds")]
+    pub reconcile_rounds: u32,
+}
+
+impl PlanningConfig {
+    /// The reconciliation ceiling with the documented "0 = default"
+    /// sentinel resolved. Callers (build/replan wiring) use this instead of
+    /// the raw field so an explicit `reconcile_rounds = 0` behaves like an
+    /// omitted key rather than a zero-round (immediate) failure.
+    pub fn effective_reconcile_rounds(&self) -> u32 {
+        if self.reconcile_rounds == 0 {
+            DEFAULT_RECONCILE_ROUNDS
+        } else {
+            self.reconcile_rounds
+        }
+    }
 }
 
 /// Which corpus side(s) the retrieval endpoints draw from — the config AND
@@ -406,6 +428,14 @@ fn default_max_rejected_claim_ratio() -> f32 {
 fn default_max_cluster_nodes() -> u32 {
     24
 }
+/// Default reconciliation round ceiling (PRD §14): large enough that the
+/// progress-driven loop converges on real corpora, small enough to fail
+/// closed on a model that never merges. `[planning] reconcile_rounds`
+/// overrides it; `0` means "use this default".
+pub const DEFAULT_RECONCILE_ROUNDS: u32 = 64;
+fn default_reconcile_rounds() -> u32 {
+    DEFAULT_RECONCILE_ROUNDS
+}
 fn default_keep_generations() -> u32 {
     3
 }
@@ -476,6 +506,7 @@ impl Default for PlanningConfig {
         PlanningConfig {
             hierarchical: true,
             max_cluster_nodes: default_max_cluster_nodes(),
+            reconcile_rounds: default_reconcile_rounds(),
         }
     }
 }
@@ -603,7 +634,7 @@ impl Config {
     /// construction: config only stores env-var names (PRD §32).
     pub fn effective_summary(&self) -> String {
         format!(
-            "project.name = {}\nproject.wiki_dir = {}\nsource.root = {}\nsource.include = {:?}\nsource.exclude = {:?}\nllm.provider = {}\nllm.base_url = {}\nllm.model = {}\nllm.api_key_env = <env name: redacted>\nllm.max_concurrency = {}\nembedding.provider = {}\nembedding.base_url = {}\nembedding.model = {}\nembedding.api_key_env = <env name: redacted>\nsearch.rerank = {}\nsearch.source_mode = {}\nrerank.base_url = {}\nrerank.model = {}\nrerank.api_key_env = <env name: redacted>\nanalysis.max_input_tokens = {}\nanalysis.max_plan_input_tokens = {}\nanalysis.max_rejected_claim_ratio = {}\nplanning.hierarchical = {}\nplanning.max_cluster_nodes = {}\nbuild.incremental = {}\nbuild.keep_generations = {}\nserver.bind = {}\nserver.remote_enabled = {}",
+            "project.name = {}\nproject.wiki_dir = {}\nsource.root = {}\nsource.include = {:?}\nsource.exclude = {:?}\nllm.provider = {}\nllm.base_url = {}\nllm.model = {}\nllm.api_key_env = <env name: redacted>\nllm.max_concurrency = {}\nembedding.provider = {}\nembedding.base_url = {}\nembedding.model = {}\nembedding.api_key_env = <env name: redacted>\nsearch.rerank = {}\nsearch.source_mode = {}\nrerank.base_url = {}\nrerank.model = {}\nrerank.api_key_env = <env name: redacted>\nanalysis.max_input_tokens = {}\nanalysis.max_plan_input_tokens = {}\nanalysis.max_rejected_claim_ratio = {}\nplanning.hierarchical = {}\nplanning.max_cluster_nodes = {}\nplanning.reconcile_rounds = {}\nbuild.incremental = {}\nbuild.keep_generations = {}\nserver.bind = {}\nserver.remote_enabled = {}",
             self.project.name,
             self.project.wiki_dir.display(),
             self.source.root.display(),
@@ -625,6 +656,7 @@ impl Config {
             self.analysis.max_rejected_claim_ratio,
             self.planning.hierarchical,
             self.planning.max_cluster_nodes,
+            self.planning.effective_reconcile_rounds(),
             self.build.incremental,
             self.build.keep_generations,
             self.server.bind,
@@ -697,9 +729,24 @@ mod tests {
         let cfg = Config::default();
         assert!(cfg.planning.hierarchical);
         assert_eq!(cfg.planning.max_cluster_nodes, 24);
+        assert_eq!(cfg.planning.reconcile_rounds, 64);
+        assert_eq!(cfg.planning.effective_reconcile_rounds(), 64);
+        // 0 is the documented "use the default" sentinel — accepted, never a
+        // zero-round immediate failure.
+        let mut zero = Config::default();
+        zero.planning.reconcile_rounds = 0;
+        zero.validate().unwrap();
+        assert_eq!(zero.planning.effective_reconcile_rounds(), 64);
         let mut bad = Config::default();
         bad.planning.max_cluster_nodes = 1;
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn planning_reconcile_rounds_parses_from_toml() {
+        let cfg = Config::parse_toml("[planning]\nreconcile_rounds = 2\n").unwrap();
+        assert_eq!(cfg.planning.reconcile_rounds, 2);
+        assert_eq!(cfg.planning.effective_reconcile_rounds(), 2);
     }
 
     #[test]

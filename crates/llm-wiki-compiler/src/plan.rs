@@ -36,6 +36,11 @@ pub struct PlannerConfig {
     pub hierarchical: bool,
     pub max_cluster_nodes: usize,
     pub max_plan_input_tokens: u64,
+    /// Fail-closed safety ceiling on the batched reconciliation loop (PRD
+    /// §14, `[planning] reconcile_rounds`). The loop itself is
+    /// progress-driven; this only bounds a pathological model. Values below
+    /// 1 are clamped to 1 (the first round must always get a chance).
+    pub reconcile_rounds: usize,
     /// Instruction for output language; matches the analysis prompt contract.
     pub language: String,
     /// Per-request output ceiling (config `[llm] max_output_tokens`): thinking
@@ -53,6 +58,7 @@ impl Default for PlannerConfig {
             hierarchical: true,
             max_cluster_nodes: 24,
             max_plan_input_tokens: 32_000,
+            reconcile_rounds: llm_wiki_core::config::DEFAULT_RECONCILE_ROUNDS as usize,
             language: "the sources' language".to_owned(),
             max_output_tokens: 4096,
             max_concurrency: 4,
@@ -371,8 +377,17 @@ impl WikiPlanner {
     /// Guarantees preserved per round: coverage validated against that
     /// batch's proposed set; DUPLICATE across batches is impossible
     /// because batches partition the proposals.
-    /// Length note: ~60 lines — the multi-round loop, symmetric with the
-    /// cluster staging inside plan_hierarchical.
+    ///
+    /// CONVERGENCE (T1 DBX M0 slice 2): the loop is progress-driven, not
+    /// fixed-8. Each round's "outstanding work" is measured BEFORE its
+    /// request(s) as `(proposal count, payload bytes)`; a round is accepted
+    /// only while it STRICTLY shrinks at least one dimension. A round that
+    /// shrinks neither is degenerate (the model keeps echoing one page per
+    /// proposal) and fails immediately with an actionable message — never
+    /// after grinding to the ceiling, and never forever. The configurable
+    /// `[planning] reconcile_rounds` ceiling remains as the outer
+    /// fail-closed bound. Length note: ~95 lines — the multi-round loop,
+    /// symmetric with the cluster staging inside plan_hierarchical.
     async fn reconcile_rounds(
         &self,
         proposals: Vec<RawPage>,
@@ -382,6 +397,7 @@ impl WikiPlanner {
         proposal_summaries: &[String],
     ) -> Result<(Vec<RawPage>, u32)> {
         let task = PlannerTask::from(self);
+        let ceiling = self.config.reconcile_rounds.max(1);
         let mut round_proposals = proposals;
         let mut round_keys_summary: Vec<String> = summary_keys.to_vec();
         let mut round_keys_local: Vec<String> = local_keys.to_vec();
@@ -391,14 +407,21 @@ impl WikiPlanner {
         let mut reconcile_requests = 0u32;
         let merged: Vec<RawPage>;
         let mut rounds = 0usize;
+        // Outstanding work of the PREVIOUS round's input, used for the
+        // progress check at the top of each subsequent round. `None` on the
+        // first round: there is nothing to compare against, and the
+        // single-request path must stay byte-identical (no extra work).
+        let mut previous: Option<(usize, usize)> = None;
         loop {
             rounds += 1;
-            if rounds > MAX_RECONCILE_ROUNDS {
-                // #C02 fail-closed: convergence relies on every batched round
-                // merging its batches into fewer pages. A degenerate model
-                // that echoes one page per proposal would loop forever.
+            if rounds > ceiling {
+                // #C02 fail-closed outer bound: the progress check below
+                // catches a non-merging model quickly; this ceiling is the
+                // hard stop for a model that shrinks a little every round
+                // but never enough to fit.
                 return Err(WikiError::Planning(format!(
-                    "reconciliation did not converge after {MAX_RECONCILE_ROUNDS} rounds; the model keeps returning one page per proposal — narrow the corpus or raise max_plan_input_tokens (PRD §14 forbids truncation)"
+                    "reconciliation did not converge after {ceiling} rounds ([planning] reconcile_rounds); the model keeps returning one page per proposal — check [analysis] max_plan_input_tokens = {} and raise [planning] reconcile_rounds (PRD §14 forbids truncation)",
+                    self.config.max_plan_input_tokens
                 )));
             }
             // §31 cooperative cancellation: stop before the next round's
@@ -410,6 +433,19 @@ impl WikiPlanner {
                 &round_keys_local,
                 round_summaries,
             );
+            let outstanding = (round_proposals.len(), reconcile_json.len());
+            if let Some((prev_proposals, prev_bytes)) = previous {
+                if outstanding.0 >= prev_proposals && outstanding.1 >= prev_bytes {
+                    // PRD §14 degenerate-model guard: a round that neither
+                    // shrank the proposal count nor the payload made no
+                    // progress, so continuing would only burn requests until
+                    // the ceiling. Fail now, actionably.
+                    return Err(WikiError::Planning(format!(
+                        "reconciliation did not converge: a round made no progress — proposals {prev_proposals} → {} and payload {prev_bytes} → {} bytes both stopped shrinking; the model keeps returning one page per proposal — check [analysis] max_plan_input_tokens = {} and [planning] reconcile_rounds = {ceiling} (PRD §14 forbids truncation)",
+                        outstanding.0, outstanding.1, self.config.max_plan_input_tokens
+                    )));
+                }
+            }
             let single_round = reconcile_json.len() <= MAX_RECONCILE_PAYLOAD_BYTES;
             if single_round {
                 task.ensure_stage_budget(&reconcile_json, "reconciliation")?;
@@ -449,6 +485,7 @@ impl WikiPlanner {
                 reconcile_requests += requests;
                 next_round.extend(batch_merged);
             }
+            previous = Some(outstanding);
             round_proposals = next_round;
             round_summaries = None;
             round_keys_summary = round_proposals
@@ -916,12 +953,6 @@ fn compact_payload(base: &KnowledgeBase, ids: &[KnowledgeNodeId], summary: &str)
 /// batched reconciliation (T1 Run 13: a 60-doc corpus produced ~506K chars —
 /// ~126K tokens — against a 32K-token budget).
 const MAX_RECONCILE_PAYLOAD_BYTES: usize = 96_000;
-
-/// Reconciliation must converge: every batched round merges its batches into
-/// strictly fewer pages (each batch yields fewer pages than it consumed
-/// proposals). PRD §14 fail-closed: a degenerate model that keeps echoing one
-/// page per proposal stops here instead of looping forever.
-const MAX_RECONCILE_ROUNDS: usize = 8;
 
 /// Deterministic synthetic key for a batch-round page: derived from the
 /// page's own content, so identical proposals produce the identical prompt —

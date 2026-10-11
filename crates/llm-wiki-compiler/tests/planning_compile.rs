@@ -5,7 +5,8 @@
 //! Node ids are opaque registry-assigned ULIDs, so every scripted response
 //! references the ids returned by the registry in this run — never literals.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rusqlite::{params, Connection};
@@ -297,6 +298,50 @@ fn seed_knowledge(conn: &mut Connection) -> Seeded {
 
 fn summary_response(text: &str) -> String {
     serde_json::json!({ "summary": text }).to_string()
+}
+
+/// Seeds `count` anchor-less claim nodes (no sources, no relations). With a
+/// large `max_cluster_nodes` the cluster step yields ONE cluster holding all
+/// of them, so the reconcile loop sees `count` proposals in its first round.
+fn seed_flat_nodes(conn: &mut Connection, count: usize) -> Vec<String> {
+    let drafts: Vec<NodeDraft> = (0..count)
+        .map(|i| NodeDraft {
+            kind: NodeKind::Claim,
+            canonical_key: format!("flat-node-{i:04}"),
+            canonical_name: format!("Flat Node {i:04}"),
+            entity_type: None,
+            description: None,
+        })
+        .collect();
+    get_or_create_batch(conn, &drafts, None)
+        .unwrap()
+        .into_iter()
+        .map(|id| id.as_str().to_owned())
+        .collect()
+}
+
+/// Every quoted node id (`"kn_<ULID>"`) appearing in a prompt, sorted and
+/// deduped. The planning payload always renders `knowledge_refs` as a JSON
+/// array of quoted ids; stage templates only ever contain the `<node id>`
+/// placeholder, so this is exactly the refs a request carries.
+fn refs_in(prompt: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = prompt;
+    while let Some(pos) = rest.find("\"kn_") {
+        let tail = &rest[pos + 1..];
+        let end = tail.find('"').unwrap_or(tail.len());
+        out.push(tail[..end].to_owned());
+        rest = &tail[end..];
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The reconcile prompt carries one `"index"` field per proposal (the stage
+/// template's `merge_of` example has none), so this counts the batch size.
+fn proposal_count_in(prompt: &str) -> usize {
+    prompt.matches("\"index\":").count()
 }
 
 fn plan_response(pages: Vec<serde_json::Value>) -> String {
@@ -790,11 +835,129 @@ async fn oversized_reconcile_payload_batches_before_budget_validation() {
     );
 }
 
-/// #C02 regression: a degenerate reconcile that echoes one page per proposal
-/// (huge purposes keep every round over the single-round ceiling) must fail
-/// closed after MAX_RECONCILE_ROUNDS instead of looping forever.
+/// A FakeLlmProvider whose reconcile stage returns exactly ONE page per
+/// REQUEST (merging everything the request proposed) — the "one page per
+/// proposal" model that stalled the 4-doc DBX M0 build. While a request still
+/// carries more than one proposal the merged page keeps a large purpose, so
+/// the payload only shrinks slowly across rounds and many rounds are needed;
+/// a lone leftover proposal has nothing to merge, so its page shrinks — that
+/// is what lets the tail collapse onto the single-request path.
+fn one_page_per_request_provider(
+    big_purpose: usize,
+    reconcile_calls: Arc<AtomicUsize>,
+) -> FakeLlmProvider {
+    FakeLlmProvider::new(
+        "fake-one-page",
+        Arc::new(move |request: &LlmRequest| {
+            let prompt = &request.prompt;
+            if prompt.contains(SUMMARY_MARK) {
+                return Ok(summary_response("s"));
+            }
+            if prompt.contains(LOCAL_MARK) {
+                let pages: Vec<serde_json::Value> = refs_in(prompt)
+                    .into_iter()
+                    .map(|id| {
+                        serde_json::json!({
+                            "title": format!("Page {id}"),
+                            "category": "concepts",
+                            "purpose": "p".repeat(big_purpose),
+                            "knowledge_refs": [id],
+                        })
+                    })
+                    .collect();
+                return Ok(plan_response(pages));
+            }
+            if prompt.contains(RECONCILE_MARK) {
+                reconcile_calls.fetch_add(1, Ordering::SeqCst);
+                let refs = refs_in(prompt);
+                let proposals = proposal_count_in(prompt);
+                let purpose = if proposals > 1 {
+                    "p".repeat(big_purpose)
+                } else {
+                    "merged".to_owned()
+                };
+                return Ok(plan_response(vec![serde_json::json!({
+                    "title": "Merged",
+                    "category": "concepts",
+                    "purpose": purpose,
+                    "knowledge_refs": refs,
+                })]));
+            }
+            Err(LlmError::Api {
+                code: 500,
+                message: "no stage matched".into(),
+            })
+        }),
+    )
+}
+
+/// PRD §2.3.1 (progress-driven convergence): a model that returns exactly one
+/// page per reconcile request must CONVERGE even when the corpus needs more
+/// than the old hardcoded 8 rounds. 320 singleton proposals, each carrying a
+/// ~50KB purpose, shrink the payload only ~2x per round, so 9+ rounds are
+/// required; on the pre-change code the loop dies at round 8. The single
+/// final round then merges the remnants onto one page covering every node.
 #[tokio::test]
-async fn non_converging_reconcile_fails_closed_after_the_round_cap() {
+async fn one_page_per_reconcile_request_converges_beyond_the_old_round_cap() {
+    const NODES: usize = 320;
+    let mut conn = open_in_memory().unwrap();
+    let nodes = seed_flat_nodes(&mut conn, NODES);
+    let base = load_knowledge_base(&conn).unwrap();
+
+    let reconcile_calls = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(one_page_per_request_provider(
+        50_000,
+        Arc::clone(&reconcile_calls),
+    ));
+    let prompt = load_prompt("wiki-planning", None).unwrap();
+    // Default ceiling (the NEW 64) is what lets this converge; the OLD
+    // hardcoded 8 is what makes it fail before the fix. The plan-input budget
+    // is raised because each round's batch payload carries every cluster's
+    // synthetic keys alongside its pages.
+    let config = PlannerConfig {
+        max_plan_input_tokens: 120_000,
+        ..PlannerConfig::default()
+    };
+    let planner = WikiPlanner::new(provider.clone(), prompt, config);
+    let outcome = planner.plan(&base, 4).await.unwrap();
+
+    // The last (single-request) round merges the remnants into one page that
+    // still covers every proposed node — no knowledge dropped (PRD §14).
+    assert_eq!(
+        outcome.plan.pages.len(),
+        1,
+        "final merge collapses to 1 page"
+    );
+    let covered: BTreeSet<String> = outcome.plan.pages[0]
+        .knowledge_refs
+        .iter()
+        .map(|id| id.as_str().to_owned())
+        .collect();
+    assert_eq!(
+        covered,
+        nodes.iter().cloned().collect::<BTreeSet<_>>(),
+        "every node survives the merge"
+    );
+    assert_eq!(outcome.plan.pages[0].title, "Merged");
+
+    // Proof the corpus needed MORE than the old 8-round cap: the OLD code
+    // errored ("did not converge after 8 rounds") on this exact corpus.
+    let rounds_proxy = reconcile_calls.load(Ordering::SeqCst);
+    assert!(
+        rounds_proxy > 8,
+        "expected more than the old 8-round cap of reconcile work, got {rounds_proxy} requests"
+    );
+}
+
+/// PRD §2.3.2 (zero-progress fail-fast): a reconcile that echoes one page per
+/// proposal (huge purposes keep every round over the single-round ceiling and
+/// the proposal count never shrinks) must stop as soon as a round shrinks
+/// NEITHER proposals nor payload — never grind to the ceiling, never loop
+/// forever. The error must be actionable: it names the `[analysis]` section of
+/// `max_plan_input_tokens` AND the new `[planning] reconcile_rounds` knob, and
+/// states the likely cause.
+#[tokio::test]
+async fn zero_progress_reconcile_fails_fast_with_actionable_message() {
     let mut conn = open_in_memory().unwrap();
     let seeded = seed_knowledge(&mut conn);
     let known = [
@@ -804,6 +967,8 @@ async fn non_converging_reconcile_fails_closed_after_the_round_cap() {
         seeded.claim_b.clone(),
     ];
 
+    let reconcile_calls = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::clone(&reconcile_calls);
     let known_for_handler = known.clone();
     let handler = Arc::new(move |request: &LlmRequest| {
         let prompt = &request.prompt;
@@ -825,6 +990,7 @@ async fn non_converging_reconcile_fails_closed_after_the_round_cap() {
             })]));
         }
         if prompt.contains(RECONCILE_MARK) {
+            calls.fetch_add(1, Ordering::SeqCst);
             // Degenerate echo: one page per BIGPURPOSE marker, purposes kept
             // huge so every round stays over the single-round ceiling and the
             // proposal count never shrinks.
@@ -863,13 +1029,78 @@ async fn non_converging_reconcile_fails_closed_after_the_round_cap() {
         message.contains("did not converge"),
         "actionable: {message}"
     );
+    assert!(
+        message.contains("[analysis] max_plan_input_tokens"),
+        "must name the section of the token budget: {message}"
+    );
+    assert!(
+        message.contains("[planning] reconcile_rounds"),
+        "must name the new ceiling knob: {message}"
+    );
+    assert!(
+        message.contains("one page per proposal"),
+        "must state the likely cause: {message}"
+    );
 
-    // Bounded work: 4 summaries + 4 locals + at most MAX_RECONCILE_ROUNDS
-    // reconcile rounds of 2 batched requests — then it stops.
+    // Bounded work: the round that shrank nothing fails immediately, so a
+    // handful of reconcile requests — NOT the (ceil*2) grind the old cap
+    // allowed. 4 summaries + 4 locals + <= 2 rounds x 2 batched requests.
+    let reconcile_requests = reconcile_calls.load(Ordering::SeqCst);
+    assert!(
+        reconcile_requests <= 6,
+        "the reconcile loop should fail fast, ran {reconcile_requests} requests"
+    );
     let requests = provider.request_count();
     assert!(
-        requests <= 4 + 4 + 8 * 2,
+        requests <= 4 + 4 + 6,
         "the reconcile loop ran away: {requests} requests"
+    );
+}
+
+/// PRD §2.3 + §3.3 (ceiling honored): the SAME corpus that converges under
+/// the default ceiling fails closed when `[planning] reconcile_rounds` is set
+/// to a tiny value, and the error names the knob.
+#[tokio::test]
+async fn reconcile_rounds_ceiling_is_honored() {
+    let mut conn = open_in_memory().unwrap();
+    let nodes = seed_flat_nodes(&mut conn, 8);
+    let base = load_knowledge_base(&conn).unwrap();
+    let prompt = load_prompt("wiki-planning", None).unwrap();
+
+    // Default ceiling: the 8-proposal corpus converges in a few rounds.
+    let default_provider = Arc::new(one_page_per_request_provider(
+        50_000,
+        Arc::new(AtomicUsize::new(0)),
+    ));
+    let converged = WikiPlanner::new(default_provider, prompt.clone(), PlannerConfig::default())
+        .plan(&base, 4)
+        .await
+        .unwrap();
+    assert_eq!(converged.plan.pages.len(), 1);
+    let covered: BTreeSet<String> = converged.plan.pages[0]
+        .knowledge_refs
+        .iter()
+        .map(|id| id.as_str().to_owned())
+        .collect();
+    assert_eq!(covered, nodes.into_iter().collect::<BTreeSet<_>>());
+
+    let tiny_provider = Arc::new(one_page_per_request_provider(
+        50_000,
+        Arc::new(AtomicUsize::new(0)),
+    ));
+    let config = PlannerConfig {
+        reconcile_rounds: 2,
+        ..PlannerConfig::default()
+    };
+    let error = WikiPlanner::new(tiny_provider, prompt, config)
+        .plan(&base, 4)
+        .await
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("did not converge"), "{message}");
+    assert!(
+        message.contains("[planning] reconcile_rounds"),
+        "the ceiling error must name the knob: {message}"
     );
 }
 

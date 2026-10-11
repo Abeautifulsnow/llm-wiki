@@ -1099,6 +1099,7 @@ async fn build_full_pipeline(
         hierarchical: config.planning.hierarchical,
         max_cluster_nodes: config.planning.max_cluster_nodes as usize,
         max_plan_input_tokens: config.analysis.max_plan_input_tokens as u64,
+        reconcile_rounds: config.planning.effective_reconcile_rounds() as usize,
         max_output_tokens: config.llm.max_output_tokens,
         max_concurrency: config.llm.max_concurrency.max(1) as usize,
         ..PlannerConfig::default()
