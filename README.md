@@ -109,6 +109,28 @@ raise `[llm] max_output_tokens` (e.g. 32768) or analysis fails with
 | `status` | Source counts and the latest build. |
 | `doctor [--live]` | Config validation, source root, state db, publish integrity, FTS5 availability, API-key env. Every FAIL prints the command that fixes it. `--live` additionally makes one real request per configured endpoint (chat, embedding, rerank) — the only way to tell a configured endpoint from a live one. Reports, never repairs. |
 
+### Machine-readable output (`--json`)
+
+Every command accepts a global `--json` flag (before or after the
+subcommand). Instead of human-readable text it prints **one JSON object on
+stdout**; errors stay on stderr and the exit code is unchanged, so stdout is
+either empty or exactly one valid JSON document. Field names mirror the
+protocol v1 HTTP payloads (`docs/agent-protocol.md`) wherever the same
+concept exists, so one parser covers both `llm-wiki --json` and `/v1/*`.
+Commands that need a published wiki report `{"published": false}` — the JSON
+form of the "nothing published" line, still exit 0:
+
+```bash
+llm-wiki status --json | jq '.sources'
+llm-wiki search "认证流程" --json | jq '.hits[].title'
+llm-wiki doctor --json | jq '.checks[] | select(.status == "fail") | .remedy'
+llm-wiki lint --json          # findings + errors/warnings; still exits 11 on errors
+```
+
+`doctor` reports per-check `{label, status: ok|fail|skip, detail, remedy}`,
+`lint` reports `{findings, errors, warnings, semantic}`, and `build`/`replan`
+carry their full report (cache stats, incremental summary, plan diff).
+
 ## Configuration
 
 Config lives at `.llm-wiki/config.toml`. Priority is fixed:

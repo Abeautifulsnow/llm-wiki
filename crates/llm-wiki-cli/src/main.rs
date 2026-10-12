@@ -2,6 +2,8 @@
 //! `llm-wiki` CLI. Per PRD §7.7 this crate only parses arguments and calls
 //! application services; all logic lives in the library crates.
 
+mod output;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -15,6 +17,18 @@ use llm_wiki_llm::{
 use llm_wiki_search::FullTextSearch;
 use llm_wiki_source::{ScanDiagnostic, Scanner, SourceManifest};
 
+use output::{Check, CheckStatus};
+
+/// Prints one JSON object on stdout. `--json` makes stdout the machine channel
+/// (see `output.rs`); the human text a command would otherwise print is
+/// suppressed, never mixed in.
+fn print_json(value: &serde_json::Value) {
+    match serde_json::to_string_pretty(value) {
+        Ok(text) => println!("{text}"),
+        Err(err) => eprintln!("error: cannot serialize json output: {err}"),
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "llm-wiki",
@@ -22,6 +36,13 @@ use llm_wiki_source::{ScanDiagnostic, Scanner, SourceManifest};
     about = "Knowledge Compiler: compile docs into a cited, maintainable wiki"
 )]
 struct Cli {
+    /// Emit a machine-readable JSON object on stdout instead of human-readable
+    /// text. stdout carries at most one such object; errors stay on stderr and
+    /// the process exit code is unchanged. Field names mirror the protocol v1
+    /// HTTP payloads where the same concept exists.
+    #[arg(long, global = true)]
+    json: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -131,9 +152,13 @@ fn main() {
         .init();
 
     let cli = Cli::parse();
-    let code = match run(cli.command) {
+    let json = cli.json;
+    let code = match run(cli.command, json) {
         Ok(()) => 0,
         Err(err) => {
+            // Errors stay on stderr in both modes: stdout carries at most one
+            // JSON object (the command's data), so a report-emitting command
+            // like `doctor`/`lint` that also returns Err never doubles it.
             eprintln!("error: {err}");
             err.exit_code()
         }
@@ -141,26 +166,33 @@ fn main() {
     std::process::exit(code);
 }
 
-fn run(command: Command) -> Result<(), WikiError> {
+fn run(command: Command, json: bool) -> Result<(), WikiError> {
     let workspace = std::env::current_dir()
         .map_err(|e| WikiError::Source(format!("cannot determine cwd: {e}")))?;
     match command {
-        Command::Init => init(&workspace),
-        Command::Scan { root } => scan(&workspace, root.as_deref()),
-        Command::Build { root } => build(&workspace, root.as_deref()),
-        Command::Replan { dry_run } => replan(&workspace, dry_run),
-        Command::Status => status(&workspace),
-        Command::Search { query } => search(&workspace, &query),
-        Command::Doctor { live } => doctor(&workspace, live),
+        Command::Init => init(&workspace, json),
+        Command::Scan { root } => scan(&workspace, root.as_deref(), json),
+        Command::Build { root } => build(&workspace, root.as_deref(), json),
+        Command::Replan { dry_run } => replan(&workspace, dry_run, json),
+        Command::Status => status(&workspace, json),
+        Command::Search { query } => search(&workspace, &query, json),
+        Command::Doctor { live } => doctor(&workspace, live, json),
         Command::Ask {
             query,
             write_back,
             hybrid,
             embedding_model,
-        } => ask(&workspace, &query, write_back, hybrid, embedding_model),
-        Command::Embed { model, batch } => embed(&workspace, model.as_deref(), batch),
-        Command::Lint { semantic } => lint(&workspace, semantic),
-        Command::Serve { host, port } => serve(&workspace, host, port),
+        } => ask(
+            &workspace,
+            &query,
+            write_back,
+            hybrid,
+            embedding_model,
+            json,
+        ),
+        Command::Embed { model, batch } => embed(&workspace, model.as_deref(), batch, json),
+        Command::Lint { semantic } => lint(&workspace, semantic, json),
+        Command::Serve { host, port } => serve(&workspace, host, port, json),
     }
 }
 
@@ -176,7 +208,7 @@ fn load_config(workspace: &Path) -> Result<Config, WikiError> {
     Config::load(workspace)
 }
 
-fn init(workspace: &Path) -> Result<(), WikiError> {
+fn init(workspace: &Path, json: bool) -> Result<(), WikiError> {
     let dir = state_dir(workspace);
     let config_path = dir.join("config.toml");
     if config_path.exists() {
@@ -190,8 +222,12 @@ fn init(workspace: &Path) -> Result<(), WikiError> {
     let toml_body = toml_string(&Config::default())?;
     std::fs::write(&config_path, toml_body)
         .map_err(|e| WikiError::Source(format!("cannot write config: {e}")))?;
-    println!("created {}", config_path.display());
-    println!("next: edit source.root / llm settings, then run `llm-wiki scan`");
+    if json {
+        print_json(&output::init(&config_path));
+    } else {
+        println!("created {}", config_path.display());
+        println!("next: edit source.root / llm settings, then run `llm-wiki scan`");
+    }
     Ok(())
 }
 
@@ -287,7 +323,7 @@ resume_interrupted_jobs = false
     )
 }
 
-fn scan(workspace: &Path, root_override: Option<&str>) -> Result<(), WikiError> {
+fn scan(workspace: &Path, root_override: Option<&str>, json: bool) -> Result<(), WikiError> {
     let config = load_config(workspace)?;
     let root = match root_override {
         Some(root) => PathBuf::from(root),
@@ -301,19 +337,24 @@ fn scan(workspace: &Path, root_override: Option<&str>) -> Result<(), WikiError> 
         &config.source.exclude,
         wiki_dir_rel,
     )?;
-    let output = scanner.scan()?;
+    let scanned = scanner.scan()?;
 
-    for diagnostic in &output.diagnostics {
-        warn_diagnostic(diagnostic);
+    if !json {
+        for diagnostic in &scanned.diagnostics {
+            warn_diagnostic(diagnostic);
+        }
     }
 
-    let manifest = SourceManifest::from_scanned(&output.files);
-    println!(
-        "scanned {} file(s) under {} (snapshot {})",
-        output.files.len(),
-        root.display(),
-        &manifest.snapshot_hash()[..16]
-    );
+    let manifest = SourceManifest::from_scanned(&scanned.files);
+    let snapshot = manifest.snapshot_hash().to_owned();
+    if !json {
+        println!(
+            "scanned {} file(s) under {} (snapshot {})",
+            scanned.files.len(),
+            root.display(),
+            &snapshot[..16]
+        );
+    }
 
     let db_path = state_db(workspace);
     std::fs::create_dir_all(state_dir(workspace))
@@ -321,7 +362,7 @@ fn scan(workspace: &Path, root_override: Option<&str>) -> Result<(), WikiError> 
     let mut conn = llm_wiki_storage::open(&db_path)?;
 
     // One transaction for the whole scan — no per-file commits.
-    let batch: Vec<llm_wiki_storage::SourceUpsert> = output
+    let batch: Vec<llm_wiki_storage::SourceUpsert> = scanned
         .files
         .iter()
         .map(|file| llm_wiki_storage::SourceUpsert {
@@ -332,7 +373,21 @@ fn scan(workspace: &Path, root_override: Option<&str>) -> Result<(), WikiError> 
         })
         .collect();
     let _results = llm_wiki_storage::upsert_sources_batch(&mut conn, &batch, None)?;
-    for file in &output.files {
+
+    if json {
+        // Absolute so `scan` and `build` report the same shape for the same
+        // concept (build resolves it the same way).
+        let source_root = lexical_absolute(workspace, &root);
+        print_json(&output::scan(
+            &source_root,
+            &scanned.files,
+            &snapshot[..16],
+            &db_path,
+            &scanned.diagnostics,
+        ));
+        return Ok(());
+    }
+    for file in &scanned.files {
         println!(
             "  {:<60} {} bytes  {}",
             file.rel_path,
@@ -342,7 +397,7 @@ fn scan(workspace: &Path, root_override: Option<&str>) -> Result<(), WikiError> 
     }
     println!(
         "source registry: {} file(s) up to date in {}",
-        output.files.len(),
+        scanned.files.len(),
         db_path.display()
     );
     Ok(())
@@ -389,7 +444,7 @@ fn build_provider(llm: &LlmConfig) -> Result<Arc<dyn llm_wiki_llm::LlmProvider>,
 /// `llm-wiki build [root]` (PRD §29): thin transport over
 /// `llm_wiki_compiler::run_build`. `ReplanRequired` propagates with its exit
 /// code (7) and trigger reason — the CLI never auto-replans.
-fn build(workspace: &Path, root_override: Option<&str>) -> Result<(), WikiError> {
+fn build(workspace: &Path, root_override: Option<&str>, json: bool) -> Result<(), WikiError> {
     let mut config = load_config(workspace)?;
     if let Some(root) = root_override {
         config.source.root = PathBuf::from(root);
@@ -398,17 +453,25 @@ fn build(workspace: &Path, root_override: Option<&str>) -> Result<(), WikiError>
     let provider = build_provider(&config.llm)?;
 
     let wiki_abs = lexical_absolute(workspace, &config.project.wiki_dir);
-    println!(
-        "build: sources {} → wiki {}",
-        config.source.root.display(),
-        wiki_abs.display()
-    );
+    if !json {
+        println!(
+            "build: sources {} → wiki {}",
+            config.source.root.display(),
+            wiki_abs.display()
+        );
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| WikiError::Llm(format!("cannot start async runtime: {e}")))?;
     let report = runtime.block_on(llm_wiki_compiler::run_build(workspace, &config, provider))?;
+
+    if json {
+        let source_root = lexical_absolute(workspace, &config.source.root);
+        print_json(&output::build(&source_root, &wiki_abs, &report));
+        return Ok(());
+    }
 
     println!("build {} completed", report.build_id);
     println!("  sources: {}", report.sources);
@@ -444,16 +507,20 @@ fn build(workspace: &Path, root_override: Option<&str>) -> Result<(), WikiError>
 /// Length note: ~91 lines — report formatting only (linear println branches over ReplanReport fields), no nesting.
 /// `llm-wiki replan [--dry-run]` (PRD §29/§19.2): thin transport over the
 /// compiler's replan service.
-fn replan(workspace: &Path, dry_run: bool) -> Result<(), WikiError> {
+fn replan(workspace: &Path, dry_run: bool, json: bool) -> Result<(), WikiError> {
     let config = load_config(workspace)?;
     config.validate()?;
     let provider = build_provider(&config.llm)?;
 
-    if dry_run {
-        println!("replan --dry-run: auditing the global plan change (no compile, no publish)");
-        println!("  note: pending source changes are analyzed and the knowledge registry is updated; the published wiki is not touched");
-    } else {
-        println!("replan: fresh planning + stable-ID plan diff + recompile of every changed page");
+    if !json {
+        if dry_run {
+            println!("replan --dry-run: auditing the global plan change (no compile, no publish)");
+            println!("  note: pending source changes are analyzed and the knowledge registry is updated; the published wiki is not touched");
+        } else {
+            println!(
+                "replan: fresh planning + stable-ID plan diff + recompile of every changed page"
+            );
+        }
     }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -463,6 +530,11 @@ fn replan(workspace: &Path, dry_run: bool) -> Result<(), WikiError> {
     let report = runtime.block_on(llm_wiki_compiler::replan(
         workspace, &config, provider, dry_run,
     ))?;
+
+    if json {
+        print_json(&output::replan(&report));
+        return Ok(());
+    }
 
     for trigger in &report.triggers {
         println!("  trigger: {trigger}");
@@ -537,22 +609,34 @@ fn replan(workspace: &Path, dry_run: bool) -> Result<(), WikiError> {
     Ok(())
 }
 
+/// How many search hits are returned at most. The fetch asks for one more so
+/// `truncated` can be reported honestly.
+const SEARCH_LIMIT: usize = 10;
+
 /// `llm-wiki search <query>` (PRD §5.5/§20): thin transport over
 /// `llm_wiki_search::FullTextSearch`. Prints ranked page sections with body
 /// snippets; a never-built workspace is not an error. With
 /// `config.search.graph = true` the top hit gains a one-hop "related" line
 /// from the §17 Wiki Graph (§22 limits: depth 1, max 10 nodes).
-fn search(workspace: &Path, query: &str) -> Result<(), WikiError> {
+fn search(workspace: &Path, query: &str, json: bool) -> Result<(), WikiError> {
     let config = load_config(workspace)?;
     let db_path = state_db(workspace);
     if !db_path.exists() {
-        println!("nothing published; run build first");
+        if json {
+            print_json(&output::not_published());
+        } else {
+            println!("nothing published; run build first");
+        }
         return Ok(());
     }
     let conn = llm_wiki_storage::open(&db_path)?;
     let fts = llm_wiki_search::SqliteFullTextSearch::new(conn, config.search.full_text);
     if !fts.has_published()? {
-        println!("nothing published; run build first");
+        if json {
+            print_json(&output::not_published());
+        } else {
+            println!("nothing published; run build first");
+        }
         return Ok(());
     }
 
@@ -560,8 +644,16 @@ fn search(workspace: &Path, query: &str) -> Result<(), WikiError> {
         .enable_all()
         .build()
         .map_err(|e| WikiError::Llm(format!("cannot start async runtime: {e}")))?;
-    let hits = runtime.block_on(fts.search(query, 10))?;
+    // Over-fetch by one so `truncated` is honest: the same limit+1 shape the
+    // HTTP wiki search path uses.
+    let mut hits = runtime.block_on(fts.search(query, SEARCH_LIMIT + 1))?;
+    let truncated = hits.len() > SEARCH_LIMIT;
+    hits.truncate(SEARCH_LIMIT);
 
+    if json {
+        print_json(&output::search(&hits, truncated));
+        return Ok(());
+    }
     if hits.is_empty() {
         println!("no results for {query:?}");
         return Ok(());
@@ -687,6 +779,7 @@ fn ask(
     write_back: bool,
     hybrid: bool,
     embedding_model_flag: Option<String>,
+    json: bool,
 ) -> Result<(), WikiError> {
     let config = load_config(workspace)?;
     let provider = build_provider(&config.llm)?;
@@ -718,9 +811,17 @@ fn ask(
         hybrid_context,
     ))?
     else {
-        println!("nothing published — build the wiki first");
+        if json {
+            print_json(&output::not_published());
+        } else {
+            println!("nothing published — build the wiki first");
+        }
         return Ok(());
     };
+    if json {
+        print_json(&output::ask(&report));
+        return Ok(());
+    }
     println!("{}", report.answer);
     if !report.sources.is_empty() {
         println!("\nsources:");
@@ -736,7 +837,7 @@ fn ask(
 }
 
 /// `llm-wiki embed` (§19.3): incremental embedding backfill.
-fn embed(workspace: &Path, model: Option<&str>, batch: usize) -> Result<(), WikiError> {
+fn embed(workspace: &Path, model: Option<&str>, batch: usize, json: bool) -> Result<(), WikiError> {
     let config = load_config(workspace)?;
     let model = embedding_model(model, &config)?;
     let embedding_provider = build_embedding_provider(&config)?;
@@ -752,9 +853,17 @@ fn embed(workspace: &Path, model: Option<&str>, batch: usize) -> Result<(), Wiki
         batch,
     ))?
     else {
-        println!("nothing published — build the wiki first");
+        if json {
+            print_json(&output::not_published());
+        } else {
+            println!("nothing published — build the wiki first");
+        }
         return Ok(());
     };
+    if json {
+        print_json(&output::embed(&report));
+        return Ok(());
+    }
     println!(
         "embeddings [{}]: {} section(s), {} already covered, {} embedded",
         report.model, report.total_sections, report.covered_before, report.embedded
@@ -767,12 +876,29 @@ fn embed(workspace: &Path, model: Option<&str>, batch: usize) -> Result<(), Wiki
 /// deterministic order; any Error-severity finding exits with the dedicated
 /// lint code (11), warnings alone exit 0. A never-built workspace is not an
 /// error.
-fn lint(workspace: &Path, semantic: bool) -> Result<(), WikiError> {
+fn lint(workspace: &Path, semantic: bool, json: bool) -> Result<(), WikiError> {
     let config = load_config(workspace)?;
     let Some(report) = llm_wiki_compiler::run_lint(workspace, &config)? else {
-        println!("nothing published — nothing to lint");
+        if json {
+            print_json(&output::not_published());
+        } else {
+            println!("nothing published — nothing to lint");
+        }
         return Ok(());
     };
+
+    // `--json` emits one complete object, so the advisory semantic review (when
+    // asked for) must run before it. The text path prints the structural report
+    // first, then the review — the order a human expects.
+    if json {
+        let semantic_report = if semantic {
+            run_semantic_review(workspace, &config)?
+        } else {
+            None
+        };
+        print_json(&output::lint(&report, semantic_report.as_ref()));
+        return lint_exit(&report);
+    }
 
     let mut current: Option<llm_wiki_compiler::LintCheck> = None;
     for finding in &report.findings {
@@ -790,60 +916,89 @@ fn lint(workspace: &Path, semantic: bool) -> Result<(), WikiError> {
 
     let (errors, warnings) = (report.errors(), report.warnings());
     println!("{errors} error(s), {warnings} warning(s)");
-    let exit = if errors > 0 {
-        Err(WikiError::Lint { errors, warnings })
-    } else {
-        Ok(())
-    };
 
     // Semantic review (audit FIX-019): advisory, printed after the
     // structural report, never affecting the exit code.
     if semantic {
-        let provider = build_provider(&config.llm)?;
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| WikiError::Llm(format!("cannot start async runtime: {e}")))?;
-        let semantic_report = runtime.block_on(llm_wiki_compiler::run_semantic_lint(
-            workspace, &config, provider,
-        ))?;
-        if let Some(semantic_report) = semantic_report {
-            println!("semantic review (advisory):");
-            let mut current_kind: Option<llm_wiki_compiler::SemanticFindingKind> = None;
-            for finding in &semantic_report.findings {
-                if current_kind != Some(finding.kind) {
-                    println!("  {}:", finding.kind.label());
-                    current_kind = Some(finding.kind);
-                }
-                let claims = if finding.claim_ids.is_empty() {
-                    String::new()
-                } else {
-                    format!(" [{}]", finding.claim_ids.join(", "))
-                };
-                println!("    {}{claims}: {}", finding.page_slug, finding.message);
-            }
-            println!(
-                "  {} page(s) reviewed, {} finding(s), skipped: {}",
-                semantic_report.pages_reviewed,
-                semantic_report.findings.len(),
-                if semantic_report.skipped_pages.is_empty() {
-                    "none".to_owned()
-                } else {
-                    semantic_report.skipped_pages.join(", ")
-                }
-            );
+        if let Some(semantic_report) = run_semantic_review(workspace, &config)? {
+            print_semantic_review(&semantic_report);
         }
     }
-    exit
+    lint_exit(&report)
+}
+
+/// The exit verdict of a lint run: any Error-severity finding fails with the
+/// dedicated lint code (11), warnings alone exit 0. Shared by the text and
+/// `--json` paths so `--json` never changes the exit code.
+fn lint_exit(report: &llm_wiki_compiler::LintReport) -> Result<(), WikiError> {
+    let (errors, warnings) = (report.errors(), report.warnings());
+    if errors > 0 {
+        Err(WikiError::Lint { errors, warnings })
+    } else {
+        Ok(())
+    }
+}
+
+/// Runs the advisory semantic review (audit FIX-019). Costs model calls.
+fn run_semantic_review(
+    workspace: &Path,
+    config: &Config,
+) -> Result<Option<llm_wiki_compiler::SemanticReport>, WikiError> {
+    let provider = build_provider(&config.llm)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| WikiError::Llm(format!("cannot start async runtime: {e}")))?;
+    runtime.block_on(llm_wiki_compiler::run_semantic_lint(
+        workspace, config, provider,
+    ))
+}
+
+/// Human text for the advisory semantic review, grouped by finding kind.
+fn print_semantic_review(report: &llm_wiki_compiler::SemanticReport) {
+    println!("semantic review (advisory):");
+    let mut current_kind: Option<llm_wiki_compiler::SemanticFindingKind> = None;
+    for finding in &report.findings {
+        if current_kind != Some(finding.kind) {
+            println!("  {}:", finding.kind.label());
+            current_kind = Some(finding.kind);
+        }
+        let claims = if finding.claim_ids.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", finding.claim_ids.join(", "))
+        };
+        println!("    {}{claims}: {}", finding.page_slug, finding.message);
+    }
+    println!(
+        "  {} page(s) reviewed, {} finding(s), skipped: {}",
+        report.pages_reviewed,
+        report.findings.len(),
+        if report.skipped_pages.is_empty() {
+            "none".to_owned()
+        } else {
+            report.skipped_pages.join(", ")
+        }
+    );
 }
 
 /// `llm-wiki serve` (PRD §29/§30): thin transport over the llm-wiki-server
 /// crate. The LLM provider is optional — build/query endpoints report a
 /// clear config error when `[llm]` is unconfigured; search/context/pages
 /// keep working.
-fn serve(workspace: &Path, host: Option<String>, port: u16) -> Result<(), WikiError> {
+fn serve(workspace: &Path, host: Option<String>, port: u16, json: bool) -> Result<(), WikiError> {
     let config = load_config(workspace)?;
     config.validate()?;
+    if json {
+        // Announce the address the server is about to bind. It is printed
+        // before the listener starts, so a failed bind still exits non-zero
+        // rather than leaving a false "starting" line behind.
+        let bind_host = host.clone().unwrap_or_else(|| config.server.bind.clone());
+        print_json(&output::serve(
+            &format!("{bind_host}:{port}"),
+            config.server.remote_enabled,
+        ));
+    }
     let provider = if config.llm.model.trim().is_empty() {
         eprintln!(
             "note: llm.model is not configured — /v1/build and /v1/query will return config errors"
@@ -866,18 +1021,33 @@ fn serve(workspace: &Path, host: Option<String>, port: u16) -> Result<(), WikiEr
     Ok(())
 }
 
-fn status(workspace: &Path) -> Result<(), WikiError> {
+fn status(workspace: &Path, json: bool) -> Result<(), WikiError> {
     let db_path = state_db(workspace);
     if !db_path.exists() {
-        println!(
-            "no state db at {} — run `llm-wiki scan` first",
-            db_path.display()
-        );
+        if json {
+            print_json(&output::status(None, None, None));
+        } else {
+            println!(
+                "no state db at {} — run `llm-wiki scan` first",
+                db_path.display()
+            );
+        }
         return Ok(());
     }
     let conn = llm_wiki_storage::open(&db_path)?;
-    println!("sources: {}", llm_wiki_storage::count_sources(&conn)?);
-    match llm_wiki_storage::latest_build(&conn)? {
+    let sources = llm_wiki_storage::count_sources(&conn)?;
+    let latest = llm_wiki_storage::latest_build(&conn)?;
+    if json {
+        let active = llm_wiki_storage::get_active_build_id(&conn)?;
+        print_json(&output::status(
+            Some(sources),
+            latest.as_ref(),
+            active.as_ref(),
+        ));
+        return Ok(());
+    }
+    println!("sources: {sources}");
+    match latest {
         Some(build) => println!(
             "latest build: {} [{}] started {}",
             build.build_id,
@@ -908,16 +1078,43 @@ impl Gap {
     }
 }
 
-fn report_gap(label: &str, result: Result<String, Gap>) -> bool {
+/// Records one doctor check. Checks are collected (not printed) so the text and
+/// `--json` paths render the same run, and the caller derives the failure count
+/// from the list rather than counting separately.
+fn record_check(label: &str, result: Result<String, Gap>, checks: &mut Vec<Check>) {
     match result {
-        Ok(msg) => {
-            println!("ok   {label} {msg}");
-            true
+        Ok(detail) => {
+            checks.push(Check {
+                label: label.to_owned(),
+                status: CheckStatus::Ok,
+                detail,
+                remedy: None,
+            });
         }
         Err(gap) => {
-            println!("FAIL {label} {}", gap.detail);
-            println!("     fix: {}", gap.remedy);
-            false
+            checks.push(Check {
+                label: label.to_owned(),
+                status: CheckStatus::Fail,
+                detail: gap.detail,
+                remedy: Some(gap.remedy),
+            });
+        }
+    }
+}
+
+/// Human text for the collected doctor checks (one report per line, each FAIL
+/// carrying its own remedy).
+fn print_checks(checks: &[Check]) {
+    for check in checks {
+        match check.status {
+            CheckStatus::Ok => println!("ok   {} {}", check.label, check.detail),
+            CheckStatus::Fail => {
+                println!("FAIL {} {}", check.label, check.detail);
+                if let Some(remedy) = &check.remedy {
+                    println!("     fix: {remedy}");
+                }
+            }
+            CheckStatus::Skip => println!("skip {} ({})", check.label, check.detail),
         }
     }
 }
@@ -1156,13 +1353,14 @@ fn tokio_runtime() -> Result<tokio::runtime::Runtime, Gap> {
         })
 }
 
-/// Length note: ~150 lines — a flat list of checks, one report per line, each
-/// FAIL carrying its own remedy; the helpers above keep every branch shallow.
-fn doctor(workspace: &Path, live: bool) -> Result<(), WikiError> {
-    let config = load_config(workspace)?;
-    let config_path = state_dir(workspace).join("config.toml");
-    let mut failures = 0usize;
-
+/// Config validity + the source tree: the checks that need neither a state db
+/// nor the network.
+fn config_and_source_checks(
+    workspace: &Path,
+    config: &Config,
+    config_path: &Path,
+    checks: &mut Vec<Check>,
+) {
     let valid = config.validate().map(|_| {
         format!(
             "valid (source root {}, wiki_dir {})",
@@ -1180,9 +1378,7 @@ fn doctor(workspace: &Path, live: bool) -> Result<(), WikiError> {
             ),
         )
     });
-    if !report_gap("config", valid) {
-        failures += 1;
-    }
+    record_check("config", valid, checks);
 
     let root = workspace.join(&config.source.root);
     let root_exists = if root.is_dir() {
@@ -1197,76 +1393,12 @@ fn doctor(workspace: &Path, live: bool) -> Result<(), WikiError> {
             ),
         ))
     };
-    if !report_gap("source root", root_exists) {
-        failures += 1;
-    }
+    record_check("source root", root_exists, checks);
+}
 
-    let db_path = state_db(workspace);
-    let db = std::fs::create_dir_all(state_dir(workspace))
-        .map_err(|e| e.to_string())
-        .and_then(|_| llm_wiki_storage::open(&db_path).map_err(|e| e.to_string()));
-    let conn = match db {
-        Ok(conn) => {
-            let count = llm_wiki_storage::count_sources(&conn);
-            let count = count.map_err(|err| {
-                Gap::new(
-                    err.to_string(),
-                    "the state db exists but is not readable as a wiki state db",
-                )
-            });
-            if !report_gap(
-                "state db",
-                count.map(|count| format!("open + migrated ({count} sources)")),
-            ) {
-                failures += 1;
-            }
-            Some(conn)
-        }
-        Err(err) => {
-            report_gap(
-                "state db",
-                Err(Gap::new(
-                    format!("cannot open {}: {err}", db_path.display()),
-                    format!(
-                        "move {} aside and run `llm-wiki scan` to rebuild it (build state, cache \
-                         and index are all derived — nothing in it is hand-authored)",
-                        db_path.display()
-                    ),
-                )),
-            );
-            failures += 1;
-            None
-        }
-    };
-
-    // Publish integrity (PRD §35): report, never auto-fix.
-    if let Some(conn) = conn {
-        let wiki_abs = lexical_absolute(workspace, &config.project.wiki_dir);
-        let publish_state = check_publish_state(&conn, &wiki_abs);
-        if !report_gap("publish state", publish_state) {
-            failures += 1;
-        }
-
-        // FTS5 availability (PRD §20): with the bundled SQLite this always
-        // passes; a custom SQLite build without FTS5 must surface here as a
-        // reported degradation — search refuses to run rather than silently
-        // returning unusable results.
-        let fts_state = if llm_wiki_storage::probe_fts5(&conn) {
-            Ok("fts5 available".to_owned())
-        } else if config.search.full_text {
-            Err(Gap::new(
-                llm_wiki_storage::FTS5_UNAVAILABLE.to_owned(),
-                "this binary was linked against a SQLite without FTS5: rebuild with the default \
-                 `bundled` feature, or set search.full_text = false to accept lexical-less search",
-            ))
-        } else {
-            Ok("fts5 unavailable (full-text search is disabled in config)".to_owned())
-        };
-        if !report_gap("fts", fts_state) {
-            failures += 1;
-        }
-    }
-
+/// Is the API-key env var the config names actually set? Presence only — the
+/// value is never read, echoed or logged.
+fn api_key_check(config: &Config, checks: &mut Vec<Check>) {
     let api_key = match std::env::var(&config.llm.api_key_env) {
         Ok(_) => Ok(format!("env {} is set", config.llm.api_key_env)),
         Err(_) => Err(Gap::new(
@@ -1278,43 +1410,133 @@ fn doctor(workspace: &Path, live: bool) -> Result<(), WikiError> {
             ),
         )),
     };
-    if !report_gap("llm api key", api_key) {
-        failures += 1;
+    record_check("llm api key", api_key, checks);
+}
+
+/// State db open, publish integrity (PRD §35) and FTS5 availability (PRD §20) —
+/// the checks that need a readable state db. Publish is report-only, never
+/// auto-fix; a custom SQLite build without FTS5 surfaces as a reported
+/// degradation rather than silently unusable search.
+fn workspace_checks(workspace: &Path, config: &Config, checks: &mut Vec<Check>) {
+    let db_path = state_db(workspace);
+    let db = std::fs::create_dir_all(state_dir(workspace))
+        .map_err(|e| e.to_string())
+        .and_then(|_| llm_wiki_storage::open(&db_path).map_err(|e| e.to_string()));
+    let conn = match db {
+        Ok(conn) => {
+            let count = llm_wiki_storage::count_sources(&conn).map_err(|err| {
+                Gap::new(
+                    err.to_string(),
+                    "the state db exists but is not readable as a wiki state db",
+                )
+            });
+            record_check(
+                "state db",
+                count.map(|count| format!("open + migrated ({count} sources)")),
+                checks,
+            );
+            Some(conn)
+        }
+        Err(err) => {
+            record_check(
+                "state db",
+                Err(Gap::new(
+                    format!("cannot open {}: {err}", db_path.display()),
+                    format!(
+                        "move {} aside and run `llm-wiki scan` to rebuild it (build state, cache \
+                         and index are all derived — nothing in it is hand-authored)",
+                        db_path.display()
+                    ),
+                )),
+                checks,
+            );
+            None
+        }
+    };
+    let Some(conn) = conn else { return };
+
+    let wiki_abs = lexical_absolute(workspace, &config.project.wiki_dir);
+    record_check(
+        "publish state",
+        check_publish_state(&conn, &wiki_abs),
+        checks,
+    );
+
+    let fts_state = if llm_wiki_storage::probe_fts5(&conn) {
+        Ok("fts5 available".to_owned())
+    } else if config.search.full_text {
+        Err(Gap::new(
+            llm_wiki_storage::FTS5_UNAVAILABLE.to_owned(),
+            "this binary was linked against a SQLite without FTS5: rebuild with the default \
+             `bundled` feature, or set search.full_text = false to accept lexical-less search",
+        ))
+    } else {
+        Ok("fts5 unavailable (full-text search is disabled in config)".to_owned())
+    };
+    record_check("fts", fts_state, checks);
+}
+
+/// Endpoint connectivity: the checks above prove the config is COMPLETE, not
+/// that the endpoints are ALIVE. Opt-in because each probe is a real (billed)
+/// request.
+fn live_endpoint_checks(config: &Config, config_path: &Path, checks: &mut Vec<Check>) {
+    if config.llm.model.trim().is_empty() {
+        record_check(
+            "llm endpoint",
+            Err(Gap::new(
+                "llm.model is empty, nothing to probe".to_owned(),
+                format!("set llm.model in {}", config_path.display()),
+            )),
+            checks,
+        );
+        return;
+    }
+    record_check("llm endpoint", probe_chat_endpoint(config), checks);
+    record_check(
+        "embedding endpoint",
+        probe_embedding_endpoint(config),
+        checks,
+    );
+    record_check("rerank endpoint", probe_rerank_endpoint(config), checks);
+}
+
+/// `llm-wiki doctor`: collect every check, then emit the text or `--json`
+/// report. The failure count is derived from the collected list, so the verdict
+/// and the entries can never disagree.
+fn doctor(workspace: &Path, live: bool, json: bool) -> Result<(), WikiError> {
+    let config = load_config(workspace)?;
+    let config_path = state_dir(workspace).join("config.toml");
+    let mut checks: Vec<Check> = Vec::new();
+
+    config_and_source_checks(workspace, &config, &config_path, &mut checks);
+    workspace_checks(workspace, &config, &mut checks);
+    api_key_check(&config, &mut checks);
+    if live {
+        live_endpoint_checks(&config, &config_path, &mut checks);
+    } else {
+        checks.push(Check {
+            label: "endpoint connectivity".to_owned(),
+            status: CheckStatus::Skip,
+            detail: "pass --live to probe llm/embedding/rerank for real".to_owned(),
+            remedy: None,
+        });
     }
 
-    // Endpoint connectivity: the checks above prove the config is COMPLETE,
-    // not that the endpoints are ALIVE. Opt-in because each probe is a real
-    // (billed) request.
-    if live {
-        if config.llm.model.trim().is_empty() {
-            report_gap(
-                "llm endpoint",
-                Err(Gap::new(
-                    "llm.model is empty, nothing to probe".to_owned(),
-                    format!("set llm.model in {}", config_path.display()),
-                )),
-            );
-            failures += 1;
-        } else {
-            let chat = probe_chat_endpoint(&config);
-            if !report_gap("llm endpoint", chat) {
-                failures += 1;
-            }
-        }
-        let embedding = probe_embedding_endpoint(&config);
-        if !report_gap("embedding endpoint", embedding) {
-            failures += 1;
-        }
-        let rerank = probe_rerank_endpoint(&config);
-        if !report_gap("rerank endpoint", rerank) {
-            failures += 1;
-        }
+    let failures = checks
+        .iter()
+        .filter(|check| check.status == CheckStatus::Fail)
+        .count();
+
+    if json {
+        print_json(&output::doctor(&checks));
     } else {
-        println!("skip endpoint connectivity (pass --live to probe llm/embedding/rerank for real)");
+        print_checks(&checks);
+        if failures == 0 {
+            println!("doctor: all checks passed");
+        }
     }
 
     if failures == 0 {
-        println!("doctor: all checks passed");
         Ok(())
     } else {
         Err(WikiError::Config(format!("{failures} check(s) failed")))

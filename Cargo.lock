@@ -827,6 +827,7 @@ dependencies = [
  "llm-wiki-server",
  "llm-wiki-source",
  "llm-wiki-storage",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
