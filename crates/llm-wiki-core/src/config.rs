@@ -104,7 +104,7 @@ pub struct EndpointConfig {
 /// INHERITS the corresponding `[llm]` value: embedding may point at a
 /// different provider (different base_url / key / model) by filling in only
 /// what differs.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingConfig {
     /// Endpoint family. Empty inherits `llm.provider`; currently only
     /// `"openai-compatible"` is supported.
@@ -185,6 +185,31 @@ impl LlmConfig {
             base_url: self.base_url.clone(),
             api_key_env: self.api_key_env.clone(),
             timeout_seconds: self.timeout_seconds,
+        }
+    }
+}
+
+impl Default for EmbeddingConfig {
+    ///
+    /// A derived `Default` would zero every numeric knob, and that is the
+    /// value a workspace gets whenever there is no `[embedding]` section at
+    /// all — `Config::default()`, a missing `config.toml`, or a config file
+    /// that simply never mentions `[embedding]`. In that case the documented
+    /// defaults (concurrency 1, batch 16, retries 3, snapshot cache 100_000)
+    /// were silently replaced by 0: no retries, batch 0, and the server's
+    /// vector snapshot cache switched off while the docs promised it was on.
+    fn default() -> Self {
+        Self {
+            provider: String::new(),
+            base_url: String::new(),
+            api_key_env: String::new(),
+            model: String::new(),
+            timeout_seconds: 0,
+            max_concurrency: default_embed_max_concurrency(),
+            batch_size: default_embed_batch_size(),
+            max_retries: default_embed_max_retries(),
+            requests_per_minute: default_embed_requests_per_minute(),
+            snapshot_cache_sections: default_embed_snapshot_cache_sections(),
         }
     }
 }
@@ -805,6 +830,47 @@ mod tests {
         let cfg = Config::parse_toml("[planning]\nreconcile_rounds = 2\n").unwrap();
         assert_eq!(cfg.planning.reconcile_rounds, 2);
         assert_eq!(cfg.planning.effective_reconcile_rounds(), 2);
+    }
+
+    /// The two scale-up knobs must be settable from a real config file AND
+    /// keep their back-compatible defaults when the section is silent.
+    #[test]
+    fn embedding_pacing_and_snapshot_cache_parse_from_toml() {
+        let silent = Config::parse_toml("[embedding]\nmodel = \"m\"\n").unwrap();
+        assert_eq!(
+            silent.embedding.requests_per_minute, 0,
+            "unpaced by default"
+        );
+        assert_eq!(silent.embedding.snapshot_cache_sections, 100_000);
+
+        let tuned = Config::parse_toml(
+            "[embedding]\nrequests_per_minute = 60\nsnapshot_cache_sections = 0\n",
+        )
+        .unwrap();
+        assert_eq!(tuned.embedding.requests_per_minute, 60);
+        assert_eq!(
+            tuned.embedding.snapshot_cache_sections, 0,
+            "0 disables the cache"
+        );
+
+        let defaults = Config::default();
+        assert_eq!(defaults.embedding.requests_per_minute, 0);
+        assert_eq!(defaults.embedding.snapshot_cache_sections, 100_000);
+
+        // The case that used to lose every knob: no `[embedding]` section at
+        // all. `Config::default()` (missing config.toml) and a parsed file
+        // that never mentions [embedding] must agree with the documented
+        // defaults, not with a zeroed struct.
+        let no_section = Config::parse_toml("[project]\nname = \"x\"\n").unwrap();
+        assert_eq!(no_section.embedding.snapshot_cache_sections, 100_000);
+        assert_eq!(no_section.embedding.max_concurrency, 1);
+        assert_eq!(no_section.embedding.batch_size, 16);
+        assert_eq!(no_section.embedding.max_retries, 3);
+        assert_eq!(
+            no_section.embedding.snapshot_cache_sections,
+            defaults.embedding.snapshot_cache_sections,
+            "derived Default and serde defaults must not diverge"
+        );
     }
 
     #[test]

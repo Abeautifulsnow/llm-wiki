@@ -49,7 +49,7 @@ impl VectorSnapshot {
     /// the coverage pre-check that keeps an uncovered workspace from spending
     /// a query embedding.
     pub fn covered(&self) -> bool {
-        !self.vectors.is_empty()
+        !self.is_empty()
     }
 
     /// Stored vector count (the cache's size measure).
@@ -62,7 +62,7 @@ impl VectorSnapshot {
     }
 
     /// Approximate resident size: dims are uniform per model, so one vector's
-    /// bytes times the count. Used only to decide cacheability.
+    /// bytes times the count. Reported when a snapshot is too large to keep.
     pub fn resident_bytes(&self) -> usize {
         let per_vector = self
             .vectors
@@ -135,6 +135,9 @@ struct CachedSnapshot {
 pub struct VectorSnapshotCache {
     max_sections: usize,
     slot: Mutex<Option<CachedSnapshot>>,
+    /// Over-budget is a CONFIGURATION condition, not per-query data: warn once
+    /// per process instead of on every retrieval.
+    warned_oversized: std::sync::atomic::AtomicBool,
 }
 
 impl VectorSnapshotCache {
@@ -143,6 +146,7 @@ impl VectorSnapshotCache {
         Self {
             max_sections,
             slot: Mutex::new(None),
+            warned_oversized: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -174,9 +178,13 @@ impl VectorSnapshotCache {
                 revision,
                 snapshot: snapshot.clone(),
             });
-        } else {
+        } else if !self
+            .warned_oversized
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
             tracing::warn!(
                 vectors = snapshot.len(),
+                resident_mib = snapshot.resident_bytes() / (1024 * 1024),
                 max_sections = self.max_sections,
                 "vector snapshot exceeds the cache budget; serving it without caching \
                  (raise [embedding] snapshot_cache_sections or leave it uncached)"

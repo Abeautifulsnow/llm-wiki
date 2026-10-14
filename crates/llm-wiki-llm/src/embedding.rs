@@ -156,26 +156,19 @@ fn parse_embeddings_response(
 mod tests {
     use super::*;
 
-    /// Serves `count` embeddings requests and records when each ARRIVED —
-    /// the arrival times are what pacing has to spread out.
-    fn counting_embeddings_server(
-        count: usize,
-    ) -> (
-        u16,
-        std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
-    ) {
+    /// Serves `count` embeddings requests on a loopback port and returns it.
+    /// Pacing is asserted at the CLIENT (see `rate_limit_paces_outbound_requests`),
+    /// so the server only has to answer.
+    fn counting_embeddings_server(count: usize) -> u16 {
         use std::io::{Read, Write};
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let arrivals = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let seen = arrivals.clone();
         std::thread::spawn(move || {
             for _ in 0..count {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut buf = vec![0u8; 65536];
                 let _ = stream.read(&mut buf).unwrap();
-                seen.lock().unwrap().push(std::time::Instant::now());
                 let body = r#"{"data":[{"index":0,"embedding":[0.1,0.2]}]}"#;
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -186,15 +179,20 @@ mod tests {
                 stream.flush().unwrap();
             }
         });
-        (port, arrivals)
+        port
     }
 
     /// LW-002: `requests_per_minute` must pace the WIRE, not just set a field.
-    /// At 600/min (100ms spacing) two back-to-back batches cannot both reach
-    /// the provider at once — which is the whole point of the knob.
+    ///
+    /// Measured CLIENT-side, and deliberately far from the noise floor: at
+    /// 120/min the limiter must hold the second request back ~500ms, so a
+    /// two-call elapsed time well under 400ms could only mean the limiter is
+    /// not armed. Server-side arrival gaps are NOT asserted — the limiter
+    /// guarantees spacing between SENDS, and under parallel test load the
+    /// server thread's own scheduling jitter compresses that gap.
     #[tokio::test]
     async fn rate_limit_paces_outbound_requests() {
-        let (port, arrivals) = counting_embeddings_server(2);
+        let port = counting_embeddings_server(2);
         let provider = OpenAiCompatibleEmbeddings::new(
             &format!("http://127.0.0.1:{port}"),
             "UNUSED_VAR",
@@ -202,17 +200,16 @@ mod tests {
             0,
         )
         .unwrap()
-        .with_rate_limit(600);
+        .with_rate_limit(120);
 
+        let started = std::time::Instant::now();
         provider.embed("m", &["a".to_owned()]).await.unwrap();
         provider.embed("m", &["b".to_owned()]).await.unwrap();
+        let elapsed = started.elapsed();
 
-        let times = arrivals.lock().unwrap().clone();
-        assert_eq!(times.len(), 2);
-        let spacing = times[1].duration_since(times[0]);
         assert!(
-            spacing >= std::time::Duration::from_millis(80),
-            "paced requests should be ~100ms apart, saw {spacing:?}"
+            elapsed >= std::time::Duration::from_millis(400),
+            "two requests at 120/min must be paced ~500ms apart, took {elapsed:?}"
         );
     }
 
@@ -220,7 +217,7 @@ mod tests {
     /// low-volume endpoint may not pay a per-request delay it never asked for.
     #[tokio::test]
     async fn zero_rate_limit_leaves_requests_unpaced() {
-        let (port, arrivals) = counting_embeddings_server(2);
+        let port = counting_embeddings_server(2);
         let provider = OpenAiCompatibleEmbeddings::new(
             &format!("http://127.0.0.1:{port}"),
             "UNUSED_VAR",
@@ -230,15 +227,14 @@ mod tests {
         .unwrap()
         .with_rate_limit(0);
 
+        let started = std::time::Instant::now();
         provider.embed("m", &["a".to_owned()]).await.unwrap();
         provider.embed("m", &["b".to_owned()]).await.unwrap();
+        let elapsed = started.elapsed();
 
-        let times = arrivals.lock().unwrap().clone();
-        assert_eq!(times.len(), 2);
-        let spacing = times[1].duration_since(times[0]);
         assert!(
-            spacing < std::time::Duration::from_millis(80),
-            "unpaced requests should not be delayed, saw {spacing:?}"
+            elapsed < std::time::Duration::from_millis(400),
+            "unpaced requests must not be delayed (400ms would mean pacing), saw {elapsed:?}"
         );
     }
 
