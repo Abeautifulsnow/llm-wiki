@@ -294,14 +294,22 @@ timeout_seconds = 120
 # at dim=768, so 100000 is a ~300 MiB ceiling.
 # snapshot_cache_sections = 100000
 
-# Nearest-neighbour search path (LW-001 中期 / PR-5): "off" (default) always
-# scans exactly, "auto" keeps the exact scan below ann_min_sections and builds
-# an HNSW index above it, "on" always builds one. A failed build falls back to
-# the exact scan, so this trades recall and BUILD TIME for query latency,
-# never correctness. Measured at 100k x 768: build ~10 min, query 21ms vs
-# 190ms exact, recall@8 0.944 at ef 128 — the build is why "off" ships.
-# ann = "off"
-# ann_min_sections = 20000
+# Nearest-neighbour search path (LW-001 中期 / PR-5): "off" always scans
+# exactly, "auto" (default) keeps the exact scan below ann_min_sections and
+# builds an HNSW index above it, "on" always builds one. The index is produced
+# OFF the query path — a background thread adopts the graph persisted for this
+# generation/model/revision or builds and dumps it — and any failure falls back
+# to the exact scan, so this trades recall, CPU and memory for query latency,
+# never correctness. Measured (768-dim, 20 reps, release):
+#   1k:   exact 0.4ms → ann 0.8ms,  build 0.1s,  reload 8ms,   recall@8 1.000
+#   10k:  exact 4.3ms → ann 4.7ms,  build 4.3s,  reload 106ms, recall@8 1.000
+#   100k: exact 68.7ms → ann 12.4ms, build 292s, reload 3.1s,  recall@8 0.944
+# The index only pays above ~50k sections, which is what ann_min_sections
+# encodes. Above that it costs one all-core background build per revision and
+# roughly doubles the snapshot's memory (the exact arena is kept as the
+# fallback). Set "off" to refuse all of that.
+# ann = "auto"
+# ann_min_sections = 50000
 # ann_ef_search = 128
 
 # Used when [search] rerank = "cohere-compatible" (Cohere/Jina-style

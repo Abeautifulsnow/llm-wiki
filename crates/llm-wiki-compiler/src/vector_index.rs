@@ -10,20 +10,33 @@
 //!   per-candidate norms precomputed and the result tuples reduced to
 //!   `(score, slot)` so no string comparison runs inside the sort. Scores are
 //!   bit-identical to the pre-PR-5 scan.
-//! - [`HnswIndex`] — an approximate index for corpora where the exact scan is
-//!   the measured bottleneck (HNSW via `instant-distance`, built once per
-//!   generation/model/embeddings revision, never mutated after).
+//! - [`AnnIndex`] — HNSW (`hnsw_rs`) for corpora where the exact scan is the
+//!   measured bottleneck: built once per (generation, model, embeddings
+//!   revision), inserted in parallel, dumped to disk and reloaded from it on
+//!   the next start, and never mutated after it is built.
 //!
-//! Degradation contract (LW-001 acceptance): a missing, unbuildable or
-//! unsearchable index NEVER fabricates a hit and never silently drops one. The
-//! ANN path is chosen only when it can actually be built, every build failure
-//! falls back to [`ExactIndex`] with a warning, and a degenerate query (a zero
-//! vector, or a dimension that does not match the corpus) reproduces the exact
-//! scan's defined answer instead of an arbitrary neighbour set.
+//! Degradation contract (LW-001 acceptance): an index that is missing,
+//! unbuildable or unloadable NEVER fabricates a hit and never silently drops
+//! one. The exact scan is always available and always the fallback; the ANN is
+//! built OFF the query path (see `vector_cache`) and only replaces the scan
+//! once it is complete. A degenerate query (a zero vector, or a width that
+//! does not match the corpus) reproduces the exact scan's defined answer
+//! instead of an arbitrary neighbour set.
+//!
+//! Determinism: the exact path is bit-reproducible. The ANN graph is not — the
+//! builder assigns levels from an unseeded RNG (and parallel insertion adds
+//! small race-dependent differences), so two builds of the same corpus may
+//! answer a query slightly differently. That is why the persisted graph is
+//! keyed by the embeddings revision: a long-lived server keeps answering with
+//! the SAME graph until the vectors change.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::path::Path;
 
+use hnsw_rs::anndists::dist::distances::DistCosine;
+use hnsw_rs::api::AnnT;
+use hnsw_rs::hnsw::Hnsw;
+use hnsw_rs::hnswio::HnswIo;
 use llm_wiki_search::VectorCandidate;
 
 use crate::vector_cache::VECTOR_TOP_K;
@@ -32,24 +45,38 @@ use crate::vector_cache::VECTOR_TOP_K;
 /// accepted values live in exactly one place.
 pub use llm_wiki_core::config::AnnMode;
 
+/// `M` from the HNSW paper: links per node. `hnsw_rs` caps this at 256 and
+/// exits the process above it, so the value is fixed here, well inside range.
+const HNSW_MAX_CONNECTIONS: usize = 32;
+/// Layer ceiling; `hnsw_rs` clamps it to its own `NB_LAYER_MAX`.
+const HNSW_MAX_LAYER: usize = 16;
+/// How hard the builder searches while linking. Higher builds a better graph
+/// more slowly.
+const HNSW_EF_CONSTRUCTION: usize = 200;
+/// Points handed to one parallel insertion batch: big enough to keep the
+/// rayon pool busy, small enough that the batch's temporary copies stay a
+/// rounding error next to the corpus.
+const HNSW_INSERT_BATCH: usize = 4096;
+/// Sidecar holding what the graph file cannot: the section hashes, the width
+/// and the search breadth. JSON, because it is written once per revision and
+/// only has to be readable.
+const META_SUFFIX: &str = "ann.meta.json";
+
 /// Resolved index policy: whether to build an ANN, and how.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VectorIndexConfig {
     pub ann: AnnMode,
-    /// `Auto` builds an ANN at or above this many stored vectors. The exact
-    /// scan is faster than an index build below roughly this size, and tiny
-    /// corpora should never pay ANN's recall risk for nothing.
+    /// `Auto` builds an ANN at or above this many stored vectors.
     pub min_sections: usize,
-    /// ANN search breadth: the recall/latency dial. Higher finds more of the
-    /// true neighbours and costs more per query.
+    /// ANN search breadth: the recall/latency dial.
     pub ef_search: usize,
 }
 
 impl Default for VectorIndexConfig {
     fn default() -> Self {
         Self {
-            ann: AnnMode::Off,
-            min_sections: 20_000,
+            ann: AnnMode::Auto,
+            min_sections: 50_000,
             ef_search: 128,
         }
     }
@@ -64,7 +91,8 @@ impl VectorIndexConfig {
         }
     }
 
-    fn wants_ann(&self, sections: usize) -> bool {
+    /// Whether this corpus, under this policy, should get an ANN.
+    pub fn wants_ann(&self, sections: usize) -> bool {
         match self.ann {
             AnnMode::Off => false,
             AnnMode::On => sections > 0,
@@ -89,32 +117,56 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug {
     fn kind(&self) -> &'static str;
 }
 
-/// Builds the index for `vectors` under `config`. Any ANN failure degrades to
-/// the exact scan: an index that cannot be built must not fail the query, and
-/// must not pretend to be approximate-but-fine either.
-pub fn build_index(
-    vectors: &BTreeMap<String, Vec<f32>>,
-    config: &VectorIndexConfig,
-) -> Box<dyn VectorIndex> {
-    if config.wants_ann(vectors.len()) {
-        match HnswIndex::build(vectors, config.ef_search) {
-            Ok(index) => {
-                tracing::info!(
-                    vectors = index.len(),
-                    ef_search = config.ef_search,
-                    resident_mib = index.resident_bytes() / (1024 * 1024),
-                    "vector index built (approximate)"
-                );
-                return Box::new(index);
-            }
-            Err(err) => tracing::warn!(
-                error = %err,
-                vectors = vectors.len(),
-                "vector index build failed; falling back to the exact scan"
-            ),
-        }
+/// Cosine of `query` against one stored vector, or 0.0 when the widths differ
+/// — two models' vectors must never mix, and a width mismatch scores 0 for
+/// every candidate exactly as the shipped scan did.
+fn cosine(query: &[f32], query_norm_sqrt: f32, vector: &[f32], norm_sqrt: f32) -> f32 {
+    if query.len() != vector.len() {
+        return 0.0;
     }
-    Box::new(ExactIndex::build(vectors))
+    let mut dot = 0.0_f32;
+    for (left, right) in query.iter().zip(vector.iter()) {
+        dot += left * right;
+    }
+    let denominator = query_norm_sqrt * norm_sqrt;
+    if denominator == 0.0 {
+        0.0
+    } else {
+        dot / denominator
+    }
+}
+
+/// Ranks scored candidates the one way every path in this module does:
+/// score descending, ties broken by text hash.
+fn rank(scored: &mut Vec<(f32, u32)>, hashes: &[String], k: usize) -> Vec<VectorCandidate> {
+    scored.sort_unstable_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| hashes[a.1 as usize].cmp(&hashes[b.1 as usize]))
+    });
+    scored
+        .drain(..scored.len().min(k))
+        .map(|(score, slot)| VectorCandidate {
+            text_hash: hashes[slot as usize].clone(),
+            score,
+        })
+        .collect()
+}
+
+/// The answer a zero-width or zero-vector query gets: every cosine is 0, so
+/// the top-K is the lowest hashes. Shared by both indexes so the degenerate
+/// cases cannot diverge between them.
+fn degenerate_top_k(hashes: &[String], k: usize) -> Vec<VectorCandidate> {
+    let mut order: Vec<u32> = (0..hashes.len() as u32).collect();
+    order.sort_unstable_by(|a, b| hashes[*a as usize].cmp(&hashes[*b as usize]));
+    order
+        .into_iter()
+        .take(k)
+        .map(|slot| VectorCandidate {
+            text_hash: hashes[slot as usize].clone(),
+            score: 0.0,
+        })
+        .collect()
 }
 
 /// The exact scan. Scores are bit-identical to the pre-PR-5 implementation:
@@ -151,24 +203,17 @@ impl ExactIndex {
         }
     }
 
-    /// Cosine of `query` against slot `slot`, or 0.0 when the widths differ —
-    /// two models' vectors must never mix, and a width mismatch scores 0 for
-    /// every candidate exactly as the shipped scan did.
-    fn score(&self, query: &[f32], query_norm_sqrt: f32, slot: usize) -> f32 {
-        if query.len() != self.dim {
-            return 0.0;
-        }
-        let start = slot * self.dim;
-        let mut dot = 0.0_f32;
-        for (offset, value) in query.iter().enumerate() {
-            dot += value * self.arena[start + offset];
-        }
-        let denominator = query_norm_sqrt * self.norm_sqrt[slot];
-        if denominator == 0.0 {
-            0.0
-        } else {
-            dot / denominator
-        }
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
+    pub fn hashes(&self) -> &[String] {
+        &self.hashes
+    }
+
+    /// One stored vector, for the ANN builder to read without a second copy.
+    pub fn point(&self, slot: usize) -> &[f32] {
+        &self.arena[slot * self.dim..(slot + 1) * self.dim]
     }
 }
 
@@ -179,23 +224,19 @@ impl VectorIndex for ExactIndex {
         };
         let query_norm_sqrt = query.iter().map(|value| value * value).sum::<f32>().sqrt();
         let mut scored: Vec<(f32, u32)> = (0..self.hashes.len())
-            .map(|slot| (self.score(query, query_norm_sqrt, slot), slot as u32))
-            .collect();
-        // Total order: score descending, ties broken by text hash — the same
-        // order the pre-PR-5 scan produced, so results stay comparable.
-        scored.sort_unstable_by(|a, b| {
-            b.0.partial_cmp(&a.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| self.hashes[a.1 as usize].cmp(&self.hashes[b.1 as usize]))
-        });
-        scored
-            .into_iter()
-            .take(k)
-            .map(|(score, slot)| VectorCandidate {
-                text_hash: self.hashes[slot as usize].clone(),
-                score,
+            .map(|slot| {
+                (
+                    cosine(
+                        query,
+                        query_norm_sqrt,
+                        self.point(slot),
+                        self.norm_sqrt[slot],
+                    ),
+                    slot as u32,
+                )
             })
-            .collect()
+            .collect();
+        rank(&mut scored, &self.hashes, k)
     }
 
     fn len(&self) -> usize {
@@ -213,36 +254,32 @@ impl VectorIndex for ExactIndex {
     }
 }
 
-/// One point of the ANN graph: a unit-normalised vector, so `distance` is
-/// `1 - cosine` and the closest neighbours are exactly the highest cosines.
-#[derive(Debug, Clone)]
-pub struct UnitPoint(Vec<f32>);
-
-impl instant_distance::Point for UnitPoint {
-    fn distance(&self, other: &Self) -> f32 {
-        let mut dot = 0.0_f32;
-        for (left, right) in self.0.iter().zip(other.0.iter()) {
-            dot += left * right;
-        }
-        1.0 - dot
-    }
+/// What a persisted graph needs besides the two files `hnsw_rs` writes.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AnnMeta {
+    dim: usize,
+    ef_search: usize,
+    hashes: Vec<String>,
+    /// The basename `hnsw_rs` actually used for the graph files. It is not
+    /// always the requested one: a dump that would overwrite files a live
+    /// memory map still holds appends a suffix, so the sidecar — written last,
+    /// under the name the caller asked for — is the pointer `load` follows.
+    graph_basename: String,
 }
 
 /// Approximate nearest neighbours (HNSW). Built once from an immutable
-/// snapshot; `search` is the only mutating state and is reused under a lock.
-pub struct HnswIndex {
-    map: instant_distance::HnswMap<UnitPoint, u32>,
-    /// Scratch space the graph search needs; `Search` is sized to the graph,
-    /// so it is allocated once and reused rather than per query.
-    search: Mutex<instant_distance::Search>,
+/// snapshot, then read-only: `hnsw_rs` answers from `&self`, so concurrent
+/// queries need no lock.
+pub struct AnnIndex {
+    hnsw: Hnsw<'static, f32, DistCosine>,
     hashes: Vec<String>,
     dim: usize,
     ef_search: usize,
 }
 
-impl std::fmt::Debug for HnswIndex {
+impl std::fmt::Debug for AnnIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HnswIndex")
+        f.debug_struct("AnnIndex")
             .field("vectors", &self.hashes.len())
             .field("dim", &self.dim)
             .field("ef_search", &self.ef_search)
@@ -250,102 +287,118 @@ impl std::fmt::Debug for HnswIndex {
     }
 }
 
-impl HnswIndex {
-    /// `Err` for a corpus the index cannot represent (no vectors, or an empty
-    /// dimension); the caller falls back to the exact scan.
-    pub fn build(vectors: &BTreeMap<String, Vec<f32>>, ef_search: usize) -> Result<Self, String> {
-        let dim = vectors.values().next().map_or(0, Vec::len);
-        if vectors.is_empty() || dim == 0 {
+impl AnnIndex {
+    /// Builds the graph from `source` in batches, so the only extra memory is
+    /// one batch of copies rather than a second copy of the whole corpus.
+    pub fn build(source: &ExactIndex, ef_search: usize) -> Result<Self, String> {
+        let count = source.len();
+        if count == 0 || source.dim() == 0 {
             return Err("no vectors or zero dimension".to_owned());
         }
-        let mut hashes = Vec::with_capacity(vectors.len());
-        let mut points = Vec::with_capacity(vectors.len());
-        for (hash, vector) in vectors {
-            hashes.push(hash.clone());
-            points.push(UnitPoint(normalise(vector)));
+        let ef_search = ef_search.max(VECTOR_TOP_K);
+        let hnsw = Hnsw::<f32, DistCosine>::new(
+            HNSW_MAX_CONNECTIONS,
+            count,
+            HNSW_MAX_LAYER,
+            HNSW_EF_CONSTRUCTION,
+            DistCosine,
+        );
+        let mut start = 0usize;
+        while start < count {
+            let end = (start + HNSW_INSERT_BATCH).min(count);
+            let batch: Vec<(Vec<f32>, usize)> = (start..end)
+                .map(|slot| (source.point(slot).to_vec(), slot))
+                .collect();
+            let refs: Vec<(&Vec<f32>, usize)> =
+                batch.iter().map(|(data, id)| (data, *id)).collect();
+            hnsw.parallel_insert(&refs);
+            start = end;
         }
-        let values: Vec<u32> = (0..hashes.len() as u32).collect();
-        let map = instant_distance::Hnsw::<UnitPoint>::builder()
-            .ef_construction(EF_CONSTRUCTION)
-            .ef_search(ef_search.max(VECTOR_TOP_K))
-            .seed(HNSW_SEED)
-            .build(points, values);
         Ok(Self {
-            map,
-            search: Mutex::new(instant_distance::Search::default()),
-            hashes,
-            dim,
-            ef_search: ef_search.max(VECTOR_TOP_K),
+            hnsw,
+            hashes: source.hashes().to_vec(),
+            dim: source.dim(),
+            ef_search,
         })
     }
 
-    /// The exact scan's answer for a query the graph cannot score: a zero
-    /// vector or a mismatched width makes every cosine 0, so the top-K is the
-    /// lowest hashes. Reproducing that keeps ANN from inventing a different
-    /// answer for inputs the exact path defines.
-    fn degenerate(&self, k: usize) -> Vec<VectorCandidate> {
-        let mut order: Vec<u32> = (0..self.hashes.len() as u32).collect();
-        order.sort_unstable_by(|a, b| self.hashes[*a as usize].cmp(&self.hashes[*b as usize]));
-        order
-            .into_iter()
-            .take(k)
-            .map(|slot| VectorCandidate {
-                text_hash: self.hashes[slot as usize].clone(),
-                score: 0.0,
-            })
-            .collect()
+    /// Writes the graph and its sidecar under `dir` with `basename`, replacing
+    /// any sidecar already there (a previous graph for the same revision is
+    /// the same vectors, so superseding it is free).
+    pub fn dump(&self, dir: &Path, basename: &str) -> Result<String, String> {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        let written = AnnT::file_dump(&self.hnsw, dir, basename).map_err(|e| e.to_string())?;
+        let meta = AnnMeta {
+            dim: self.dim,
+            ef_search: self.ef_search,
+            hashes: self.hashes.clone(),
+            graph_basename: written.clone(),
+        };
+        let encoded = serde_json::to_vec(&meta).map_err(|e| e.to_string())?;
+        std::fs::write(meta_path(dir, basename), encoded)
+            .map_err(|e| format!("write ann meta: {e}"))?;
+        Ok(written)
+    }
+
+    /// Loads a graph dumped by [`AnnIndex::dump`] for the SAME revision and
+    /// parameters. Any inconsistency (missing file, different width, a
+    /// truncated dump from an interrupted write) is an error the caller turns
+    /// into "build it again" — never a partially usable index.
+    pub fn load(dir: &Path, basename: &str) -> Result<Self, String> {
+        let encoded =
+            std::fs::read(meta_path(dir, basename)).map_err(|e| format!("read ann meta: {e}"))?;
+        let meta: AnnMeta =
+            serde_json::from_slice(&encoded).map_err(|e| format!("parse ann meta: {e}"))?;
+        if meta.dim == 0 || meta.hashes.is_empty() {
+            return Err("ann meta describes an empty corpus".to_owned());
+        }
+        // `load_hnsw<'b, 'a>(&'a mut self) -> Hnsw<'b>` is bounded `'a: 'b`, so
+        // a `Hnsw<'static>` — which is what this struct stores, since the graph
+        // outlives the call — requires the loader itself to be borrowed for
+        // `'static`. Leaking one small `HnswIo` per loaded revision is the
+        // cheapest way to satisfy that; the graph is what holds the memory.
+        let io: &'static mut HnswIo = Box::leak(Box::new(HnswIo::new(dir, &meta.graph_basename)));
+        let hnsw = io
+            .load_hnsw::<f32, DistCosine>()
+            .map_err(|e| format!("load ann graph: {e}"))?;
+        if hnsw.get_nb_point() != meta.hashes.len() {
+            return Err(format!(
+                "ann graph holds {} points, meta describes {}",
+                hnsw.get_nb_point(),
+                meta.hashes.len()
+            ));
+        }
+        Ok(Self {
+            hnsw,
+            hashes: meta.hashes,
+            dim: meta.dim,
+            ef_search: meta.ef_search.max(VECTOR_TOP_K),
+        })
     }
 }
 
-/// HNSW build quality. The paper's `M` (links per node) is fixed at 32 inside
-/// `instant-distance`; this only sets how hard the builder searches while
-/// linking, and [`HNSW_LINKS_M`] mirrors that fixed value for size estimates.
-const EF_CONSTRUCTION: usize = 200;
-const HNSW_LINKS_M: usize = 32;
-/// Fixed graph seed. The crate defaults to an ENTROPY seed, which would make
-/// the same corpus produce a slightly different graph (and therefore slightly
-/// different neighbours) after every rebuild — the exact scan and every other
-/// ranking surface in this project are reproducible, so the index is too:
-/// same vectors + same parameters ⇒ same graph ⇒ same answers.
-const HNSW_SEED: u64 = 0x11_5EED;
-
-fn normalise(vector: &[f32]) -> Vec<f32> {
-    let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
-    if norm == 0.0 {
-        return vector.to_vec();
-    }
-    vector.iter().map(|value| value / norm).collect()
+/// Sidecar path for one graph basename. `pub(crate)` so the cache's tests can
+/// watch whether a load rewrote it (an adoption does not).
+pub(crate) fn meta_path(dir: &Path, basename: &str) -> std::path::PathBuf {
+    dir.join(format!("{basename}.{META_SUFFIX}"))
 }
 
-impl VectorIndex for HnswIndex {
+impl VectorIndex for AnnIndex {
     fn top_candidates(&self, query: Option<&[f32]>, k: usize) -> Vec<VectorCandidate> {
         let Some(query) = query else {
             return Vec::new();
         };
         if query.len() != self.dim || query.iter().all(|value| *value == 0.0) {
-            return self.degenerate(k);
+            return degenerate_top_k(&self.hashes, k);
         }
-        let query_point = UnitPoint(normalise(query));
-        let mut search = self.search.lock().expect("hnsw search scratch");
-        let mut found: Vec<(f32, u32)> = self
-            .map
-            .search(&query_point, &mut search)
-            .map(|item| (1.0 - item.distance, *item.value))
+        // DistCosine distances are `1 - cosine`, so the score is symmetric.
+        let mut scored: Vec<(f32, u32)> = self
+            .hnsw
+            .search(query, k, self.ef_search)
+            .iter()
+            .map(|neighbour| (1.0 - neighbour.distance, neighbour.d_id as u32))
             .collect();
-        drop(search);
-        found.sort_unstable_by(|a, b| {
-            b.0.partial_cmp(&a.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| self.hashes[a.1 as usize].cmp(&self.hashes[b.1 as usize]))
-        });
-        found
-            .into_iter()
-            .take(k)
-            .map(|(score, slot)| VectorCandidate {
-                text_hash: self.hashes[slot as usize].clone(),
-                score,
-            })
-            .collect()
+        rank(&mut scored, &self.hashes, k)
     }
 
     fn len(&self) -> usize {
@@ -353,10 +406,10 @@ impl VectorIndex for HnswIndex {
     }
 
     fn resident_bytes(&self) -> usize {
-        // Points plus the graph's links and level tables; the link count is
-        // the dominant term and is what an operator needs to budget for.
+        // Points plus the graph's links; both are needed to budget for the
+        // resident set, and the sidecar's hashes are the smaller term.
         let points = self.hashes.len() * self.dim * std::mem::size_of::<f32>();
-        let links = self.hashes.len() * HNSW_LINKS_M * std::mem::size_of::<u32>() * 2;
+        let links = self.hashes.len() * HNSW_MAX_CONNECTIONS * std::mem::size_of::<u32>() * 2;
         points + links + self.hashes.iter().map(String::len).sum::<usize>()
     }
 
@@ -387,7 +440,7 @@ mod tests {
             .collect()
     }
 
-    /// The reference implementation this file must reproduce: the shipped
+    /// The reference implementation this module must reproduce: the shipped
     /// scan, written out naively.
     fn naive_top_k(
         vectors: &BTreeMap<String, Vec<f32>>,
@@ -429,6 +482,12 @@ mod tests {
             .collect()
     }
 
+    fn query_for(index: usize, dim: usize) -> Vec<f32> {
+        (0..dim)
+            .map(|i| ((index * 31 + i * 7) % 97) as f32 / 97.0 - 0.5)
+            .collect()
+    }
+
     #[test]
     fn exact_index_is_bit_identical_to_the_shipped_scan() {
         let vectors = synthetic(500, 24, 0x5eed);
@@ -446,7 +505,6 @@ mod tests {
         let vectors = synthetic(50, 8, 7);
         let index = ExactIndex::build(&vectors);
 
-        // Width mismatch: every cosine is 0, so the order is by hash.
         let mismatched = index.top_candidates(Some(&[1.0, 2.0]), 3);
         assert!(mismatched.iter().all(|candidate| candidate.score == 0.0));
         assert_eq!(
@@ -457,37 +515,22 @@ mod tests {
             vec!["hash-000000", "hash-000001", "hash-000002"]
         );
 
-        // A zero query divides by zero in the cosine: also 0 for everyone.
         let zero_query = vec![0.0_f32; 8];
         assert!(index
             .top_candidates(Some(&zero_query), 4)
             .iter()
             .all(|candidate| candidate.score == 0.0));
 
-        // No query vector at all is an empty result, not a fabricated one.
         assert!(index.top_candidates(None, 4).is_empty());
     }
 
     #[test]
-    fn still_exact_when_the_corpus_is_smaller_than_the_ann_threshold() {
-        let vectors = synthetic(64, 8, 11);
-        let config = VectorIndexConfig::default();
-        let index = build_index(&vectors, &config);
-        assert_eq!(index.kind(), "exact", "auto stays exact below min_sections");
-        assert_eq!(index.len(), 64);
-    }
-
-    #[test]
     fn ann_mode_is_parsed_by_the_config_layer() {
-        // The accepted spellings live in core (serde), so this pins the
-        // contract the compiler relies on rather than re-listing them.
         let off =
             llm_wiki_core::config::Config::parse_toml("[embedding]\nann = \"off\"\n").unwrap();
         assert_eq!(off.embedding.ann, AnnMode::Off);
         let on = llm_wiki_core::config::Config::parse_toml("[embedding]\nann = \"on\"\n").unwrap();
         assert_eq!(on.embedding.ann, AnnMode::On);
-        let default = llm_wiki_core::config::Config::default();
-        assert_eq!(default.embedding.ann, AnnMode::Off);
         assert!(
             llm_wiki_core::config::Config::parse_toml("[embedding]\nann = \"sometimes\"\n")
                 .is_err()
@@ -495,20 +538,25 @@ mod tests {
     }
 
     #[test]
-    fn auto_builds_an_ann_once_the_corpus_reaches_the_threshold() {
-        let vectors = synthetic(200, 8, 13);
+    fn auto_decides_by_corpus_size_against_the_threshold() {
         let config = VectorIndexConfig {
             ann: AnnMode::Auto,
             min_sections: 200,
             ef_search: 64,
         };
-        assert_eq!(build_index(&vectors, &config).kind(), "hnsw");
-
+        assert!(config.wants_ann(200));
+        assert!(!config.wants_ann(199));
         let off = VectorIndexConfig {
             ann: AnnMode::Off,
             ..config
         };
-        assert_eq!(build_index(&vectors, &off).kind(), "exact");
+        assert!(!off.wants_ann(100_000));
+        let on = VectorIndexConfig {
+            ann: AnnMode::On,
+            ..config
+        };
+        assert!(on.wants_ann(1));
+        assert!(!on.wants_ann(0));
     }
 
     /// The acceptance question for an approximate index: how much of the
@@ -518,16 +566,14 @@ mod tests {
     fn ann_recalls_the_exact_top_k() {
         let vectors = synthetic(2_000, 32, 0xC0FFEE);
         let exact = ExactIndex::build(&vectors);
-        let ann = HnswIndex::build(&vectors, 128).unwrap();
+        let ann = AnnIndex::build(&exact, 128).unwrap();
         assert_eq!(ann.len(), exact.len());
 
         let mut hits = 0usize;
         let mut total = 0usize;
         let queries = 40;
         for q in 0..queries {
-            let query: Vec<f32> = (0..32)
-                .map(|i| ((q * 31 + i * 7) % 97) as f32 / 97.0 - 0.5)
-                .collect();
+            let query = query_for(q, 32);
             let expected = exact.top_candidates(Some(&query), VECTOR_TOP_K);
             let actual = ann.top_candidates(Some(&query), VECTOR_TOP_K);
             assert_eq!(actual.len(), VECTOR_TOP_K);
@@ -545,27 +591,16 @@ mod tests {
         println!("ann recall@{VECTOR_TOP_K} over {queries} queries: {recall:.3}");
     }
 
-    /// Approximate is still DETERMINISTIC here: the graph is seeded at build
-    /// time, so the same query returns the same neighbours — and so does a
-    /// REBUILD of the same corpus, which is what makes a retrieval result
-    /// reproducible across server restarts and backfills.
     #[test]
-    fn ann_results_are_deterministic_and_well_formed() {
+    fn ann_answers_are_ordered_and_well_formed() {
         let vectors = synthetic(500, 16, 99);
-        let ann = HnswIndex::build(&vectors, 128).unwrap();
-        let query: Vec<f32> = (0..16).map(|i| (i as f32) * 0.25 - 2.0).collect();
+        let exact = ExactIndex::build(&vectors);
+        let ann = AnnIndex::build(&exact, 128).unwrap();
+        let query = query_for(7, 16);
 
         let first = ann.top_candidates(Some(&query), VECTOR_TOP_K);
         let second = ann.top_candidates(Some(&query), VECTOR_TOP_K);
-        assert_eq!(first, second, "same query, same answer");
-
-        let rebuilt = HnswIndex::build(&vectors, 128).unwrap();
-        assert_eq!(
-            first,
-            rebuilt.top_candidates(Some(&query), VECTOR_TOP_K),
-            "a rebuild of the same corpus must answer identically"
-        );
-
+        assert_eq!(first, second, "one graph, one answer");
         for candidate in &first {
             assert!(vectors.contains_key(&candidate.text_hash));
             assert!(
@@ -574,19 +609,18 @@ mod tests {
                 candidate.score
             );
         }
-        // Sorted by score descending.
         for window in first.windows(2) {
             assert!(window[0].score >= window[1].score);
         }
     }
 
-    /// Degenerate inputs must reproduce the exact scan's defined answer
-    /// rather than an arbitrary neighbour set.
+    /// Degenerate inputs must reproduce the exact scan's defined answer rather
+    /// than an arbitrary neighbour set.
     #[test]
     fn ann_matches_the_exact_answer_for_degenerate_queries() {
         let vectors = synthetic(300, 8, 3);
         let exact = ExactIndex::build(&vectors);
-        let ann = HnswIndex::build(&vectors, 128).unwrap();
+        let ann = AnnIndex::build(&exact, 128).unwrap();
 
         let mismatched = vec![1.0_f32, 0.0];
         assert_eq!(
@@ -599,5 +633,48 @@ mod tests {
             exact.top_candidates(Some(&zero), 3)
         );
         assert!(ann.top_candidates(None, 3).is_empty());
+    }
+
+    /// A dumped graph must come back answering the same questions — that is
+    /// the whole point of persisting it per revision.
+    #[test]
+    fn dumped_graph_reloads_with_the_same_answers() {
+        let dir = std::env::temp_dir().join("llm-wiki-ann-dump-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let vectors = synthetic(600, 24, 0xBEEF);
+        let exact = ExactIndex::build(&vectors);
+        let ann = AnnIndex::build(&exact, 128).unwrap();
+        let written = ann.dump(&dir, "ann-test").unwrap();
+        assert_eq!(
+            written, "ann-test",
+            "a fresh directory takes the name as given"
+        );
+
+        let loaded = AnnIndex::load(&dir, "ann-test").expect("reload the graph");
+        assert_eq!(loaded.len(), ann.len());
+        assert_eq!(loaded.dim, ann.dim);
+        for q in 0..5 {
+            let query = query_for(q, 24);
+            assert_eq!(
+                ann.top_candidates(Some(&query), VECTOR_TOP_K),
+                loaded.top_candidates(Some(&query), VECTOR_TOP_K),
+                "the persisted graph must answer identically"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Corrupt or mismatched persistence is an error to rebuild from, never a
+    /// silently wrong index.
+    #[test]
+    fn loading_garbage_is_an_error_not_a_partial_index() {
+        let dir = std::env::temp_dir().join("llm-wiki-ann-bad-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(AnnIndex::load(&dir, "never-dumped").is_err());
+
+        std::fs::write(meta_path(&dir, "garbage"), b"{ not json").unwrap();
+        assert!(AnnIndex::load(&dir, "garbage").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

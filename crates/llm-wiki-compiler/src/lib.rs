@@ -54,5 +54,5 @@ pub use publish::{
 };
 pub use replan::{plan_diff, replan, PlanDiff, ReplanReport};
 pub use semantic_lint::{run_semantic_lint, SemanticFinding, SemanticFindingKind, SemanticReport};
-pub use vector_cache::{VectorSnapshot, VectorSnapshotCache};
-pub use vector_index::{AnnMode, ExactIndex, HnswIndex, VectorIndex, VectorIndexConfig};
+pub use vector_cache::{SnapshotLoad, VectorSnapshot, VectorSnapshotCache};
+pub use vector_index::{AnnIndex, AnnMode, ExactIndex, VectorIndex, VectorIndexConfig};

@@ -102,18 +102,18 @@ pub struct EndpointConfig {
 
 /// Which search path the vector layer uses (PRD §49's local index).
 ///
-/// `Off` is the shipped default because the measured cost is in the BUILD, not
-/// the query: at 100k sections × 768 dims an HNSW build took ~10 minutes
-/// against a 190 ms exact scan (LW-001 harness), and the index is rebuilt
-/// whenever the generation or the embeddings change. `Auto`/`On` are for a
-/// long-lived server over a corpus that is embedded once and queried heavily.
+/// `Auto` is the shipped default: the index is produced off the query path (a
+/// detached thread, persisted per embeddings revision), so above the measured
+/// crossover it is pure gain, and below it `ann_min_sections` keeps the exact
+/// scan. The measured cost is in the BUILD, not the query — see
+/// [`EmbeddingConfig::ann`] for the numbers at 1k/10k/100k sections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum AnnMode {
     /// Always the exact scan.
-    #[default]
     Off,
     /// Exact below `ann_min_sections`, approximate above it.
+    #[default]
     Auto,
     /// Approximate whenever the corpus is non-empty.
     On,
@@ -169,26 +169,48 @@ pub struct EmbeddingConfig {
     /// (LW-001). The whole active generation's vectors for one model are
     /// loaded once and reused across queries until the generation or the
     /// embeddings change; this caps how large that snapshot may get before the
-    /// server serves it WITHOUT caching. 0 disables the cache. At dim=768 one
-    /// vector is ~3 KiB, so the 100_000 default is a ~300 MiB ceiling.
+    /// server serves it WITHOUT caching. 0 disables the cache (and with it the
+    /// ANN, which is only worth producing for a snapshot that will be kept).
+    /// At dim=768 one vector is ~3 KiB, so the 100_000 default is a ~300 MiB
+    /// ceiling — roughly doubled when an ANN is built over it, since the exact
+    /// arena is kept as the fallback.
     #[serde(default = "default_embed_snapshot_cache_sections")]
     pub snapshot_cache_sections: usize,
-    /// Nearest-neighbour search path (LW-001 中期 / PR-5). `off` (the
-    /// default) always scans exactly; `auto` keeps the exact scan below
+    /// Nearest-neighbour search path (LW-001 中期 / PR-5). `off` always scans
+    /// exactly; `auto` (the default) keeps the exact scan below
     /// `ann_min_sections` and builds an HNSW index above it; `on` always
-    /// builds one. Every build failure degrades to the exact scan, so this
-    /// trades recall and BUILD TIME for query latency, never correctness.
-    /// Measured at 100k × 768: build ~10 min, query 21 ms vs 190 ms exact,
-    /// recall@8 0.944 at `ann_ef_search = 128`.
+    /// builds one.
+    ///
+    /// The index never sits on the query path: a detached thread adopts the
+    /// graph persisted for this (generation, model, embeddings revision), or
+    /// builds and dumps it, while queries keep being served exactly. Every
+    /// failure degrades to the exact scan, so this trades recall, CPU and
+    /// memory for query latency, never correctness.
+    ///
+    /// Measured (LW-001 harness, 768-dim, 20 reps, release) — ANN versus the
+    /// shipped exact scan over the same vectors:
+    ///
+    /// | sections | exact p50 | ANN p50 | ANN build | ANN reload | recall@8 |
+    /// |----------|-----------|---------|-----------|------------|----------|
+    /// | 1k       | 0.4 ms    | 0.8 ms  | 0.1 s     | 8 ms       | 1.000    |
+    /// | 10k      | 4.3 ms    | 4.7 ms  | 4.3 s     | 106 ms     | 1.000    |
+    /// | 100k     | 68.7 ms   | 12.4 ms | 292 s     | 3.1 s      | 0.944    |
+    ///
+    /// So the index only pays above ~50k sections — hence
+    /// `ann_min_sections = 50_000`. Above that it costs one background build
+    /// per revision (all cores), ~3 s to reload after a restart, and roughly
+    /// doubles the snapshot's resident memory (the exact arena is kept as the
+    /// fallback). Set `off` to refuse all of that.
     #[serde(default)]
     pub ann: AnnMode,
     /// `ann = "auto"` builds the index from this many stored vectors up.
-    /// Below it the exact scan is both faster and exact.
+    /// Below it the exact scan is both faster and exact (measured: the ANN
+    /// only wins above ~50k; it is still slower at 10k).
     #[serde(default = "default_embed_ann_min_sections")]
     pub ann_min_sections: usize,
     /// ANN search breadth: higher finds more of the true neighbours and costs
     /// more per query. The dial for the recall/latency trade-off — the
-    /// measured recall above is what 128 buys at that scale.
+    /// measured recall above is what 128 buys at 100k.
     #[serde(default = "default_embed_ann_ef_search")]
     pub ann_ef_search: usize,
 }
@@ -493,7 +515,7 @@ fn default_embed_snapshot_cache_sections() -> usize {
 }
 
 fn default_embed_ann_min_sections() -> usize {
-    20_000
+    50_000
 }
 
 fn default_embed_ann_ef_search() -> usize {
@@ -914,6 +936,16 @@ mod tests {
         assert_eq!(no_section.embedding.max_concurrency, 1);
         assert_eq!(no_section.embedding.batch_size, 16);
         assert_eq!(no_section.embedding.max_retries, 3);
+        assert_eq!(
+            no_section.embedding.ann,
+            AnnMode::Auto,
+            "auto is the shipped search path"
+        );
+        assert_eq!(
+            no_section.embedding.ann_min_sections, 50_000,
+            "the measured crossover between the exact scan and HNSW"
+        );
+        assert_eq!(no_section.embedding.ann_ef_search, 128);
         assert_eq!(
             no_section.embedding.snapshot_cache_sections,
             defaults.embedding.snapshot_cache_sections,

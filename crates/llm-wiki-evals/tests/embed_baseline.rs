@@ -169,7 +169,7 @@ fn measure(reps: usize, mut run: impl FnMut()) -> (Duration, Duration, usize) {
 /// — the number that decides whether the default should be `auto` — how much
 /// of the exact top-K the index actually returns.
 fn index_comparison(n: usize, hashes: &[String]) {
-    use llm_wiki_compiler::{ExactIndex, HnswIndex, VectorIndex};
+    use llm_wiki_compiler::{AnnIndex, ExactIndex, VectorIndex};
 
     const SCAN_REPS: usize = 5;
     const RECALL_QUERIES: usize = 20;
@@ -184,8 +184,9 @@ fn index_comparison(n: usize, hashes: &[String]) {
     let started = Instant::now();
     let exact = ExactIndex::build(&vectors);
     let exact_build = started.elapsed();
+    drop(vectors);
     let started = Instant::now();
-    let ann = match HnswIndex::build(&vectors, EF_SEARCH) {
+    let ann = match AnnIndex::build(&exact, EF_SEARCH) {
         Ok(index) => index,
         Err(err) => {
             println!("    ↳ index: HNSW unavailable ({err})");
@@ -194,12 +195,32 @@ fn index_comparison(n: usize, hashes: &[String]) {
     };
     let ann_build = started.elapsed();
 
+    // The restart path: a graph persisted once is adopted instead of rebuilt.
+    // This is what makes the ANN safe to enable — a query never waits.
+    let dir = std::env::temp_dir().join(format!("llm-wiki-pr5-{n}"));
+    let started = Instant::now();
+    let dumped = ann.dump(&dir, "graph").is_ok();
+    let dump_time = started.elapsed();
+    let started = Instant::now();
+    let reload = if dumped {
+        AnnIndex::load(&dir, "graph").ok()
+    } else {
+        None
+    };
+    let load_time = started.elapsed();
+
     let query = synthetic_vector("pr5 query vector");
     let (exact_p50, exact_p95, _) = measure(SCAN_REPS, || {
         let _ = exact.top_candidates(Some(&query), K);
     });
     let (ann_p50, ann_p95, _) = measure(SCAN_REPS, || {
         let _ = ann.top_candidates(Some(&query), K);
+    });
+    let reloaded_p50 = reload.as_ref().map(|index| {
+        measure(SCAN_REPS, || {
+            let _ = index.top_candidates(Some(&query), K);
+        })
+        .0
     });
 
     let mut hits = 0usize;
@@ -230,6 +251,17 @@ fn index_comparison(n: usize, hashes: &[String]) {
         exact_p50.as_secs_f64() / ann_p50.as_secs_f64().max(1e-9),
         hits as f64 / total.max(1) as f64,
     );
+    match reloaded_p50 {
+        Some(p50) => println!(
+            "    ↳ persisted: dump {:.0}ms / reload {:.0}ms / reloaded p50 {:.1}ms  →  \
+             a restart skips the {:.1}s build",
+            dump_time.as_secs_f64() * 1e3,
+            load_time.as_secs_f64() * 1e3,
+            p50.as_secs_f64() * 1e3,
+            ann_build.as_secs_f64(),
+        ),
+        None => println!("    ↳ persisted: unavailable (dump failed)"),
+    }
     let _ = n;
 }
 

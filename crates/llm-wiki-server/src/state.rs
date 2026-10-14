@@ -61,6 +61,7 @@ impl SharedState {
             min_sections: config.embedding.ann_min_sections,
             ef_search: config.embedding.ann_ef_search,
         };
+        let index_dir = vector_index_dir(&workspace);
         Self(Arc::new(Inner {
             workspace,
             config,
@@ -74,6 +75,7 @@ impl SharedState {
             vector_cache: Arc::new(llm_wiki_compiler::VectorSnapshotCache::new(
                 snapshot_cap,
                 index_config,
+                Some(index_dir),
             )),
         }))
     }
@@ -96,6 +98,13 @@ impl SharedState {
 
 pub fn state_db(workspace: &Path) -> PathBuf {
     workspace.join(".llm-wiki").join("state.db")
+}
+
+/// Where the query-side ANN graph is cached. Keyed by the identity of the
+/// vectors it was built from (see `VectorSnapshotCache`), so generations
+/// coexist and a superseded graph is simply never looked up again.
+pub fn vector_index_dir(workspace: &Path) -> PathBuf {
+    workspace.join(".llm-wiki").join("ann")
 }
 
 /// The single build slot. `start` fails while another job holds it; `take`
