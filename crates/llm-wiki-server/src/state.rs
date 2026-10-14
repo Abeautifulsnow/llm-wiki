@@ -56,6 +56,11 @@ impl SharedState {
     pub fn new(workspace: PathBuf, config: Config, provider: Option<Arc<dyn LlmProvider>>) -> Self {
         let permits = config.llm.max_concurrency.max(1) as usize;
         let snapshot_cap = config.embedding.snapshot_cache_sections;
+        let index_config = llm_wiki_compiler::VectorIndexConfig {
+            ann: config.embedding.ann,
+            min_sections: config.embedding.ann_min_sections,
+            ef_search: config.embedding.ann_ef_search,
+        };
         Self(Arc::new(Inner {
             workspace,
             config,
@@ -66,7 +71,10 @@ impl SharedState {
             embed_jobs: JobManager::new(),
             llm_permits: Arc::new(tokio::sync::Semaphore::new(permits)),
             rate_buckets: Mutex::new(std::collections::HashMap::new()),
-            vector_cache: Arc::new(llm_wiki_compiler::VectorSnapshotCache::new(snapshot_cap)),
+            vector_cache: Arc::new(llm_wiki_compiler::VectorSnapshotCache::new(
+                snapshot_cap,
+                index_config,
+            )),
         }))
     }
 

@@ -21,6 +21,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 unicode-normalization = { workspace = true }
 tokio = { workspace = true }
+instant-distance = "0.6.1"
 
 [dev-dependencies]
 async-trait = { workspace = true }

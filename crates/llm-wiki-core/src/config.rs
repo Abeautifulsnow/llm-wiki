@@ -100,6 +100,25 @@ pub struct EndpointConfig {
     pub timeout_seconds: u64,
 }
 
+/// Which search path the vector layer uses (PRD §49's local index).
+///
+/// `Off` is the shipped default because the measured cost is in the BUILD, not
+/// the query: at 100k sections × 768 dims an HNSW build took ~10 minutes
+/// against a 190 ms exact scan (LW-001 harness), and the index is rebuilt
+/// whenever the generation or the embeddings change. `Auto`/`On` are for a
+/// long-lived server over a corpus that is embedded once and queried heavily.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AnnMode {
+    /// Always the exact scan.
+    #[default]
+    Off,
+    /// Exact below `ann_min_sections`, approximate above it.
+    Auto,
+    /// Approximate whenever the corpus is non-empty.
+    On,
+}
+
 /// Vector-layer provider overrides (§19.3). Every field left empty/0
 /// INHERITS the corresponding `[llm]` value: embedding may point at a
 /// different provider (different base_url / key / model) by filling in only
@@ -154,6 +173,24 @@ pub struct EmbeddingConfig {
     /// vector is ~3 KiB, so the 100_000 default is a ~300 MiB ceiling.
     #[serde(default = "default_embed_snapshot_cache_sections")]
     pub snapshot_cache_sections: usize,
+    /// Nearest-neighbour search path (LW-001 中期 / PR-5). `off` (the
+    /// default) always scans exactly; `auto` keeps the exact scan below
+    /// `ann_min_sections` and builds an HNSW index above it; `on` always
+    /// builds one. Every build failure degrades to the exact scan, so this
+    /// trades recall and BUILD TIME for query latency, never correctness.
+    /// Measured at 100k × 768: build ~10 min, query 21 ms vs 190 ms exact,
+    /// recall@8 0.944 at `ann_ef_search = 128`.
+    #[serde(default)]
+    pub ann: AnnMode,
+    /// `ann = "auto"` builds the index from this many stored vectors up.
+    /// Below it the exact scan is both faster and exact.
+    #[serde(default = "default_embed_ann_min_sections")]
+    pub ann_min_sections: usize,
+    /// ANN search breadth: higher finds more of the true neighbours and costs
+    /// more per query. The dial for the recall/latency trade-off — the
+    /// measured recall above is what 128 buys at that scale.
+    #[serde(default = "default_embed_ann_ef_search")]
+    pub ann_ef_search: usize,
 }
 
 /// Rerank-stage provider overrides (PRD §50 V0.5), used when
@@ -210,6 +247,9 @@ impl Default for EmbeddingConfig {
             max_retries: default_embed_max_retries(),
             requests_per_minute: default_embed_requests_per_minute(),
             snapshot_cache_sections: default_embed_snapshot_cache_sections(),
+            ann: AnnMode::default(),
+            ann_min_sections: default_embed_ann_min_sections(),
+            ann_ef_search: default_embed_ann_ef_search(),
         }
     }
 }
@@ -450,6 +490,14 @@ fn default_embed_requests_per_minute() -> u32 {
 
 fn default_embed_snapshot_cache_sections() -> usize {
     100_000
+}
+
+fn default_embed_ann_min_sections() -> usize {
+    20_000
+}
+
+fn default_embed_ann_ef_search() -> usize {
+    128
 }
 
 fn default_project_name() -> String {
@@ -990,6 +1038,9 @@ max_rejected_claim_ratio = 0.10
                 max_retries: 1,
                 requests_per_minute: 300,
                 snapshot_cache_sections: 5_000,
+                ann: AnnMode::Off,
+                ann_min_sections: 1_000,
+                ann_ef_search: 64,
             },
             rerank: RerankConfig {
                 base_url: "https://rerank.example.com/v1".into(),

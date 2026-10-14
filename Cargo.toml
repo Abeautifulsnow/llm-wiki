@@ -26,7 +26,6 @@ llm-wiki-markdown = { path = "crates/llm-wiki-markdown" }
 llm-wiki-llm = { path = "crates/llm-wiki-llm" }
 llm-wiki-storage = { path = "crates/llm-wiki-storage" }
 llm-wiki-compiler = { path = "crates/llm-wiki-compiler" }
-llm-wiki-evals = { path = "crates/llm-wiki-evals" }
 llm-wiki-search = { path = "crates/llm-wiki-search" }
 llm-wiki-server = { path = "crates/llm-wiki-server" }
 

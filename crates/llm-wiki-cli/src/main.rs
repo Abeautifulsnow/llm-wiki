@@ -294,6 +294,16 @@ timeout_seconds = 120
 # at dim=768, so 100000 is a ~300 MiB ceiling.
 # snapshot_cache_sections = 100000
 
+# Nearest-neighbour search path (LW-001 中期 / PR-5): "off" (default) always
+# scans exactly, "auto" keeps the exact scan below ann_min_sections and builds
+# an HNSW index above it, "on" always builds one. A failed build falls back to
+# the exact scan, so this trades recall and BUILD TIME for query latency,
+# never correctness. Measured at 100k x 768: build ~10 min, query 21ms vs
+# 190ms exact, recall@8 0.944 at ef 128 — the build is why "off" ships.
+# ann = "off"
+# ann_min_sections = 20000
+# ann_ef_search = 128
+
 # Used when [search] rerank = "cohere-compatible" (Cohere/Jina-style
 # POST {base_url}/rerank — vLLM, Jina, SiliconFlow, Voyage, …).
 [rerank]

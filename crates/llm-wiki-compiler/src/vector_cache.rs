@@ -16,8 +16,13 @@
 //!
 //! Memory is the cost, so the cache is bounded by SECTION COUNT: a snapshot
 //! over the cap is returned for that request but never kept.
+//!
+//! Top-K is answered by the snapshot's [`VectorIndex`] — the exact scan, or
+//! an ANN above the configured size (`[embedding] ann`). The index is built
+//! together with the snapshot, so it is rebuilt by exactly the same
+//! invalidation events; an ANN that cannot be built leaves the exact scan in
+//! place.
 
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use llm_wiki_core::error::Result;
@@ -25,24 +30,37 @@ use llm_wiki_core::ids::BuildId;
 use llm_wiki_search::VectorCandidate;
 use llm_wiki_storage::Connection;
 
-/// Top-K returned to fusion, matching the pre-cache retrieval path.
-const VECTOR_TOP_K: usize = 8;
+use crate::vector_index::{build_index, VectorIndex, VectorIndexConfig};
+
+/// Top-K returned to fusion, shared with the index implementations.
+pub(crate) const VECTOR_TOP_K: usize = 8;
 
 /// One immutable read of the vector layer for the ACTIVE generation: the
-/// section key set plus the stored vectors for one model. Cheap to share
-/// (`Arc`), never mutated after construction.
+/// section key set, the stored vectors for one model, and the index that
+/// answers top-K over them (exact or approximate, per
+/// [`VectorIndexConfig`]). Cheap to share (`Arc`), never mutated after
+/// construction.
 #[derive(Debug)]
 pub struct VectorSnapshot {
-    vectors: BTreeMap<String, Vec<f32>>,
+    index: Box<dyn VectorIndex>,
 }
 
 impl VectorSnapshot {
-    /// Loads the snapshot for the ACTIVE generation and `model`. The key set
-    /// comes from the persisted section hashes, never from section text.
+    /// Loads the snapshot for the ACTIVE generation and `model`, scanning
+    /// exactly. The key set comes from the persisted section hashes, never
+    /// from section text.
     pub fn load(conn: &Connection, model: &str) -> Result<Self> {
+        Self::load_with(conn, model, &VectorIndexConfig::exact())
+    }
+
+    /// `load` with an explicit index policy: `Auto`/`On` build an ANN when the
+    /// corpus warrants it, and every failure degrades to the exact scan.
+    pub fn load_with(conn: &Connection, model: &str, config: &VectorIndexConfig) -> Result<Self> {
         let hashes = llm_wiki_storage::active_section_hashes(conn)?;
         let vectors = llm_wiki_storage::section_embeddings_by_hash(conn, model, &hashes)?;
-        Ok(Self { vectors })
+        Ok(Self {
+            index: build_index(&vectors, config),
+        })
     }
 
     /// Whether any vector exists for this model over the active generation —
@@ -54,73 +72,34 @@ impl VectorSnapshot {
 
     /// Stored vector count (the cache's size measure).
     pub fn len(&self) -> usize {
-        self.vectors.len()
+        self.index.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.vectors.is_empty()
+        self.index.is_empty()
     }
 
-    /// Approximate resident size: dims are uniform per model, so one vector's
-    /// bytes times the count. Reported when a snapshot is too large to keep.
+    /// Approximate resident size, reported when a snapshot is too large to
+    /// keep in the cache.
     pub fn resident_bytes(&self) -> usize {
-        let per_vector = self
-            .vectors
-            .values()
-            .next()
-            .map(|vector| vector.len() * std::mem::size_of::<f32>())
-            .unwrap_or(0);
-        per_vector * self.vectors.len()
+        self.index.resident_bytes()
+    }
+
+    /// Which search path this snapshot uses: `"exact"` or `"hnsw"`.
+    pub fn index_kind(&self) -> &'static str {
+        self.index.kind()
     }
 
     /// The top-K cosine candidates, deterministic: score descending, ties
     /// broken by text hash. `None` (a provider that returned no vector) is an
     /// empty result, never a fabricated hit.
     pub fn top_candidates(&self, query_vector: Option<&[f32]>) -> Vec<VectorCandidate> {
-        let Some(query_vector) = query_vector else {
-            return Vec::new();
-        };
-        let mut scored: Vec<(f32, &str)> = self
-            .vectors
-            .iter()
-            .map(|(text_hash, vector)| (cosine(query_vector, vector), text_hash.as_str()))
-            .collect();
-        scored.sort_by(|a, b| {
-            b.0.partial_cmp(&a.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.1.cmp(b.1))
-        });
-        scored
-            .into_iter()
-            .take(VECTOR_TOP_K)
-            .map(|(score, text_hash)| VectorCandidate {
-                text_hash: text_hash.to_owned(),
-                score,
-            })
-            .collect()
+        self.index.top_candidates(query_vector, VECTOR_TOP_K)
     }
 }
 
 /// Cosine similarity (vectors of different length score 0 — different
 /// embedding dimensions never mix).
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() {
-        return 0.0;
-    }
-    let (mut dot, mut norm_a, mut norm_b) = (0.0f32, 0.0f32, 0.0f32);
-    for (x, y) in a.iter().zip(b.iter()) {
-        dot += x * y;
-        norm_a += x * x;
-        norm_b += y * y;
-    }
-    let denominator = norm_a.sqrt() * norm_b.sqrt();
-    if denominator == 0.0 {
-        0.0
-    } else {
-        dot / denominator
-    }
-}
-
 /// The single cached snapshot plus the identity it belongs to.
 struct CachedSnapshot {
     build_id: BuildId,
@@ -134,6 +113,7 @@ struct CachedSnapshot {
 /// simply replaces the slot).
 pub struct VectorSnapshotCache {
     max_sections: usize,
+    index_config: VectorIndexConfig,
     slot: Mutex<Option<CachedSnapshot>>,
     /// Over-budget is a CONFIGURATION condition, not per-query data: warn once
     /// per process instead of on every retrieval.
@@ -141,10 +121,12 @@ pub struct VectorSnapshotCache {
 }
 
 impl VectorSnapshotCache {
-    /// `max_sections == 0` disables caching (every call loads).
-    pub fn new(max_sections: usize) -> Self {
+    /// `max_sections == 0` disables caching (every call loads). `index_config`
+    /// chooses the search path (exact, or an ANN above the configured size).
+    pub fn new(max_sections: usize, index_config: VectorIndexConfig) -> Self {
         Self {
             max_sections,
+            index_config,
             slot: Mutex::new(None),
             warned_oversized: std::sync::atomic::AtomicBool::new(false),
         }
@@ -154,7 +136,11 @@ impl VectorSnapshotCache {
     /// it is still valid, otherwise freshly loaded (and kept when it fits).
     pub fn get_or_load(&self, conn: &Connection, model: &str) -> Result<Arc<VectorSnapshot>> {
         if self.max_sections == 0 {
-            return Ok(Arc::new(VectorSnapshot::load(conn, model)?));
+            return Ok(Arc::new(VectorSnapshot::load_with(
+                conn,
+                model,
+                &self.index_config,
+            )?));
         }
         let active = llm_wiki_storage::get_active_build_id(conn)?;
         let revision = llm_wiki_storage::embeddings_revision(conn)?;
@@ -169,7 +155,7 @@ impl VectorSnapshotCache {
                 }
             }
         }
-        let snapshot = Arc::new(VectorSnapshot::load(conn, model)?);
+        let snapshot = Arc::new(VectorSnapshot::load_with(conn, model, &self.index_config)?);
         if snapshot.len() <= self.max_sections {
             let mut slot = self.slot.lock().expect("vector cache lock");
             *slot = active.map(|build_id| CachedSnapshot {
@@ -243,7 +229,7 @@ mod tests {
     #[test]
     fn a_valid_entry_is_reused_and_a_new_backfill_invalidates_it() {
         let (mut conn, _) = workspace(4);
-        let cache = VectorSnapshotCache::new(100);
+        let cache = VectorSnapshotCache::new(100, VectorIndexConfig::exact());
 
         // Nothing embedded yet: an empty snapshot is still cached as valid.
         let empty = cache.get_or_load(&conn, "m").unwrap();
@@ -270,7 +256,7 @@ mod tests {
     #[test]
     fn a_new_backfill_between_calls_invalidates_the_cache() {
         let (mut conn, _) = workspace(4);
-        let cache = VectorSnapshotCache::new(100);
+        let cache = VectorSnapshotCache::new(100, VectorIndexConfig::exact());
         seed(&mut conn, "m", 2);
         let first = cache.get_or_load(&conn, "m").unwrap();
         assert_eq!(first.len(), 2);
@@ -289,7 +275,7 @@ mod tests {
     #[test]
     fn a_publish_switch_invalidates_the_cache() {
         let (mut conn, first_build) = workspace(2);
-        let cache = VectorSnapshotCache::new(100);
+        let cache = VectorSnapshotCache::new(100, VectorIndexConfig::exact());
         seed(&mut conn, "m", 2);
         let before = cache.get_or_load(&conn, "m").unwrap();
         assert_eq!(before.len(), 2);
@@ -332,7 +318,7 @@ mod tests {
     #[test]
     fn an_oversized_snapshot_is_served_but_not_kept() {
         let (mut conn, _) = workspace(6);
-        let cache = VectorSnapshotCache::new(2);
+        let cache = VectorSnapshotCache::new(2, VectorIndexConfig::exact());
         seed(&mut conn, "m", 6);
 
         let first = cache.get_or_load(&conn, "m").unwrap();
@@ -348,7 +334,7 @@ mod tests {
     #[test]
     fn a_disabled_cache_never_retains() {
         let (mut conn, _) = workspace(4);
-        let cache = VectorSnapshotCache::new(0);
+        let cache = VectorSnapshotCache::new(0, VectorIndexConfig::exact());
         seed(&mut conn, "m", 4);
         let first = cache.get_or_load(&conn, "m").unwrap();
         let second = cache.get_or_load(&conn, "m").unwrap();
@@ -362,7 +348,7 @@ mod tests {
         let (mut conn, _) = workspace(5);
         seed(&mut conn, "m", 5);
         let query = vec![1.0_f32, 0.5];
-        let cache = VectorSnapshotCache::new(100);
+        let cache = VectorSnapshotCache::new(100, VectorIndexConfig::exact());
 
         let direct = VectorSnapshot::load(&conn, "m")
             .unwrap()

@@ -145,23 +145,92 @@ fn percentile(sorted: &[Duration], pct: f64) -> Duration {
 /// Times one closure `REPS` times and returns (p50, p95, SQL statements per
 /// run). The warm-up round is excluded from BOTH latency and statement
 /// counts.
-fn measure(mut run: impl FnMut()) -> (Duration, Duration, usize) {
+fn measure(reps: usize, mut run: impl FnMut()) -> (Duration, Duration, usize) {
     run(); // warm-up
     QUERIES.store(0, Ordering::Relaxed);
-    let mut samples: Vec<Duration> = (0..REPS)
+    let mut samples: Vec<Duration> = (0..reps)
         .map(|_| {
             let started = Instant::now();
             run();
             started.elapsed()
         })
         .collect();
-    let stmts_per_run = QUERIES.load(Ordering::Relaxed) / REPS;
+    let stmts_per_run = QUERIES.load(Ordering::Relaxed) / reps.max(1);
     samples.sort_unstable();
     (
         percentile(&samples, 0.50),
         percentile(&samples, 0.95),
         stmts_per_run,
     )
+}
+
+/// PR-5 evidence (LW-001 中期): the same vectors, in memory, scanned exactly
+/// versus indexed approximately. Build cost, query latency, resident size and
+/// — the number that decides whether the default should be `auto` — how much
+/// of the exact top-K the index actually returns.
+fn index_comparison(n: usize, hashes: &[String]) {
+    use llm_wiki_compiler::{ExactIndex, HnswIndex, VectorIndex};
+
+    const SCAN_REPS: usize = 5;
+    const RECALL_QUERIES: usize = 20;
+    const K: usize = 8;
+    const EF_SEARCH: usize = 128;
+
+    let vectors: std::collections::BTreeMap<String, Vec<f32>> = hashes
+        .iter()
+        .map(|hash| (hash.clone(), synthetic_vector(hash)))
+        .collect();
+
+    let started = Instant::now();
+    let exact = ExactIndex::build(&vectors);
+    let exact_build = started.elapsed();
+    let started = Instant::now();
+    let ann = match HnswIndex::build(&vectors, EF_SEARCH) {
+        Ok(index) => index,
+        Err(err) => {
+            println!("    ↳ index: HNSW unavailable ({err})");
+            return;
+        }
+    };
+    let ann_build = started.elapsed();
+
+    let query = synthetic_vector("pr5 query vector");
+    let (exact_p50, exact_p95, _) = measure(SCAN_REPS, || {
+        let _ = exact.top_candidates(Some(&query), K);
+    });
+    let (ann_p50, ann_p95, _) = measure(SCAN_REPS, || {
+        let _ = ann.top_candidates(Some(&query), K);
+    });
+
+    let mut hits = 0usize;
+    let mut total = 0usize;
+    for index in 0..RECALL_QUERIES {
+        let probe = synthetic_vector(&format!("pr5 probe {index}"));
+        let wanted = exact.top_candidates(Some(&probe), K);
+        let found = ann.top_candidates(Some(&probe), K);
+        total += wanted.len();
+        hits += wanted
+            .iter()
+            .filter(|want| found.iter().any(|got| got.text_hash == want.text_hash))
+            .count();
+    }
+
+    println!(
+        "    ↳ index: exact build {:.0}ms / p50 {:.1}ms / p95 {:.1}ms / {:.0} MiB  vs  \
+         hnsw build {:.0}ms / p50 {:.1}ms / p95 {:.1}ms / {:.0} MiB (ef={EF_SEARCH})  →  \
+         {:.1}× faster, recall@{K} {:.3}",
+        exact_build.as_secs_f64() * 1e3,
+        exact_p50.as_secs_f64() * 1e3,
+        exact_p95.as_secs_f64() * 1e3,
+        exact.resident_bytes() as f64 / (1024.0 * 1024.0),
+        ann_build.as_secs_f64() * 1e3,
+        ann_p50.as_secs_f64() * 1e3,
+        ann_p95.as_secs_f64() * 1e3,
+        ann.resident_bytes() as f64 / (1024.0 * 1024.0),
+        exact_p50.as_secs_f64() / ann_p50.as_secs_f64().max(1e-9),
+        hits as f64 / total.max(1) as f64,
+    );
+    let _ = n;
 }
 
 /// The pre-LW-001 lookup: one point query per hash (harness-side
@@ -225,11 +294,11 @@ fn embed_retrieval_baseline() {
         let query = synthetic_vector("baseline query vector");
 
         // Coverage probe + the full top-K scan, each measured separately.
-        let (coverage_p50, coverage_p95, coverage_stmts) = measure(|| {
+        let (coverage_p50, coverage_p95, coverage_stmts) = measure(REPS, || {
             assert!(embedding_coverage(&conn, MODEL).unwrap());
         });
 
-        let (topk_p50, topk_p95, topk_stmts) = measure(|| {
+        let (topk_p50, topk_p95, topk_stmts) = measure(REPS, || {
             let candidates = top_cosine_candidates(&conn, MODEL, Some(&query)).unwrap();
             assert!(!candidates.is_empty());
         });
@@ -278,6 +347,10 @@ fn embed_retrieval_baseline() {
                 legacy_time.as_secs_f64() / batched_time.as_secs_f64().max(1e-9),
             );
         }
+
+        // PR-5 evidence: once the vectors are in memory, what does an
+        // approximate index actually buy — and what does it cost in recall?
+        index_comparison(n, &hashes);
 
         // Temp corpora reach hundreds of MB; reclaim each size before building
         // the next one. The connection must be closed first or the delete of
