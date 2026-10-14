@@ -119,6 +119,10 @@ enum Command {
         /// Sections per embedding request.
         #[arg(long, default_value_t = 16)]
         batch: usize,
+        /// In-flight embedding requests (falls back to
+        /// `[embedding] max_concurrency`; 1 = serial).
+        #[arg(long)]
+        concurrency: Option<usize>,
     },
     /// Lint the currently published generation (PRD §36): citation integrity,
     /// links, orphans, unsupported sections, duplicates, hand edits.
@@ -190,7 +194,11 @@ fn run(command: Command, json: bool) -> Result<(), WikiError> {
             embedding_model,
             json,
         ),
-        Command::Embed { model, batch } => embed(&workspace, model.as_deref(), batch, json),
+        Command::Embed {
+            model,
+            batch,
+            concurrency,
+        } => embed(&workspace, model.as_deref(), batch, concurrency, json),
         Command::Lint { semantic } => lint(&workspace, semantic, json),
         Command::Serve { host, port } => serve(&workspace, host, port, json),
     }
@@ -318,6 +326,9 @@ rate_limit_per_minute = 120
 # Re-run build jobs interrupted by a server restart (spends LLM budget on
 # restart — enable deliberately).
 resume_interrupted_jobs = false
+# Re-run EMBED jobs interrupted by a server restart (a separate switch:
+# embedding spend is often larger; additionally requires [embedding] model).
+resume_embed_jobs = false
 "#
         .to_owned(),
     )
@@ -836,8 +847,15 @@ fn ask(
     Ok(())
 }
 
-/// `llm-wiki embed` (§19.3): incremental embedding backfill.
-fn embed(workspace: &Path, model: Option<&str>, batch: usize, json: bool) -> Result<(), WikiError> {
+/// `llm-wiki embed` (§19.3): incremental embedding backfill, with bounded
+/// in-flight batches (`--concurrency` → `[embedding] max_concurrency`).
+fn embed(
+    workspace: &Path,
+    model: Option<&str>,
+    batch: usize,
+    concurrency: Option<usize>,
+    json: bool,
+) -> Result<(), WikiError> {
     let config = load_config(workspace)?;
     let model = embedding_model(model, &config)?;
     let embedding_provider = build_embedding_provider(&config)?;
@@ -845,12 +863,20 @@ fn embed(workspace: &Path, model: Option<&str>, batch: usize, json: bool) -> Res
         .enable_all()
         .build()
         .map_err(|e| WikiError::Llm(format!("cannot start async runtime: {e}")))?;
+    let options = llm_wiki_compiler::EmbedOptions {
+        batch_size: batch,
+        max_concurrency: concurrency
+            .unwrap_or(config.embedding.max_concurrency.max(1) as usize)
+            .max(1),
+        max_retries: config.embedding.max_retries,
+        ..llm_wiki_compiler::EmbedOptions::serial(batch)
+    };
     let Some(report) = runtime.block_on(llm_wiki_compiler::run_embed(
         workspace,
         &config,
         embedding_provider,
         &model,
-        batch,
+        options,
     ))?
     else {
         if json {
@@ -865,8 +891,20 @@ fn embed(workspace: &Path, model: Option<&str>, batch: usize, json: bool) -> Res
         return Ok(());
     }
     println!(
-        "embeddings [{}]: {} section(s), {} already covered, {} embedded",
-        report.model, report.total_sections, report.covered_before, report.embedded
+        "embeddings [{}]: {} section(s), {} already covered, {} embedded{}",
+        report.model,
+        report.total_sections,
+        report.covered_before,
+        report.embedded,
+        if report.retries > 0 {
+            format!(
+                " ({} retr{} after transient failures)",
+                report.retries,
+                if report.retries == 1 { "y" } else { "ies" }
+            )
+        } else {
+            String::new()
+        }
     );
     Ok(())
 }

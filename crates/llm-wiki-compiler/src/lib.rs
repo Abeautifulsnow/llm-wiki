@@ -38,7 +38,7 @@ pub use changeset::{
     ScannedSource,
 };
 pub use compile::{CompiledGeneration, CompilerConfig, WikiCompiler};
-pub use embed::{run_embed, EmbedReport};
+pub use embed::{run_embed, EmbedOptions, EmbedProgress, EmbedProgressSink, EmbedReport};
 pub use incremental::{map_incremental_change, MappingDecision, MappingInput};
 pub use lint::{run_lint, LintCheck, LintFinding, LintReport, LintSeverity};
 pub use persist::{persist_outcome, PersistOptions};

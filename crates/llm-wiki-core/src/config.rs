@@ -124,6 +124,21 @@ pub struct EmbeddingConfig {
     /// 0 inherits `llm.timeout_seconds`.
     #[serde(default)]
     pub timeout_seconds: u64,
+    /// Cap on in-flight embedding requests during `llm-wiki embed` /
+    /// `/v1/embed` backfills. 1 (the default) is the historical serial
+    /// behavior — a safe default for low-quota providers. The HTTP server
+    /// accounts in-flight batches against its shared LLM semaphore; this
+    /// caps the CLI/local fallback.
+    #[serde(default = "default_embed_max_concurrency")]
+    pub max_concurrency: u32,
+    /// Sections per embedding request; CLI `--batch` and the HTTP request
+    /// body override it.
+    #[serde(default = "default_embed_batch_size")]
+    pub batch_size: u32,
+    /// Retries per batch for transient provider failures (429/5xx/timeout)
+    /// with exponential backoff. 0 preserves the historical fail-fast.
+    #[serde(default = "default_embed_max_retries")]
+    pub max_retries: u32,
 }
 
 /// Rerank-stage provider overrides (PRD §50 V0.5), used when
@@ -359,6 +374,12 @@ pub struct ServerConfig {
     /// budget on restart, which must never come as a surprise.
     #[serde(default)]
     pub resume_interrupted_jobs: bool,
+    /// Re-enqueue EMBED jobs interrupted by a server restart. A separate
+    /// switch (embedding spend is often larger than a build's): off by
+    /// default, and it additionally requires `[embedding] model` to be set —
+    /// a resumed backfill must target the same model as before.
+    #[serde(default)]
+    pub resume_embed_jobs: bool,
 }
 
 fn default_max_queued_jobs() -> u32 {
@@ -369,6 +390,18 @@ fn default_max_body_bytes() -> u32 {
 }
 fn default_rate_limit_per_minute() -> u32 {
     120
+}
+
+fn default_embed_max_concurrency() -> u32 {
+    1
+}
+
+fn default_embed_batch_size() -> u32 {
+    16
+}
+
+fn default_embed_max_retries() -> u32 {
+    3
 }
 
 fn default_project_name() -> String {
@@ -542,6 +575,7 @@ impl Default for ServerConfig {
             max_body_bytes: default_max_body_bytes(),
             rate_limit_per_minute: default_rate_limit_per_minute(),
             resume_interrupted_jobs: false,
+            resume_embed_jobs: false,
         }
     }
 }
@@ -634,7 +668,7 @@ impl Config {
     /// construction: config only stores env-var names (PRD §32).
     pub fn effective_summary(&self) -> String {
         format!(
-            "project.name = {}\nproject.wiki_dir = {}\nsource.root = {}\nsource.include = {:?}\nsource.exclude = {:?}\nllm.provider = {}\nllm.base_url = {}\nllm.model = {}\nllm.api_key_env = <env name: redacted>\nllm.max_concurrency = {}\nembedding.provider = {}\nembedding.base_url = {}\nembedding.model = {}\nembedding.api_key_env = <env name: redacted>\nsearch.rerank = {}\nsearch.source_mode = {}\nrerank.base_url = {}\nrerank.model = {}\nrerank.api_key_env = <env name: redacted>\nanalysis.max_input_tokens = {}\nanalysis.max_plan_input_tokens = {}\nanalysis.max_rejected_claim_ratio = {}\nplanning.hierarchical = {}\nplanning.max_cluster_nodes = {}\nplanning.reconcile_rounds = {}\nbuild.incremental = {}\nbuild.keep_generations = {}\nserver.bind = {}\nserver.remote_enabled = {}",
+            "project.name = {}\nproject.wiki_dir = {}\nsource.root = {}\nsource.include = {:?}\nsource.exclude = {:?}\nllm.provider = {}\nllm.base_url = {}\nllm.model = {}\nllm.api_key_env = <env name: redacted>\nllm.max_concurrency = {}\nembedding.provider = {}\nembedding.base_url = {}\nembedding.model = {}\nembedding.max_concurrency = {}\nembedding.api_key_env = <env name: redacted>\nsearch.rerank = {}\nsearch.source_mode = {}\nrerank.base_url = {}\nrerank.model = {}\nrerank.api_key_env = <env name: redacted>\nanalysis.max_input_tokens = {}\nanalysis.max_plan_input_tokens = {}\nanalysis.max_rejected_claim_ratio = {}\nplanning.hierarchical = {}\nplanning.max_cluster_nodes = {}\nplanning.reconcile_rounds = {}\nbuild.incremental = {}\nbuild.keep_generations = {}\nserver.bind = {}\nserver.remote_enabled = {}",
             self.project.name,
             self.project.wiki_dir.display(),
             self.source.root.display(),
@@ -647,6 +681,7 @@ impl Config {
             self.embedding.resolved_provider(&self.llm),
             if self.embedding.base_url.is_empty() { &self.llm.base_url } else { &self.embedding.base_url },
             if self.embedding.model.is_empty() { "<unset>" } else { &self.embedding.model },
+            self.embedding.max_concurrency,
             self.search.rerank,
             self.search.source_mode,
             if self.rerank.base_url.is_empty() { &self.llm.base_url } else { &self.rerank.base_url },
@@ -861,6 +896,9 @@ max_rejected_claim_ratio = 0.10
                 api_key_env: "EMBED_KEY".into(),
                 model: "bge-m3".into(),
                 timeout_seconds: 30,
+                max_concurrency: 2,
+                batch_size: 32,
+                max_retries: 1,
             },
             rerank: RerankConfig {
                 base_url: "https://rerank.example.com/v1".into(),
