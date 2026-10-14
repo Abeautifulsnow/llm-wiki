@@ -268,11 +268,12 @@ pub async fn vector_candidates(
 
 /// Whether any stored section embeddings exist for `model` over the active
 /// generation — the cheap pre-check that keeps uncovered workspaces from
-/// spending a query embedding.
+/// spending a query embedding. One indexed existence probe per hash chunk,
+/// never a vector load (this runs on every hybrid retrieval).
 pub fn embedding_coverage(conn: &rusqlite::Connection, model: &str) -> Result<bool> {
     let sections = llm_wiki_search::active_context_sections(conn)?;
     let hashes: Vec<String> = sections.iter().map(|s| s.text_hash.clone()).collect();
-    Ok(!llm_wiki_storage::section_embeddings_by_hash(conn, model, &hashes)?.is_empty())
+    llm_wiki_storage::has_any_section_embedding(conn, model, &hashes)
 }
 
 /// The query side of [`vector_candidates`]: one embedding for the query.

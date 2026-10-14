@@ -46,7 +46,9 @@ pub use decisions::{
     OUTCOME_REPLAN_EXECUTED, OUTCOME_REPLAN_REQUIRED, TRIGGER_FINGERPRINT_CHANGED,
     TRIGGER_PAGE_EMPTIED, TRIGGER_STRUCTURAL_CHANGE, TRIGGER_UNMAPPABLE_NODE,
 };
-pub use embeddings::{insert_section_embeddings, section_embeddings_by_hash};
+pub use embeddings::{
+    has_any_section_embedding, insert_section_embeddings, section_embeddings_by_hash,
+};
 pub use graph::{
     ensure_graph_matches_active, graph_expand, graph_expand_from_page, page_node_id, rebuild_graph,
     GraphNeighbor, GraphStats, NeighborDirection, EXPAND_MAX_NODES, NODE_TYPE_CONCEPT,
@@ -59,9 +61,9 @@ pub use insights::{
 pub use jobs::{
     attach_job_build, count_jobs_by_status, finish_job, get_job, get_job_by_idempotency_key,
     insert_job, list_jobs, list_resumable_jobs, mark_stale_jobs_interrupted, requeue_job,
-    set_job_phase, set_job_running, ServerJobRecord, FAILURE_CANCELLED, FAILURE_INTERNAL,
-    FAILURE_INTERRUPTED, FAILURE_LLM, FAILURE_PLANNING, FAILURE_PUBLISH, FAILURE_REPLAN_REQUIRED,
-    JOB_STATUSES,
+    set_job_phase, set_job_progress, set_job_running, ServerJobRecord, FAILURE_CANCELLED,
+    FAILURE_INTERNAL, FAILURE_INTERRUPTED, FAILURE_LLM, FAILURE_PLANNING, FAILURE_PUBLISH,
+    FAILURE_REPLAN_REQUIRED, JOB_STATUSES,
 };
 pub use knowledge::{list_active_relation_pairs, load_knowledge_base, load_plan_input};
 pub use page_id_map::{
