@@ -153,12 +153,15 @@ impl VectorSnapshot {
                 let index = snapshot.adopt_or_build();
                 snapshot.building.store(false, Ordering::SeqCst);
                 if let Some(index) = index {
+                    let installed = Arc::new(index);
                     tracing::info!(
-                        vectors = index.len(),
+                        vectors = installed.len(),
+                        resident_mib = installed.resident_bytes() / (1024 * 1024),
                         elapsed_ms = started.elapsed().as_millis() as u64,
-                        "vector index ready (approximate)"
+                        "vector index ready (approximate); the exact arena is kept as the \
+                         fallback, so this doubles the snapshot's resident size"
                     );
-                    snapshot.install(Arc::new(index));
+                    snapshot.install(installed);
                 }
             });
         if spawned.is_err() {
@@ -182,10 +185,21 @@ impl VectorSnapshot {
     fn persisted_or_built(&self) -> Option<AnnIndex> {
         if let Some((dir, basename)) = &self.persist {
             match AnnIndex::load(dir, basename) {
-                Ok(index) => {
+                // The graph is only reused for the vectors it was built from.
+                // The name already encodes (build, model, revision) and the
+                // revision only grows because `section_embeddings` is
+                // append-only — checked here rather than assumed, so a future
+                // delete/cleanup path cannot silently serve stale neighbours.
+                Ok(index) if index.hashes() == self.exact.hashes() => {
                     tracing::info!(vectors = index.len(), "vector index loaded from disk");
                     return Some(index);
                 }
+                Ok(index) => tracing::warn!(
+                    graph_vectors = index.len(),
+                    current_vectors = self.exact.len(),
+                    "the persisted vector index does not match the current vectors; \
+                     rebuilding it"
+                ),
                 Err(err) => tracing::debug!(
                     error = %err,
                     "no usable persisted vector index; building one"
@@ -276,7 +290,7 @@ fn prune_other_graphs(dir: &Path, keep: &str) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let ours = name.contains(".hnsw.") || name.contains("ann.meta.json");
+        let ours = name.contains(".hnsw.") || name.contains(crate::vector_index::META_SUFFIX);
         let current =
             name.starts_with(&format!("{keep}.")) || name.starts_with(&format!("{keep}-"));
         if !ours || current {
@@ -310,6 +324,8 @@ pub struct VectorSnapshotCache {
     /// Over-budget is a CONFIGURATION condition, not per-query data: warn once
     /// per process instead of on every retrieval.
     warned_oversized: std::sync::atomic::AtomicBool,
+    /// Same for the ANN that can never be built because nothing is retained.
+    warned_uncached_ann: std::sync::atomic::AtomicBool,
 }
 
 impl VectorSnapshotCache {
@@ -327,6 +343,7 @@ impl VectorSnapshotCache {
             persist_dir,
             slot: Mutex::new(None),
             warned_oversized: std::sync::atomic::AtomicBool::new(false),
+            warned_uncached_ann: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -368,7 +385,17 @@ impl VectorSnapshotCache {
     pub fn get_or_load(&self, conn: &Connection, model: &str) -> Result<Arc<VectorSnapshot>> {
         if self.max_sections == 0 {
             // Nothing is retained, so a graph would be built (and thrown away)
-            // on every single query: scan exactly instead.
+            // on every single query: scan exactly instead. An explicit
+            // `ann = "on"` then does nothing, which must not be silent.
+            if self.index_config.ann != llm_wiki_core::config::AnnMode::Off
+                && !self.warned_uncached_ann.swap(true, Ordering::Relaxed)
+            {
+                tracing::warn!(
+                    "`[embedding] ann` is configured but `snapshot_cache_sections` is 0, so \
+                     no snapshot is kept and no index is ever built; raise \
+                     snapshot_cache_sections above 0 to enable it"
+                );
+            }
             return VectorSnapshot::load(conn, model);
         }
         let active = llm_wiki_storage::get_active_build_id(conn)?;
@@ -723,6 +750,126 @@ mod tests {
             "hnsw",
             "the background index must land"
         );
+    }
+
+    /// A graph whose keys are not the current vectors is discarded, never
+    /// served. Reachable in practice only if `section_embeddings` ever stops
+    /// being append-only — which is exactly why the loader checks instead of
+    /// assuming it.
+    #[test]
+    fn a_graph_of_other_vectors_is_discarded_not_served() {
+        let (mut conn, build_id) = workspace(12);
+        seed(&mut conn, "m", 12);
+        let revision = llm_wiki_storage::embeddings_revision(&conn).unwrap();
+        let hashes = llm_wiki_storage::active_section_hashes(&conn).unwrap();
+
+        // A same-sized but DIFFERENT key set, persisted under this identity's
+        // name — the shape a stale graph would have.
+        let stale: std::collections::BTreeMap<String, Vec<f32>> = (0..hashes.len())
+            .map(|slot| (format!("stale-{slot:06}"), vec![1.0_f32, 0.5]))
+            .collect();
+        let dir = std::env::temp_dir().join("llm-wiki-ann-stale");
+        let _ = std::fs::remove_dir_all(&dir);
+        let basename = VectorSnapshotCache::graph_basename(&build_id, "m", revision);
+        AnnIndex::build(&ExactIndex::build(&stale), 32)
+            .unwrap()
+            .dump(&dir, &basename)
+            .unwrap();
+        // The stale dump loads and is self-consistent — it is the key check,
+        // not the loader, that has to reject it (or this test would pass even
+        // with the guard removed).
+        let as_dumped = AnnIndex::load(&dir, &basename).expect("the stale dump loads");
+        assert_eq!(as_dumped.len(), hashes.len(), "same size, different keys");
+        assert!(as_dumped.hashes()[0].starts_with("stale-"));
+
+        let config = VectorIndexConfig {
+            ann: llm_wiki_core::config::AnnMode::On,
+            min_sections: 0,
+            ef_search: 32,
+        };
+        let cache = VectorSnapshotCache::new(100, config, Some(dir.clone()));
+        let snapshot = cache.get_or_load(&conn, "m").unwrap();
+        await_index(&snapshot);
+
+        let served: Vec<String> = snapshot
+            .top_candidates(Some(&[1.0_f32, 0.5]))
+            .into_iter()
+            .map(|candidate| candidate.text_hash)
+            .collect();
+        assert!(
+            !served.is_empty() && served.iter().all(|hash| hashes.contains(hash)),
+            "a stale graph leaked its own keys: {served:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With caching off there is nothing to keep a graph in, so no graph is
+    /// built — and saying so is not optional, or an explicit `ann = "on"`
+    /// looks like it took effect.
+    #[test]
+    fn an_uncached_snapshot_builds_no_index() {
+        let (mut conn, _) = workspace(20);
+        seed(&mut conn, "m", 20);
+        let dir = std::env::temp_dir().join("llm-wiki-ann-uncached");
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = VectorIndexConfig {
+            ann: llm_wiki_core::config::AnnMode::On,
+            min_sections: 0,
+            ef_search: 32,
+        };
+        let cache = VectorSnapshotCache::new(0, config, Some(dir.clone()));
+        for _ in 0..3 {
+            let snapshot = cache.get_or_load(&conn, "m").unwrap();
+            assert_eq!(snapshot.index_kind(), "exact");
+        }
+        assert!(
+            !dir.exists(),
+            "an uncached snapshot must not leave a graph behind"
+        );
+        assert!(
+            cache.warned_uncached_ann.load(Ordering::Relaxed),
+            "the no-op configuration must be reported once"
+        );
+    }
+
+    /// A corrupt sidecar is an error to rebuild from, through the whole cache
+    /// path (not just `AnnIndex::load`): queries keep being answered exactly.
+    #[test]
+    fn a_corrupt_persisted_graph_still_answers_exactly() {
+        let (mut conn, build_id) = workspace(12);
+        seed(&mut conn, "m", 12);
+        let revision = llm_wiki_storage::embeddings_revision(&conn).unwrap();
+        let dir = std::env::temp_dir().join("llm-wiki-ann-corrupt");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let basename = VectorSnapshotCache::graph_basename(&build_id, "m", revision);
+        std::fs::write(
+            crate::vector_index::meta_path(&dir, &basename),
+            b"{ truncated",
+        )
+        .unwrap();
+
+        let config = VectorIndexConfig {
+            ann: llm_wiki_core::config::AnnMode::On,
+            min_sections: 0,
+            ef_search: 32,
+        };
+        let cache = VectorSnapshotCache::new(100, config, Some(dir.clone()));
+        let snapshot = cache.get_or_load(&conn, "m").unwrap();
+        let query = vec![1.0_f32, 0.5];
+        assert!(!snapshot.top_candidates(Some(&query)).is_empty());
+        await_index(&snapshot);
+        assert!(!snapshot.top_candidates(Some(&query)).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A directory that was never created (or already cleaned up) is not an
+    /// error for the pruning pass.
+    #[test]
+    fn pruning_a_missing_directory_is_a_no_op() {
+        let dir = std::env::temp_dir().join("llm-wiki-ann-prune-missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        prune_other_graphs(&dir, "ann-a-1");
     }
 
     /// Exactly one revision's graph is kept. The separator matters: a bare

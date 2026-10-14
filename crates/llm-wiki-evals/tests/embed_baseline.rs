@@ -164,6 +164,89 @@ fn measure(reps: usize, mut run: impl FnMut()) -> (Duration, Duration, usize) {
     )
 }
 
+/// What the restart path costs: the dump that writes the graph, the reload
+/// that adopts it, and the query latency of the reloaded graph.
+struct Persistence {
+    dump: Duration,
+    reload: Duration,
+    reloaded_p50: Option<Duration>,
+}
+
+/// Persists `ann` under `tag` and reloads it, timing both halves. `reloaded_p50`
+/// is `None` when the dump itself failed (nothing to reload).
+fn measure_persistence(
+    ann: &llm_wiki_compiler::AnnIndex,
+    tag: &str,
+    reps: usize,
+    k: usize,
+) -> Persistence {
+    use llm_wiki_compiler::{AnnIndex, VectorIndex};
+
+    let dir = std::env::temp_dir().join(format!("llm-wiki-pr5-{tag}"));
+    let started = Instant::now();
+    let dumped = ann.dump(&dir, "graph").is_ok();
+    let dump = started.elapsed();
+    let started = Instant::now();
+    let reloaded = if dumped {
+        AnnIndex::load(&dir, "graph").ok()
+    } else {
+        None
+    };
+    let reload = started.elapsed();
+    let query = synthetic_vector("pr5 query vector");
+    let reloaded_p50 = reloaded.as_ref().map(|index| {
+        measure(reps, || {
+            let _ = index.top_candidates(Some(&query), k);
+        })
+        .0
+    });
+    Persistence {
+        dump,
+        reload,
+        reloaded_p50,
+    }
+}
+
+/// How much of the exact top-K the index returns — the number that decides
+/// whether enabling it is worth the build.
+fn recall_at_k(
+    exact: &llm_wiki_compiler::ExactIndex,
+    ann: &llm_wiki_compiler::AnnIndex,
+    queries: usize,
+    k: usize,
+) -> f64 {
+    use llm_wiki_compiler::VectorIndex;
+
+    let mut hits = 0usize;
+    let mut total = 0usize;
+    for index in 0..queries {
+        let probe = synthetic_vector(&format!("pr5 probe {index}"));
+        let wanted = exact.top_candidates(Some(&probe), k);
+        let found = ann.top_candidates(Some(&probe), k);
+        total += wanted.len();
+        hits += wanted
+            .iter()
+            .filter(|want| found.iter().any(|got| got.text_hash == want.text_hash))
+            .count();
+    }
+    hits as f64 / total.max(1) as f64
+}
+
+/// The restart path's report line, so `index_comparison` stays a straight read.
+fn report_persistence(stats: &Persistence, build: Duration) {
+    match stats.reloaded_p50 {
+        Some(p50) => println!(
+            "    ↳ persisted: dump {:.0}ms / reload {:.0}ms / reloaded p50 {:.1}ms  →  \
+             a restart skips the {:.1}s build",
+            stats.dump.as_secs_f64() * 1e3,
+            stats.reload.as_secs_f64() * 1e3,
+            p50.as_secs_f64() * 1e3,
+            build.as_secs_f64(),
+        ),
+        None => println!("    ↳ persisted: unavailable (dump failed)"),
+    }
+}
+
 /// PR-5 evidence (LW-001 中期): the same vectors, in memory, scanned exactly
 /// versus indexed approximately. Build cost, query latency, resident size and
 /// — the number that decides whether the default should be `auto` — how much
@@ -195,19 +278,7 @@ fn index_comparison(n: usize, hashes: &[String]) {
     };
     let ann_build = started.elapsed();
 
-    // The restart path: a graph persisted once is adopted instead of rebuilt.
-    // This is what makes the ANN safe to enable — a query never waits.
-    let dir = std::env::temp_dir().join(format!("llm-wiki-pr5-{n}"));
-    let started = Instant::now();
-    let dumped = ann.dump(&dir, "graph").is_ok();
-    let dump_time = started.elapsed();
-    let started = Instant::now();
-    let reload = if dumped {
-        AnnIndex::load(&dir, "graph").ok()
-    } else {
-        None
-    };
-    let load_time = started.elapsed();
+    let persistence = measure_persistence(&ann, &n.to_string(), SCAN_REPS, K);
 
     let query = synthetic_vector("pr5 query vector");
     let (exact_p50, exact_p95, _) = measure(SCAN_REPS, || {
@@ -216,25 +287,7 @@ fn index_comparison(n: usize, hashes: &[String]) {
     let (ann_p50, ann_p95, _) = measure(SCAN_REPS, || {
         let _ = ann.top_candidates(Some(&query), K);
     });
-    let reloaded_p50 = reload.as_ref().map(|index| {
-        measure(SCAN_REPS, || {
-            let _ = index.top_candidates(Some(&query), K);
-        })
-        .0
-    });
-
-    let mut hits = 0usize;
-    let mut total = 0usize;
-    for index in 0..RECALL_QUERIES {
-        let probe = synthetic_vector(&format!("pr5 probe {index}"));
-        let wanted = exact.top_candidates(Some(&probe), K);
-        let found = ann.top_candidates(Some(&probe), K);
-        total += wanted.len();
-        hits += wanted
-            .iter()
-            .filter(|want| found.iter().any(|got| got.text_hash == want.text_hash))
-            .count();
-    }
+    let recall = recall_at_k(&exact, &ann, RECALL_QUERIES, K);
 
     println!(
         "    ↳ index: exact build {:.0}ms / p50 {:.1}ms / p95 {:.1}ms / {:.0} MiB  vs  \
@@ -249,19 +302,9 @@ fn index_comparison(n: usize, hashes: &[String]) {
         ann_p95.as_secs_f64() * 1e3,
         ann.resident_bytes() as f64 / (1024.0 * 1024.0),
         exact_p50.as_secs_f64() / ann_p50.as_secs_f64().max(1e-9),
-        hits as f64 / total.max(1) as f64,
+        recall,
     );
-    match reloaded_p50 {
-        Some(p50) => println!(
-            "    ↳ persisted: dump {:.0}ms / reload {:.0}ms / reloaded p50 {:.1}ms  →  \
-             a restart skips the {:.1}s build",
-            dump_time.as_secs_f64() * 1e3,
-            load_time.as_secs_f64() * 1e3,
-            p50.as_secs_f64() * 1e3,
-            ann_build.as_secs_f64(),
-        ),
-        None => println!("    ↳ persisted: unavailable (dump failed)"),
-    }
+    report_persistence(&persistence, ann_build);
     let _ = n;
 }
 

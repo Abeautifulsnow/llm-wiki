@@ -59,8 +59,9 @@ const HNSW_EF_CONSTRUCTION: usize = 200;
 const HNSW_INSERT_BATCH: usize = 4096;
 /// Sidecar holding what the graph file cannot: the section hashes, the width
 /// and the search breadth. JSON, because it is written once per revision and
-/// only has to be readable.
-const META_SUFFIX: &str = "ann.meta.json";
+/// only has to be readable. `pub(crate)` so the cache's pruning matches the
+/// same suffix this module writes.
+pub(crate) const META_SUFFIX: &str = "ann.meta.json";
 
 /// Resolved index policy: whether to build an ANN, and how.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,10 +140,12 @@ fn cosine(query: &[f32], query_norm_sqrt: f32, vector: &[f32], norm_sqrt: f32) -
 /// Ranks scored candidates the one way every path in this module does:
 /// score descending, ties broken by text hash.
 fn rank(scored: &mut Vec<(f32, u32)>, hashes: &[String], k: usize) -> Vec<VectorCandidate> {
-    scored.sort_unstable_by(|a, b| {
-        b.0.partial_cmp(&a.0)
+    scored.sort_unstable_by(|left, right| {
+        right
+            .0
+            .partial_cmp(&left.0)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| hashes[a.1 as usize].cmp(&hashes[b.1 as usize]))
+            .then_with(|| hashes[left.1 as usize].cmp(&hashes[right.1 as usize]))
     });
     scored
         .drain(..scored.len().min(k))
@@ -158,7 +161,7 @@ fn rank(scored: &mut Vec<(f32, u32)>, hashes: &[String], k: usize) -> Vec<Vector
 /// cases cannot diverge between them.
 fn degenerate_top_k(hashes: &[String], k: usize) -> Vec<VectorCandidate> {
     let mut order: Vec<u32> = (0..hashes.len() as u32).collect();
-    order.sort_unstable_by(|a, b| hashes[*a as usize].cmp(&hashes[*b as usize]));
+    order.sort_unstable_by(|left, right| hashes[*left as usize].cmp(&hashes[*right as usize]));
     order
         .into_iter()
         .take(k)
@@ -381,6 +384,14 @@ impl AnnIndex {
 /// watch whether a load rewrote it (an adoption does not).
 pub(crate) fn meta_path(dir: &Path, basename: &str) -> std::path::PathBuf {
     dir.join(format!("{basename}.{META_SUFFIX}"))
+}
+
+impl AnnIndex {
+    /// The section key set this graph was built over, in slot order — the
+    /// authority a loader checks before trusting a persisted graph.
+    pub fn hashes(&self) -> &[String] {
+        &self.hashes
+    }
 }
 
 impl VectorIndex for AnnIndex {
@@ -653,8 +664,8 @@ mod tests {
         let loaded = AnnIndex::load(&dir, "ann-test").expect("reload the graph");
         assert_eq!(loaded.len(), ann.len());
         assert_eq!(loaded.dim, ann.dim);
-        for q in 0..5 {
-            let query = query_for(q, 24);
+        for probe in 0..5 {
+            let query = query_for(probe, 24);
             assert_eq!(
                 ann.top_candidates(Some(&query), VECTOR_TOP_K),
                 loaded.top_candidates(Some(&query), VECTOR_TOP_K),
