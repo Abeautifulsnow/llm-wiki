@@ -174,6 +174,22 @@ zero requests when fully covered. Request: `{"model"?, "batch"?}`. Response:
 "covered_before", "embedded"}`. Requires an embedding model (`model` or
 `LLM_WIKI_EMBEDDING_MODEL`).
 
+### POST /v1/embed/jobs (additive, 0014)
+
+The async, persistent, cancellable counterpart of `POST /v1/embed` (which
+stays synchronous; the frozen V1 contract is unchanged). Request:
+`{"model"?, "batch"?}` plus the `Idempotency-Key` header. Response:
+`202 {"job_id", "status": "queued"}` — progress and cancellation ride the
+generic `/v1/jobs` surface: the job row carries `kind: "embed"` and a
+`progress` object `{"total", "covered_before", "embedded"}` while RUNNING.
+One embed job at a time (`409 embed_already_running`); submit with nothing
+published is `404 nothing_published`. Idempotency keys are scoped
+`embed:{generation}:{model}:{key}`: a replay resolves to the SAME job, a new
+generation or model starts a fresh one. Restart recovery is a separate opt-in
+(`server.resume_embed_jobs`, additionally requiring `[embedding] model`);
+interrupted embed jobs otherwise stay `INTERRUPTED` and visible in
+`/v1/jobs`.
+
 ### GET /v1/pages, GET /v1/pages/{id}
 
 Page metadata / full page content with citations and links of the ACTIVE

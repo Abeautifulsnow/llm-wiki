@@ -135,6 +135,20 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         }
     }
 
+    // Embed resume is a SEPARATE opt-in (embedding spend is often larger
+    // than a build's) and additionally requires `[embedding] model` —
+    // otherwise interrupted embed jobs stay INTERRUPTED, visible via
+    // `/v1/jobs`.
+    if state.config().server.resume_embed_jobs {
+        let resume_state = state.clone();
+        tokio::spawn(async move {
+            let resumed = jobs::recover_interrupted_embed_jobs(&resume_state).await;
+            if resumed > 0 {
+                tracing::info!(count = resumed, "resumed interrupted embed jobs");
+            }
+        });
+    }
+
     let app = build_router(state).layer(axum::extract::DefaultBodyLimit::max(body_limit));
     let listener = tokio::net::TcpListener::bind((host.as_str(), options.port))
         .await
@@ -180,6 +194,7 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/v1/pages/{id}", get(routes::get_page))
         .route("/v1/insights", get(routes::list_insights))
         .route("/v1/embed", post(routes::embed))
+        .route("/v1/embed/jobs", post(routes::embed_job))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             middleware::auth,

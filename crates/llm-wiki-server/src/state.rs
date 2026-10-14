@@ -26,7 +26,14 @@ pub struct Inner {
     /// `/v1/embed` and hybrid endpoints construct one from `[llm]` config.
     pub embedding: Option<Arc<dyn EmbeddingProvider>>,
     pub started_at: chrono::DateTime<chrono::Utc>,
+    /// The single build slot (one build at a time — the §31 pipeline is
+    /// serialized by design: concurrent builds over one workspace would race
+    /// the registry).
     pub jobs: JobManager,
+    /// The single EMBED slot (one backfill at a time; independent of the
+    /// build slot — embedding never publishes, and its LLM spend is bounded
+    /// by the shared `llm_permits` semaphore, not the build lock).
+    pub embed_jobs: JobManager,
     /// LLM semaphore for request-time endpoints (`/v1/query`): bounds
     /// concurrent synthesis independent of the build pipeline.
     pub llm_permits: Arc<tokio::sync::Semaphore>,
@@ -50,6 +57,7 @@ impl SharedState {
             embedding: None,
             started_at: chrono::Utc::now(),
             jobs: JobManager::new(),
+            embed_jobs: JobManager::new(),
             llm_permits: Arc::new(tokio::sync::Semaphore::new(permits)),
             rate_buckets: Mutex::new(std::collections::HashMap::new()),
         }))

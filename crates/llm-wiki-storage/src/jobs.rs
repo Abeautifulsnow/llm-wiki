@@ -35,7 +35,7 @@ pub const FAILURE_INTERNAL: &str = "internal_error";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerJobRecord {
     pub job_id: JobId,
-    /// `build` (the only v1 job kind).
+    /// `build` or `embed` (0014: non-build kinds arrived with EMBED jobs).
     pub kind: String,
     pub status: String,
     /// Live §31 stage phase (SCANNING..INDEXING) while RUNNING.
@@ -46,6 +46,9 @@ pub struct ServerJobRecord {
     pub error: Option<String>,
     pub request_id: Option<String>,
     pub idempotency_key: Option<String>,
+    /// Live counters for non-build jobs (embed: `{"total","covered_before",
+    /// "embedded"}`), written while RUNNING.
+    pub progress_json: Option<String>,
     pub created_at: String,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
@@ -70,6 +73,7 @@ fn row_to_record(row: &rusqlite::Row) -> Result<ServerJobRecord> {
         error: row.get("error").map_err(db)?,
         request_id: row.get("request_id").map_err(db)?,
         idempotency_key: row.get("idempotency_key").map_err(db)?,
+        progress_json: row.get("progress_json").map_err(db)?,
         created_at: row.get("created_at").map_err(db)?,
         started_at: row.get("started_at").map_err(db)?,
         finished_at: row.get("finished_at").map_err(db)?,
@@ -77,13 +81,13 @@ fn row_to_record(row: &rusqlite::Row) -> Result<ServerJobRecord> {
 }
 
 const RECORD_COLUMNS: &str = "job_id, kind, status, phase, build_id, failure_code, retryable, \
-     error, request_id, idempotency_key, created_at, started_at, finished_at";
+     error, request_id, idempotency_key, progress_json, created_at, started_at, finished_at";
 
 /// Inserts a QUEUED job row.
 pub fn insert_job(conn: &Connection, record: &ServerJobRecord) -> Result<()> {
     conn.execute(
         format!(
-            "INSERT INTO server_jobs ({RECORD_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+            "INSERT INTO server_jobs ({RECORD_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
         )
         .as_str(),
         params![
@@ -97,6 +101,7 @@ pub fn insert_job(conn: &Connection, record: &ServerJobRecord) -> Result<()> {
             record.error,
             record.request_id,
             record.idempotency_key,
+            record.progress_json,
             record.created_at,
             record.started_at,
             record.finished_at,
@@ -218,6 +223,17 @@ pub fn set_job_phase(conn: &Connection, job_id: &JobId, phase: &str) -> Result<(
     Ok(())
 }
 
+/// Mirrors live progress counters (non-build jobs) onto the job row. Same
+/// RUNNING-only guard as [`set_job_phase`].
+pub fn set_job_progress(conn: &Connection, job_id: &JobId, progress_json: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE server_jobs SET progress_json = ?2 WHERE job_id = ?1 AND status = 'RUNNING'",
+        params![job_id.as_str(), progress_json],
+    )
+    .map_err(db)?;
+    Ok(())
+}
+
 /// Links the job to the build row the pipeline created.
 pub fn attach_job_build(conn: &Connection, job_id: &JobId, build_id: &BuildId) -> Result<()> {
     conn.execute(
@@ -273,18 +289,19 @@ pub fn mark_stale_jobs_interrupted(conn: &Connection) -> Result<u64> {
     Ok(changed as u64)
 }
 
-/// Jobs eligible for auto-resume (PRD §31 "根据未来策略恢复"): build jobs
-/// interrupted by a server restart, oldest first. Callers gate this behind
-/// `server.resume_interrupted_jobs` — resuming spends LLM budget.
-pub fn list_resumable_jobs(conn: &Connection) -> Result<Vec<ServerJobRecord>> {
+/// Jobs eligible for auto-resume (PRD §31 "根据未来策略恢复"): jobs of
+/// `kind` interrupted by a server restart, oldest first. Callers gate this
+/// behind `server.resume_interrupted_jobs` / `server.resume_embed_jobs` —
+/// resuming spends LLM budget.
+pub fn list_resumable_jobs(conn: &Connection, kind: &str) -> Result<Vec<ServerJobRecord>> {
     let mut stmt = conn
         .prepare(&format!(
             "SELECT {RECORD_COLUMNS} FROM server_jobs \
-             WHERE status = 'INTERRUPTED' AND failure_code = ?1 AND retryable = 1 AND kind = 'build' \
+             WHERE status = 'INTERRUPTED' AND failure_code = ?1 AND retryable = 1 AND kind = ?2 \
              ORDER BY created_at ASC, job_id ASC"
         ))
         .map_err(db)?;
-    let mut rows = stmt.query(params![FAILURE_INTERRUPTED]).map_err(db)?;
+    let mut rows = stmt.query(params![FAILURE_INTERRUPTED, kind]).map_err(db)?;
     let mut records = Vec::new();
     while let Some(row) = rows.next().map_err(db)? {
         records.push(row_to_record(row)?);
@@ -328,6 +345,7 @@ mod tests {
             error: None,
             request_id: Some("req-1".into()),
             idempotency_key: key,
+            progress_json: None,
             created_at: "2026-01-01T00:00:00+00:00".into(),
             started_at: None,
             finished_at: None,
