@@ -270,9 +270,13 @@ pub async fn vector_candidates(
 /// generation — the cheap pre-check that keeps uncovered workspaces from
 /// spending a query embedding. One indexed existence probe per hash chunk,
 /// never a vector load (this runs on every hybrid retrieval).
+///
+/// Keys come from [`llm_wiki_storage::active_section_hashes`], not from
+/// materialized sections: reading every body just to hash it made this probe
+/// O(N) in section text (LW-001 baseline: ~1.2 s at 100k sections) for a
+/// question whose cost should be one index seek.
 pub fn embedding_coverage(conn: &rusqlite::Connection, model: &str) -> Result<bool> {
-    let sections = llm_wiki_search::active_context_sections(conn)?;
-    let hashes: Vec<String> = sections.iter().map(|s| s.text_hash.clone()).collect();
+    let hashes = llm_wiki_storage::active_section_hashes(conn)?;
     llm_wiki_storage::has_any_section_embedding(conn, model, &hashes)
 }
 
@@ -293,6 +297,11 @@ pub async fn embed_query_vector(
 /// The storage side of [`vector_candidates`] — synchronous and
 /// spawn_blocking-friendly: section hashes + stored embeddings + cosine over
 /// the ACTIVE generation's embedded sections (top-K, deterministic).
+///
+/// The hash key set comes from [`llm_wiki_storage::active_section_hashes`]
+/// (persisted at index build, migration 0015), so this scan reads vectors but
+/// never section text — the O(N) text term the LW-001 baseline measured is
+/// gone; what remains is the genuinely O(N·dim) cosine over loaded vectors.
 pub fn top_cosine_candidates(
     conn: &rusqlite::Connection,
     model: &str,
@@ -301,8 +310,7 @@ pub fn top_cosine_candidates(
     let Some(query_vector) = query_vector else {
         return Ok(Vec::new());
     };
-    let sections = llm_wiki_search::active_context_sections(conn)?;
-    let hashes: Vec<String> = sections.iter().map(|s| s.text_hash.clone()).collect();
+    let hashes = llm_wiki_storage::active_section_hashes(conn)?;
     let stored = llm_wiki_storage::section_embeddings_by_hash(conn, model, &hashes)?;
     if stored.is_empty() {
         tracing::warn!(
@@ -311,12 +319,12 @@ pub fn top_cosine_candidates(
         );
         return Ok(Vec::new());
     }
-    let mut scored: Vec<(f32, &str)> = sections
+    let mut scored: Vec<(f32, &str)> = hashes
         .iter()
-        .filter_map(|section| {
+        .filter_map(|text_hash| {
             stored
-                .get(&section.text_hash)
-                .map(|vector| (cosine(query_vector, vector), section.text_hash.as_str()))
+                .get(text_hash)
+                .map(|vector| (cosine(query_vector, vector), text_hash.as_str()))
         })
         .collect();
     scored.sort_by(|a, b| {

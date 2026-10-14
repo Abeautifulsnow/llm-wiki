@@ -76,7 +76,7 @@ pub use registry::{
     retire, NodeDraft, NodeKind, RegistryEntry,
 };
 pub use search_index::{
-    activate_build_with_search_index, clear_search_index, default_tokenizer,
+    activate_build_with_search_index, active_section_hashes, clear_search_index, default_tokenizer,
     ensure_search_index_matches_active, probe_fts5, rebuild_search_index, search_index,
     DefaultSearchTokenizer, SearchIndexRow, SearchIndexStats, SearchTokenizer, FTS5_UNAVAILABLE,
 };

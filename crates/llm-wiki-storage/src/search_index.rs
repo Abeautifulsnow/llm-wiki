@@ -2,8 +2,11 @@
 //!
 //! Storage model: `wiki_page_text` (migration 0008) holds one row per PAGE
 //! SECTION — `(page_id, build_id, slug, title, aliases_json,
-//! heading_path_json, body)` — and the `wiki_fts` FTS5 virtual table indexes
-//! `(title, headings, body, aliases)` with the `unicode61` tokenizer.
+//! heading_path_json, body, text_hash)` — and the `wiki_fts` FTS5 virtual
+//! table indexes `(title, headings, body, aliases)` with the `unicode61`
+//! tokenizer. `text_hash` (migration 0015) is the section's content-addressed
+//! identity, written here so the Vector layer can read its key set without
+//! materialising every body ([`active_section_hashes`]).
 //!
 //! CJK strategy (PRD §20 hard rule): the default Latin tokenizer is NEVER
 //! relied on for Chinese. The [`SearchTokenizer`] pre-tokenizes every field
@@ -26,6 +29,7 @@ use serde_json::json;
 
 use llm_wiki_core::error::{Result, WikiError};
 use llm_wiki_core::ids::{BuildId, WikiPageId};
+use llm_wiki_core::section_text::context_section_hash;
 use llm_wiki_markdown::parse_document;
 
 fn db(e: rusqlite::Error) -> WikiError {
@@ -167,6 +171,68 @@ pub fn fts_table_exists(conn: &Connection) -> Result<bool> {
     Ok(count > 0)
 }
 
+/// The ACTIVE generation's context-section hashes, WITHOUT materialising
+/// section text — the read path the Vector layer keys on (§19.3, LW-001).
+///
+/// `text_hash` is persisted by the index rebuild (migration 0015) using the
+/// very same [`context_section_hash`] that
+/// `llm_wiki_search::active_context_sections` computes, so the key set is
+/// identical and 32 bytes per section instead of a full body.
+///
+/// Rows indexed before 0015 carry a NULL hash; such a build falls back to
+/// deriving the hash from the stored text, which keeps an un-migrated
+/// workspace CORRECT (just back to the old O(N) text cost) until its next
+/// publish rewrites the rows.
+pub fn active_section_hashes(conn: &Connection) -> Result<Vec<String>> {
+    let Some(active) = crate::state::get_active_build_id(conn)? else {
+        return Err(WikiError::Index(
+            "nothing published; run build first".into(),
+        ));
+    };
+    // One probe decides the path: `COUNT(text_hash)` skips NULLs, so a zero
+    // difference means every row of this build carries a persisted hash.
+    let (rows, hashed): (i64, i64) = conn
+        .query_row(
+            "SELECT COUNT(*), COUNT(text_hash) FROM wiki_page_text WHERE build_id = ?1",
+            params![active.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(db)?;
+    if rows == hashed {
+        let mut stmt = conn
+            .prepare("SELECT text_hash FROM wiki_page_text WHERE build_id = ?1 ORDER BY text_id")
+            .map_err(|e| WikiError::Storage(format!("prepare section hashes: {e}")))?;
+        let rows = stmt
+            .query_map(params![active.as_str()], |row| row.get::<_, String>(0))
+            .map_err(|e| WikiError::Storage(format!("section hashes: {e}")))?;
+        return rows.map(|row| row.map_err(db)).collect();
+    }
+    // Legacy build (pre-0015 rows): derive from text, same order and same
+    // formula as `active_context_sections`.
+    let mut stmt = conn
+        .prepare(
+            "SELECT title, heading_path_json, body FROM wiki_page_text
+             WHERE build_id = ?1 ORDER BY page_id, text_id",
+        )
+        .map_err(|e| WikiError::Storage(format!("prepare legacy section hashes: {e}")))?;
+    let rows = stmt
+        .query_map(params![active.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| WikiError::Storage(format!("legacy section hashes: {e}")))?;
+    let mut hashes = Vec::new();
+    for row in rows {
+        let (title, heading_json, body) = row.map_err(db)?;
+        let heading_path: Vec<String> = serde_json::from_str(&heading_json).unwrap_or_default();
+        hashes.push(context_section_hash(&title, &heading_path, &body));
+    }
+    Ok(hashes)
+}
+
 // ---------------------------------------------------------------------------
 // Rebuild (runs inside the publish / recovery transaction)
 // ---------------------------------------------------------------------------
@@ -205,8 +271,8 @@ pub fn rebuild_search_index(
     // its content row without a separate `last_insert_rowid` round-trip).
     let mut insert_text = conn
         .prepare(
-            "INSERT INTO wiki_page_text (page_id, build_id, slug, title, aliases_json, heading_path_json, body)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO wiki_page_text (page_id, build_id, slug, title, aliases_json, heading_path_json, body, text_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )
         .map_err(|e| WikiError::Storage(format!("prepare text insert: {e}")))?;
     let mut insert_fts = conn
@@ -367,8 +433,8 @@ pub fn update_search_index(
 
     let mut insert_text = conn
         .prepare(
-            "INSERT INTO wiki_page_text (page_id, build_id, slug, title, aliases_json, heading_path_json, body)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO wiki_page_text (page_id, build_id, slug, title, aliases_json, heading_path_json, body, text_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )
         .map_err(|e| WikiError::Storage(format!("prepare text insert: {e}")))?;
     let mut insert_fts = conn
@@ -476,7 +542,8 @@ fn insert_section_row(
             title,
             json!(aliases).to_string(),
             json!(heading_path).to_string(),
-            body
+            body,
+            context_section_hash(title, heading_path, body)
         ])
         .map_err(db)?;
     fts_stmt
@@ -1174,5 +1241,106 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM wiki_page_text", [], |r| r.get(0))
             .unwrap();
         assert_eq!(rows, 0);
+    }
+
+    fn null_hashes(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM wiki_page_text WHERE text_hash IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// The persisted hash IS the section-text formula, every row, and
+    /// [`active_section_hashes`] lists exactly those keys.
+    fn assert_persisted_hashes_are_consistent(conn: &Connection) {
+        let mut stmt = conn
+            .prepare(
+                "SELECT text_hash, title, heading_path_json, body FROM wiki_page_text \
+                 ORDER BY text_id",
+            )
+            .unwrap();
+        let rows: Vec<(String, String, String, String)> = stmt
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert!(!rows.is_empty(), "fixture must index something");
+        for (hash, title, heading_json, body) in &rows {
+            let heading_path: Vec<String> = serde_json::from_str(heading_json).unwrap();
+            assert_eq!(
+                hash,
+                &context_section_hash(title, &heading_path, body),
+                "a stored key that drifts from the formula silently blinds the vector layer"
+            );
+        }
+        let listed = active_section_hashes(conn).unwrap();
+        let expected: Vec<String> = rows.into_iter().map(|(hash, ..)| hash).collect();
+        assert_eq!(listed, expected, "reader returns exactly the stored keys");
+    }
+
+    #[test]
+    fn persisted_section_hashes_cover_every_row_and_survive_a_carry() {
+        let mut conn = open_in_memory().unwrap();
+        let build = start_build(&mut conn, &BuildDraft::default()).unwrap();
+        let pages = vec![
+            page(
+                "streaming",
+                "Streaming Processing",
+                "# Streaming Processing\n\n## Checkpoints\n\n检查点默认每 30 秒持久化一次。\n\n## Windows\n\ntumbling windows close on fixed boundaries\n",
+            ),
+            page(
+                "sso",
+                "Identity & Access",
+                "# Identity & Access\n\n企业可以通过 SAML 或 OIDC 配置单点登录（SSO）。\n",
+            ),
+        ];
+        persist(&mut conn, &build, &pages);
+        _activate(&mut conn, &build, default_tokenizer()).unwrap();
+
+        assert_eq!(null_hashes(&conn), 0, "index build must write every hash");
+        assert_eq!(active_section_hashes(&conn).unwrap().len(), 4);
+        assert_persisted_hashes_are_consistent(&conn);
+
+        // Second generation carrying byte-identical pages: the incremental
+        // diff keeps those rows and only moves the build stamp, so the carried
+        // rows must keep their persisted hash — a NULL here would push every
+        // later query back onto the O(N) text fallback.
+        let next = start_build(&mut conn, &BuildDraft::default()).unwrap();
+        persist(&mut conn, &next, &pages);
+        _activate(&mut conn, &next, default_tokenizer()).unwrap();
+        assert_eq!(null_hashes(&conn), 0, "carried rows keep their hash");
+        assert_persisted_hashes_are_consistent(&conn);
+    }
+
+    #[test]
+    fn legacy_rows_without_a_persisted_hash_fall_back_to_hashing_text() {
+        let mut conn = open_in_memory().unwrap();
+        let build = start_build(&mut conn, &BuildDraft::default()).unwrap();
+        persist(
+            &mut conn,
+            &build,
+            &[page(
+                "streaming",
+                "Streaming Processing",
+                "# Streaming Processing\n\n## Checkpoints\n\n检查点默认每 30 秒持久化一次。\n",
+            )],
+        );
+        _activate(&mut conn, &build, default_tokenizer()).unwrap();
+        let mut fast = active_section_hashes(&conn).unwrap();
+        assert!(!fast.is_empty());
+
+        // A build indexed before migration 0015 carries NULL hashes.
+        conn.execute("UPDATE wiki_page_text SET text_hash = NULL", [])
+            .unwrap();
+        assert_eq!(null_hashes(&conn), fast.len() as i64);
+        let mut derived = active_section_hashes(&conn).unwrap();
+
+        derived.sort();
+        fast.sort();
+        assert_eq!(derived, fast, "the fallback derives the same keys");
     }
 }

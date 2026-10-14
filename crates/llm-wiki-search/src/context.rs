@@ -13,7 +13,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use llm_wiki_core::error::{Result, WikiError};
-use llm_wiki_core::hash::sha256_hex;
 use llm_wiki_core::ids::WikiPageId;
 use llm_wiki_core::plan::estimate_tokens;
 use llm_wiki_storage::{
@@ -25,18 +24,12 @@ use crate::fusion::{
     SourceRef, RRF_K,
 };
 
-/// The semantic text of one context section — the object the Vector layer
-/// embeds and hashes. ONE definition so the embed backfill, the hybrid query
-/// path and the candidate resolution can never drift.
-pub fn context_section_text(title: &str, heading_path: &[String], body: &str) -> String {
-    format!("{title}\n{}\n{body}", heading_path.join(" > "))
-}
-
-/// The content hash identifying a context section's text
-/// ([`context_section_text`], sha256).
-pub fn context_section_hash(title: &str, heading_path: &[String], body: &str) -> String {
-    sha256_hex(context_section_text(title, heading_path, body).as_bytes())
-}
+/// The semantic text of one context section and its identity hash — the ONE
+/// definition now lives in `llm-wiki-core` (§19.3): since migration 0015 the
+/// search-index WRITER persists the hash, and that writer sits in
+/// `llm-wiki-storage`, which cannot depend on this crate. Re-exported here so
+/// the embed backfill and the query path keep one import path.
+pub use llm_wiki_core::section_text::{context_section_hash, context_section_text};
 
 /// One section of the ACTIVE generation with its identity hash — the row
 /// set the Vector layer embeds and searches over.
