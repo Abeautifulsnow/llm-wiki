@@ -47,7 +47,8 @@ pub use decisions::{
     TRIGGER_PAGE_EMPTIED, TRIGGER_STRUCTURAL_CHANGE, TRIGGER_UNMAPPABLE_NODE,
 };
 pub use embeddings::{
-    has_any_section_embedding, insert_section_embeddings, section_embeddings_by_hash,
+    embeddings_revision, has_any_section_embedding, insert_section_embeddings,
+    section_embeddings_by_hash,
 };
 pub use graph::{
     ensure_graph_matches_active, graph_expand, graph_expand_from_page, page_node_id, rebuild_graph,

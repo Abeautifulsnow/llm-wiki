@@ -67,10 +67,6 @@ pub struct HybridContext<'a> {
     pub model: String,
 }
 
-/// Vector candidates taken per ask (top-K cosine over the embedded
-/// sections; the diversity budgets still apply downstream).
-const VECTOR_TOP_K: usize = 8;
-
 /// Runs one grounded ask. Returns `Ok(None)` when nothing is published.
 /// `write_back = false` verifies and prints without persisting (the dry
 /// mode). `hybrid` adds Vector-layer candidates (§19.3 RRF fusion) — without
@@ -295,71 +291,31 @@ pub async fn embed_query_vector(
 }
 
 /// The storage side of [`vector_candidates`] — synchronous and
-/// spawn_blocking-friendly: section hashes + stored embeddings + cosine over
-/// the ACTIVE generation's embedded sections (top-K, deterministic).
+/// spawn_blocking-friendly: one snapshot of the ACTIVE generation's embedded
+/// sections plus the top-K cosine (deterministic).
 ///
-/// The hash key set comes from [`llm_wiki_storage::active_section_hashes`]
-/// (persisted at index build, migration 0015), so this scan reads vectors but
-/// never section text — the O(N) text term the LW-001 baseline measured is
-/// gone; what remains is the genuinely O(N·dim) cosine over loaded vectors.
+/// The key set comes from the persisted section hashes (migration 0015), so
+/// this reads vectors but never section text. The server goes through
+/// [`crate::vector_cache::VectorSnapshotCache`] instead, which reuses the very
+/// same snapshot across queries; this entry point loads a fresh one.
 pub fn top_cosine_candidates(
     conn: &rusqlite::Connection,
     model: &str,
     query_vector: Option<&[f32]>,
 ) -> Result<Vec<llm_wiki_search::VectorCandidate>> {
+    // No query vector (a provider that returned none) is a no-op, not an
+    // empty-corpus load.
     let Some(query_vector) = query_vector else {
         return Ok(Vec::new());
     };
-    let hashes = llm_wiki_storage::active_section_hashes(conn)?;
-    let stored = llm_wiki_storage::section_embeddings_by_hash(conn, model, &hashes)?;
-    if stored.is_empty() {
+    let snapshot = crate::vector_cache::VectorSnapshot::load(conn, model)?;
+    if !snapshot.covered() {
         tracing::warn!(
             model,
             "no embeddings stored for this model; run `llm-wiki embed` for hybrid retrieval"
         );
-        return Ok(Vec::new());
     }
-    let mut scored: Vec<(f32, &str)> = hashes
-        .iter()
-        .filter_map(|text_hash| {
-            stored
-                .get(text_hash)
-                .map(|vector| (cosine(query_vector, vector), text_hash.as_str()))
-        })
-        .collect();
-    scored.sort_by(|a, b| {
-        b.0.partial_cmp(&a.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.1.cmp(b.1))
-    });
-    Ok(scored
-        .into_iter()
-        .take(VECTOR_TOP_K)
-        .map(|(score, text_hash)| llm_wiki_search::VectorCandidate {
-            text_hash: text_hash.to_owned(),
-            score,
-        })
-        .collect())
-}
-
-/// Cosine similarity (vectors of different length score 0 — different
-/// embedding dimensions never mix).
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() {
-        return 0.0;
-    }
-    let (mut dot, mut norm_a, mut norm_b) = (0.0f32, 0.0f32, 0.0f32);
-    for (x, y) in a.iter().zip(b.iter()) {
-        dot += x * y;
-        norm_a += x * x;
-        norm_b += y * y;
-    }
-    let denominator = norm_a.sqrt() * norm_b.sqrt();
-    if denominator == 0.0 {
-        0.0
-    } else {
-        dot / denominator
-    }
+    Ok(snapshot.top_candidates(Some(query_vector)))
 }
 
 fn context_payload(

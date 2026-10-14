@@ -55,6 +55,24 @@ pub fn insert_section_embeddings(
     Ok(())
 }
 
+/// A cheap, monotonic token that changes whenever a vector is ADDED: the
+/// highest rowid in `section_embeddings`. Readers of the whole vector layer
+/// (the server's snapshot cache) use it as a validity check, so they never
+/// serve a snapshot that predates a backfill.
+///
+/// O(log N) — a B-tree maximum on the implicit rowid index, not a scan.
+/// A re-embed of an EXISTING (text_hash, model) is an UPSERT that keeps its
+/// rowid, deliberately not bumping the token: the content-addressed contract
+/// says the same key holds the same vector, so there is nothing to invalidate.
+pub fn embeddings_revision(conn: &Connection) -> Result<i64> {
+    conn.query_row(
+        "SELECT COALESCE(MAX(rowid), 0) FROM section_embeddings",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(|e| WikiError::Storage(format!("embeddings revision: {e}")))
+}
+
 /// Loads the stored vectors for `model` keyed by text hash. Missing hashes
 /// are simply absent — coverage is the caller's question.
 ///
@@ -199,5 +217,30 @@ mod tests {
         let mut spaced: Vec<String> = (0..HASH_CHUNK).map(|i| format!("absent-{i:06}")).collect();
         spaced.push("hash-000599".into());
         assert!(has_any_section_embedding(&conn, "m", &spaced).unwrap());
+    }
+
+    /// The revision token must move on every ADD and stay put otherwise —
+    /// it is the only signal a cached vector snapshot has to trust.
+    #[test]
+    fn revision_moves_only_when_vectors_are_added() {
+        let mut conn = open_in_memory().unwrap();
+        let empty = embeddings_revision(&conn).unwrap();
+
+        insert_section_embeddings(&mut conn, "m", &[("hash-a".into(), vec![1.0, 0.0])]).unwrap();
+        let after_first = embeddings_revision(&conn).unwrap();
+        assert!(after_first > empty, "an insert must bump the revision");
+
+        insert_section_embeddings(&mut conn, "m", &[("hash-b".into(), vec![0.0, 1.0])]).unwrap();
+        let after_second = embeddings_revision(&conn).unwrap();
+        assert!(after_second > after_first);
+
+        // A re-embed of an existing key is an UPSERT: same key, same vector,
+        // nothing for a reader to invalidate.
+        insert_section_embeddings(&mut conn, "m", &[("hash-a".into(), vec![1.0, 0.0])]).unwrap();
+        assert_eq!(embeddings_revision(&conn).unwrap(), after_second);
+
+        // Reading changes nothing.
+        let _ = section_embeddings_by_hash(&conn, "m", &hashes(10)).unwrap();
+        assert_eq!(embeddings_revision(&conn).unwrap(), after_second);
     }
 }

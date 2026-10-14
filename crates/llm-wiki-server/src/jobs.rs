@@ -449,6 +449,7 @@ pub async fn recover_interrupted_embed_jobs(state: &SharedState) -> usize {
                 2,
             )
             .ok()
+            .map(|provider| provider.with_rate_limit(config.embedding.requests_per_minute))
             .map(|provider| Arc::new(provider) as Arc<dyn EmbeddingProvider>),
             _ => None,
         }

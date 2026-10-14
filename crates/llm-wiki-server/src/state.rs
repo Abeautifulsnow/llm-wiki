@@ -39,6 +39,11 @@ pub struct Inner {
     pub llm_permits: Arc<tokio::sync::Semaphore>,
     /// Remote-mode per-caller rate-limit buckets (PRD §30).
     pub rate_buckets: Mutex<std::collections::HashMap<String, RateBucket>>,
+    /// Query-side vector snapshot (LW-001): the active generation's vectors
+    /// for one model, loaded once and reused until the generation or the
+    /// embeddings change. Self-invalidating, so no writer has to notify it.
+    /// An `Arc` so the blocking-pool closures can carry it.
+    pub vector_cache: Arc<llm_wiki_compiler::VectorSnapshotCache>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -50,6 +55,7 @@ pub struct RateBucket {
 impl SharedState {
     pub fn new(workspace: PathBuf, config: Config, provider: Option<Arc<dyn LlmProvider>>) -> Self {
         let permits = config.llm.max_concurrency.max(1) as usize;
+        let snapshot_cap = config.embedding.snapshot_cache_sections;
         Self(Arc::new(Inner {
             workspace,
             config,
@@ -60,6 +66,7 @@ impl SharedState {
             embed_jobs: JobManager::new(),
             llm_permits: Arc::new(tokio::sync::Semaphore::new(permits)),
             rate_buckets: Mutex::new(std::collections::HashMap::new()),
+            vector_cache: Arc::new(llm_wiki_compiler::VectorSnapshotCache::new(snapshot_cap)),
         }))
     }
 

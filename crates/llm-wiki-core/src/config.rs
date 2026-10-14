@@ -139,6 +139,21 @@ pub struct EmbeddingConfig {
     /// with exponential backoff. 0 preserves the historical fail-fast.
     #[serde(default = "default_embed_max_retries")]
     pub max_retries: u32,
+    /// Outbound embedding requests per minute, coordinated across every
+    /// concurrent batch of one process (LW-002). 0 (the default) is unpaced:
+    /// the transport's 429 backoff still applies. Set this to the provider's
+    /// real quota to stop parallel batches from provoking 429s — the retry
+    /// backoff alone reacts AFTER a rate limit has already been hit.
+    #[serde(default = "default_embed_requests_per_minute")]
+    pub requests_per_minute: u32,
+    /// How many vectors the SERVER may keep resident for hybrid retrieval
+    /// (LW-001). The whole active generation's vectors for one model are
+    /// loaded once and reused across queries until the generation or the
+    /// embeddings change; this caps how large that snapshot may get before the
+    /// server serves it WITHOUT caching. 0 disables the cache. At dim=768 one
+    /// vector is ~3 KiB, so the 100_000 default is a ~300 MiB ceiling.
+    #[serde(default = "default_embed_snapshot_cache_sections")]
+    pub snapshot_cache_sections: usize,
 }
 
 /// Rerank-stage provider overrides (PRD §50 V0.5), used when
@@ -402,6 +417,14 @@ fn default_embed_batch_size() -> u32 {
 
 fn default_embed_max_retries() -> u32 {
     3
+}
+
+fn default_embed_requests_per_minute() -> u32 {
+    0
+}
+
+fn default_embed_snapshot_cache_sections() -> usize {
+    100_000
 }
 
 fn default_project_name() -> String {
@@ -899,6 +922,8 @@ max_rejected_claim_ratio = 0.10
                 max_concurrency: 2,
                 batch_size: 32,
                 max_retries: 1,
+                requests_per_minute: 300,
+                snapshot_cache_sections: 5_000,
             },
             rerank: RerankConfig {
                 base_url: "https://rerank.example.com/v1".into(),

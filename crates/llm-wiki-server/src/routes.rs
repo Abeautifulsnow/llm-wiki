@@ -729,19 +729,25 @@ fn requested_budget(over: Option<&ContextBudgetRequest>) -> llm_wiki_search::Con
 }
 
 /// The §19.3 vector candidates for one query, split by Send-ness: the
-/// coverage check and cosine scoring run on the blocking pool; the embed
-/// call is the only async piece, and an uncovered workspace never spends it.
+/// snapshot load and cosine scoring run on the blocking pool; the embed call
+/// is the only async piece, and an uncovered workspace never spends it.
+///
+/// The snapshot comes from the shared cache (LW-001), so the whole vector
+/// layer is read once per (generation, embeddings revision) rather than once
+/// per query — and the scoring needs no second connection.
 async fn vector_candidates_for(
     state: &SharedState,
     query: &str,
 ) -> Result<Vec<llm_wiki_search::VectorCandidate>, ApiError> {
     let (embedding_provider, model) = hybrid_context(state, None)?;
-    let model_for_coverage = model.clone();
-    let covered = db(state, move |conn| {
-        llm_wiki_compiler::embedding_coverage(conn, &model_for_coverage)
-    })
-    .await?;
-    if !covered {
+    let cache = state.0.vector_cache.clone();
+    let model_for_load = model.clone();
+    let snapshot = db(state, move |conn| cache.get_or_load(conn, &model_for_load)).await?;
+    if !snapshot.covered() {
+        tracing::warn!(
+            model = %model,
+            "no embeddings stored for this model; run an embed backfill for hybrid retrieval"
+        );
         return Ok(Vec::new());
     }
     let hybrid = llm_wiki_compiler::HybridContext {
@@ -751,10 +757,7 @@ async fn vector_candidates_for(
     let query_vector = llm_wiki_compiler::embed_query_vector(&hybrid, query)
         .await
         .map_err(ApiError::from)?;
-    db(state, move |conn| {
-        llm_wiki_compiler::top_cosine_candidates(conn, &model, query_vector.as_deref())
-    })
-    .await
+    Ok(snapshot.top_candidates(query_vector.as_deref()))
 }
 
 /// `POST /v1/context` (PRD §24/§30, the Agent-integration surface): the
@@ -1002,7 +1005,8 @@ fn hybrid_context(
                     "embedding provider init failed; check [embedding] config",
                     format!("embedding provider init failed: {e}"),
                 )
-            })?,
+            })?
+            .with_rate_limit(config.embedding.requests_per_minute),
         ),
         other => {
             return Err(ApiError::bad_request(format!(

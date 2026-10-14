@@ -6,8 +6,10 @@
 //! key is read from the env var *named* by the config; it never lives in
 //! project config.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use crate::rate_limit::RateLimiter;
 use crate::LlmError;
 
 pub(crate) struct HttpTransport {
@@ -15,6 +17,10 @@ pub(crate) struct HttpTransport {
     api_key: Option<String>,
     timeout: Duration,
     max_retries: u32,
+    /// Outbound pacing for this endpoint; `None` = unpaced (the default).
+    /// Shared by every request this transport makes, so concurrent batches
+    /// cannot add up past the configured budget.
+    rate_limiter: Option<Arc<RateLimiter>>,
     client: reqwest::Client,
 }
 
@@ -46,8 +52,16 @@ impl HttpTransport {
             api_key,
             timeout: Duration::from_secs(timeout_seconds),
             max_retries,
+            rate_limiter: None,
             client,
         })
+    }
+
+    /// Paces this endpoint's requests. Called with the config-derived limiter
+    /// (`[embedding] requests_per_minute`); `None` keeps the unpaced default.
+    pub fn with_rate_limit(mut self, rate_limiter: Option<Arc<RateLimiter>>) -> Self {
+        self.rate_limiter = rate_limiter;
+        self
     }
 
     /// POSTs `{base_url}/{path}` with bearer auth and bounded exponential
@@ -75,6 +89,11 @@ impl HttpTransport {
         let url = format!("{}/{path}", self.base_url);
         let mut attempt = 0u32;
         loop {
+            // Pacing comes BEFORE the request and before the retry backoff:
+            // a retry spends provider quota like any other call.
+            if let Some(rate_limiter) = &self.rate_limiter {
+                rate_limiter.acquire().await;
+            }
             let mut request = match body {
                 Some(body) => self.client.post(&url).json(body),
                 None => self.client.get(&url),

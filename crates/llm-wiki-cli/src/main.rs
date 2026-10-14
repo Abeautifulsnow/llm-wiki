@@ -281,6 +281,19 @@ timeout_seconds = 120
 # model = ""
 # timeout_seconds = 0
 
+# Outbound requests per minute, paced ACROSS concurrent batches so raising
+# max_concurrency cannot overshoot the provider's quota (LW-002). 0 = unpaced.
+# requests_per_minute = 0
+# max_concurrency = 1
+# batch_size = 16
+# max_retries = 3
+
+# Vectors the SERVER keeps resident for hybrid retrieval (LW-001): the active
+# generation's vectors for one model are loaded once and reused until the
+# generation or the embeddings change. 0 disables the cache. ~3 KiB per vector
+# at dim=768, so 100000 is a ~300 MiB ceiling.
+# snapshot_cache_sections = 100000
+
 # Used when [search] rerank = "cohere-compatible" (Cohere/Jina-style
 # POST {base_url}/rerank — vLLM, Jina, SiliconFlow, Voyage, …).
 [rerank]
@@ -772,7 +785,8 @@ fn build_embedding_provider(
                 endpoint.timeout_seconds,
                 2,
             )
-            .map_err(|e| WikiError::Llm(e.to_string()))?;
+            .map_err(|e| WikiError::Llm(e.to_string()))?
+            .with_rate_limit(config.embedding.requests_per_minute);
             Ok(Arc::new(provider))
         }
         other => Err(WikiError::Config(format!(
