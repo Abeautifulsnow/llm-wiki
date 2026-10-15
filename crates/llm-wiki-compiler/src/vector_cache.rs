@@ -154,12 +154,19 @@ impl VectorSnapshot {
                 snapshot.building.store(false, Ordering::SeqCst);
                 if let Some(index) = index {
                     let installed = Arc::new(index);
+                    // Two numbers, because they answer different questions:
+                    // the index alone is what ANN costs, the snapshot is what
+                    // the process now holds (the exact arena stays as the
+                    // fallback, so both are resident).
                     tracing::info!(
                         vectors = installed.len(),
-                        resident_mib = installed.resident_bytes() / (1024 * 1024),
+                        index_mib = installed.resident_bytes() / (1024 * 1024),
+                        snapshot_mib = (installed.resident_bytes()
+                            + snapshot.exact.resident_bytes())
+                            / (1024 * 1024),
                         elapsed_ms = started.elapsed().as_millis() as u64,
-                        "vector index ready (approximate); the exact arena is kept as the \
-                         fallback, so this doubles the snapshot's resident size"
+                        "vector index ready (approximate): the exact arena is kept as the \
+                         fallback, so the snapshot now costs the index AND the arena"
                     );
                     snapshot.install(installed);
                 }
@@ -228,6 +235,7 @@ impl VectorSnapshot {
     fn install(&self, index: Arc<AnnIndex>) {
         *self.ann.write().expect("ann lock") = Some(index);
     }
+
     /// Whether any vector exists for this model over the active generation —
     /// the coverage pre-check that keeps an uncovered workspace from spending
     /// a query embedding.

@@ -200,6 +200,11 @@ fn measure_persistence(
         })
         .0
     });
+    // The graph is ~1 KiB per vector (324 MiB at 100k), and this harness is run
+    // by hand across three sizes: leaving them behind adds ~440 MiB to the temp
+    // directory per run. The timings are all taken; the files are not needed.
+    drop(reloaded);
+    let _ = std::fs::remove_dir_all(&dir);
     Persistence {
         dump,
         reload,

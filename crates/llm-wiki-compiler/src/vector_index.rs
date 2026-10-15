@@ -688,4 +688,32 @@ mod tests {
         assert!(AnnIndex::load(&dir, "garbage").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// The case the point-count check exists for: a dump that still parses but
+    /// describes a different corpus than the graph holds (a truncated write, or
+    /// a sidecar from another revision). Loading it would index the wrong
+    /// sections under the right keys, so it must fail loudly instead.
+    #[test]
+    fn a_graph_whose_key_count_disagrees_with_its_meta_is_rejected() {
+        let dir = std::env::temp_dir().join("llm-wiki-ann-count-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let vectors = synthetic(300, 16, 0x5A5A);
+        let ann = AnnIndex::build(&ExactIndex::build(&vectors), 32).unwrap();
+        ann.dump(&dir, "ann-count").unwrap();
+        let orphaned = ann.len();
+
+        // Tamper with the sidecar only: the graph is untouched and the JSON
+        // stays valid, so nothing but the count check can catch this.
+        let sidecar = meta_path(&dir, "ann-count");
+        let mut meta: AnnMeta = serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+        meta.hashes.push("hash-that-was-never-inserted".to_owned());
+        std::fs::write(&sidecar, serde_json::to_vec(&meta).unwrap()).unwrap();
+
+        let err = AnnIndex::load(&dir, "ann-count").expect_err("the mismatch must be refused");
+        assert!(
+            err.contains(&orphaned.to_string()) && err.contains(&(orphaned + 1).to_string()),
+            "the error must name both counts, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
