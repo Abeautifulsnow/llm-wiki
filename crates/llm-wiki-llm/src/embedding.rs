@@ -39,6 +39,19 @@ impl OpenAiCompatibleEmbeddings {
             transport: HttpTransport::new(base_url, api_key_env, timeout_seconds, max_retries)?,
         })
     }
+
+    /// Paces outbound embedding requests to `requests_per_minute` (LW-002).
+    /// The limiter is shared by every batch this provider runs, so
+    /// `embedding.max_concurrency > 1` cannot exceed the budget. `0` keeps
+    /// the historical unpaced behavior.
+    pub fn with_rate_limit(mut self, requests_per_minute: u32) -> Self {
+        self.transport =
+            self.transport
+                .with_rate_limit(crate::RateLimiter::from_requests_per_minute(
+                    requests_per_minute,
+                ));
+        self
+    }
 }
 
 /// What a live embedding round trip actually proved, for `llm-wiki doctor`.
@@ -142,6 +155,88 @@ fn parse_embeddings_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serves `count` embeddings requests on a loopback port and returns it.
+    /// Pacing is asserted at the CLIENT (see `rate_limit_paces_outbound_requests`),
+    /// so the server only has to answer.
+    fn counting_embeddings_server(count: usize) -> u16 {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for _ in 0..count {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = vec![0u8; 65536];
+                let _ = stream.read(&mut buf).unwrap();
+                let body = r#"{"data":[{"index":0,"embedding":[0.1,0.2]}]}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        port
+    }
+
+    /// LW-002: `requests_per_minute` must pace the WIRE, not just set a field.
+    ///
+    /// Measured CLIENT-side, and deliberately far from the noise floor: at
+    /// 120/min the limiter must hold the second request back ~500ms, so a
+    /// two-call elapsed time well under 400ms could only mean the limiter is
+    /// not armed. Server-side arrival gaps are NOT asserted — the limiter
+    /// guarantees spacing between SENDS, and under parallel test load the
+    /// server thread's own scheduling jitter compresses that gap.
+    #[tokio::test]
+    async fn rate_limit_paces_outbound_requests() {
+        let port = counting_embeddings_server(2);
+        let provider = OpenAiCompatibleEmbeddings::new(
+            &format!("http://127.0.0.1:{port}"),
+            "UNUSED_VAR",
+            10,
+            0,
+        )
+        .unwrap()
+        .with_rate_limit(120);
+
+        let started = std::time::Instant::now();
+        provider.embed("m", &["a".to_owned()]).await.unwrap();
+        provider.embed("m", &["b".to_owned()]).await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= std::time::Duration::from_millis(400),
+            "two requests at 120/min must be paced ~500ms apart, took {elapsed:?}"
+        );
+    }
+
+    /// The default (0) and the offline history must stay UNPACED: a local or
+    /// low-volume endpoint may not pay a per-request delay it never asked for.
+    #[tokio::test]
+    async fn zero_rate_limit_leaves_requests_unpaced() {
+        let port = counting_embeddings_server(2);
+        let provider = OpenAiCompatibleEmbeddings::new(
+            &format!("http://127.0.0.1:{port}"),
+            "UNUSED_VAR",
+            10,
+            0,
+        )
+        .unwrap()
+        .with_rate_limit(0);
+
+        let started = std::time::Instant::now();
+        provider.embed("m", &["a".to_owned()]).await.unwrap();
+        provider.embed("m", &["b".to_owned()]).await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(400),
+            "unpaced requests must not be delayed (400ms would mean pacing), saw {elapsed:?}"
+        );
+    }
 
     #[tokio::test]
     async fn embeddings_batch_returns_vectors_in_input_order() {

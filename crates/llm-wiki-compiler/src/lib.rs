@@ -20,6 +20,8 @@ pub mod prompt;
 pub mod publish;
 pub mod replan;
 pub mod semantic_lint;
+pub mod vector_cache;
+pub mod vector_index;
 
 pub use analysis::{
     AnalysisOutcome, AnalysisSection, AnalyzedDocument, DocumentAnalyzer, VerifiedRelation,
@@ -38,7 +40,7 @@ pub use changeset::{
     ScannedSource,
 };
 pub use compile::{CompiledGeneration, CompilerConfig, WikiCompiler};
-pub use embed::{run_embed, EmbedReport};
+pub use embed::{run_embed, EmbedOptions, EmbedProgress, EmbedProgressSink, EmbedReport};
 pub use incremental::{map_incremental_change, MappingDecision, MappingInput};
 pub use lint::{run_lint, LintCheck, LintFinding, LintReport, LintSeverity};
 pub use persist::{persist_outcome, PersistOptions};
@@ -52,3 +54,5 @@ pub use publish::{
 };
 pub use replan::{plan_diff, replan, PlanDiff, ReplanReport};
 pub use semantic_lint::{run_semantic_lint, SemanticFinding, SemanticFindingKind, SemanticReport};
+pub use vector_cache::{SnapshotLoad, VectorSnapshot, VectorSnapshotCache};
+pub use vector_index::{AnnIndex, AnnMode, ExactIndex, VectorIndex, VectorIndexConfig};

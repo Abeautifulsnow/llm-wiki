@@ -26,12 +26,24 @@ pub struct Inner {
     /// `/v1/embed` and hybrid endpoints construct one from `[llm]` config.
     pub embedding: Option<Arc<dyn EmbeddingProvider>>,
     pub started_at: chrono::DateTime<chrono::Utc>,
+    /// The single build slot (one build at a time — the §31 pipeline is
+    /// serialized by design: concurrent builds over one workspace would race
+    /// the registry).
     pub jobs: JobManager,
+    /// The single EMBED slot (one backfill at a time; independent of the
+    /// build slot — embedding never publishes, and its LLM spend is bounded
+    /// by the shared `llm_permits` semaphore, not the build lock).
+    pub embed_jobs: JobManager,
     /// LLM semaphore for request-time endpoints (`/v1/query`): bounds
     /// concurrent synthesis independent of the build pipeline.
     pub llm_permits: Arc<tokio::sync::Semaphore>,
     /// Remote-mode per-caller rate-limit buckets (PRD §30).
     pub rate_buckets: Mutex<std::collections::HashMap<String, RateBucket>>,
+    /// Query-side vector snapshot (LW-001): the active generation's vectors
+    /// for one model, loaded once and reused until the generation or the
+    /// embeddings change. Self-invalidating, so no writer has to notify it.
+    /// An `Arc` so the blocking-pool closures can carry it.
+    pub vector_cache: Arc<llm_wiki_compiler::VectorSnapshotCache>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -43,6 +55,13 @@ pub struct RateBucket {
 impl SharedState {
     pub fn new(workspace: PathBuf, config: Config, provider: Option<Arc<dyn LlmProvider>>) -> Self {
         let permits = config.llm.max_concurrency.max(1) as usize;
+        let snapshot_cap = config.embedding.snapshot_cache_sections;
+        let index_config = llm_wiki_compiler::VectorIndexConfig {
+            ann: config.embedding.ann,
+            min_sections: config.embedding.ann_min_sections,
+            ef_search: config.embedding.ann_ef_search,
+        };
+        let index_dir = vector_index_dir(&workspace);
         Self(Arc::new(Inner {
             workspace,
             config,
@@ -50,8 +69,14 @@ impl SharedState {
             embedding: None,
             started_at: chrono::Utc::now(),
             jobs: JobManager::new(),
+            embed_jobs: JobManager::new(),
             llm_permits: Arc::new(tokio::sync::Semaphore::new(permits)),
             rate_buckets: Mutex::new(std::collections::HashMap::new()),
+            vector_cache: Arc::new(llm_wiki_compiler::VectorSnapshotCache::new(
+                snapshot_cap,
+                index_config,
+                Some(index_dir),
+            )),
         }))
     }
 
@@ -73,6 +98,13 @@ impl SharedState {
 
 pub fn state_db(workspace: &Path) -> PathBuf {
     workspace.join(".llm-wiki").join("state.db")
+}
+
+/// Where the query-side ANN graph is cached. Keyed by the identity of the
+/// vectors it was built from (see `VectorSnapshotCache`), so generations
+/// coexist and a superseded graph is simply never looked up again.
+pub fn vector_index_dir(workspace: &Path) -> PathBuf {
+    workspace.join(".llm-wiki").join("ann")
 }
 
 /// The single build slot. `start` fails while another job holds it; `take`

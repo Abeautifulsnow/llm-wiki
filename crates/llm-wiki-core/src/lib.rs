@@ -10,6 +10,7 @@ pub mod ids;
 pub mod matcher;
 pub mod model;
 pub mod plan;
+pub mod section_text;
 
 pub use cancel::CancelFlag;
 

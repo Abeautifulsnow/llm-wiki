@@ -100,11 +100,30 @@ pub struct EndpointConfig {
     pub timeout_seconds: u64,
 }
 
+/// Which search path the vector layer uses (PRD §49's local index).
+///
+/// `Auto` is the shipped default: the index is produced off the query path (a
+/// detached thread, persisted per embeddings revision), so above the measured
+/// crossover it is pure gain, and below it `ann_min_sections` keeps the exact
+/// scan. The measured cost is in the BUILD, not the query — see
+/// [`EmbeddingConfig::ann`] for the numbers at 1k/10k/100k sections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AnnMode {
+    /// Always the exact scan.
+    Off,
+    /// Exact below `ann_min_sections`, approximate above it.
+    #[default]
+    Auto,
+    /// Approximate whenever the corpus is non-empty.
+    On,
+}
+
 /// Vector-layer provider overrides (§19.3). Every field left empty/0
 /// INHERITS the corresponding `[llm]` value: embedding may point at a
 /// different provider (different base_url / key / model) by filling in only
 /// what differs.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingConfig {
     /// Endpoint family. Empty inherits `llm.provider`; currently only
     /// `"openai-compatible"` is supported.
@@ -124,6 +143,83 @@ pub struct EmbeddingConfig {
     /// 0 inherits `llm.timeout_seconds`.
     #[serde(default)]
     pub timeout_seconds: u64,
+    /// Cap on in-flight embedding requests during `llm-wiki embed` /
+    /// `/v1/embed` backfills. 1 (the default) is the historical serial
+    /// behavior — a safe default for low-quota providers. The HTTP server
+    /// accounts in-flight batches against its shared LLM semaphore; this
+    /// caps the CLI/local fallback.
+    ///
+    /// Measured (LW-002 harness, 2000 sections, batch 8, 20 ms provider
+    /// latency, release): 251 requests take 7.82 s at 1, 1.98 s at 4 (3.94×)
+    /// and 1.03 s at 8 (7.62×), with the request count unchanged — parallel
+    /// batches do not cost extra provider spend. Above ~8 the single-writer
+    /// store and the provider's own quota are what limit the gain, so pair a
+    /// raise with `requests_per_minute` when the provider meters requests.
+    #[serde(default = "default_embed_max_concurrency")]
+    pub max_concurrency: u32,
+    /// Sections per embedding request; CLI `--batch` and the HTTP request
+    /// body override it.
+    #[serde(default = "default_embed_batch_size")]
+    pub batch_size: u32,
+    /// Retries per batch for transient provider failures (429/5xx/timeout)
+    /// with exponential backoff. 0 preserves the historical fail-fast.
+    #[serde(default = "default_embed_max_retries")]
+    pub max_retries: u32,
+    /// Outbound embedding requests per minute, coordinated across every
+    /// concurrent batch of one process (LW-002). 0 (the default) is unpaced:
+    /// the transport's 429 backoff still applies. Set this to the provider's
+    /// real quota to stop parallel batches from provoking 429s — the retry
+    /// backoff alone reacts AFTER a rate limit has already been hit.
+    #[serde(default = "default_embed_requests_per_minute")]
+    pub requests_per_minute: u32,
+    /// How many vectors the SERVER may keep resident for hybrid retrieval
+    /// (LW-001). The whole active generation's vectors for one model are
+    /// loaded once and reused across queries until the generation or the
+    /// embeddings change; this caps how large that snapshot may get before the
+    /// server serves it WITHOUT caching. 0 disables the cache (and with it the
+    /// ANN, which is only worth producing for a snapshot that will be kept).
+    /// At dim=768 one vector is ~3 KiB, so the 100_000 default is a ~300 MiB
+    /// ceiling — roughly doubled when an ANN is built over it, since the exact
+    /// arena is kept as the fallback.
+    #[serde(default = "default_embed_snapshot_cache_sections")]
+    pub snapshot_cache_sections: usize,
+    /// Nearest-neighbour search path (LW-001 中期 / PR-5). `off` always scans
+    /// exactly; `auto` (the default) keeps the exact scan below
+    /// `ann_min_sections` and builds an HNSW index above it; `on` always
+    /// builds one.
+    ///
+    /// The index never sits on the query path: a detached thread adopts the
+    /// graph persisted for this (generation, model, embeddings revision), or
+    /// builds and dumps it, while queries keep being served exactly. Every
+    /// failure degrades to the exact scan, so this trades recall, CPU and
+    /// memory for query latency, never correctness.
+    ///
+    /// Measured (LW-001 harness, 768-dim, 20 reps, release) — ANN versus the
+    /// shipped exact scan over the same vectors:
+    ///
+    /// | sections | exact p50 | ANN p50 | ANN build | ANN reload | recall@8 |
+    /// |----------|-----------|---------|-----------|------------|----------|
+    /// | 1k       | 0.4 ms    | 0.8 ms  | 0.1 s     | 8 ms       | 1.000    |
+    /// | 10k      | 4.3 ms    | 4.7 ms  | 4.3 s     | 106 ms     | 1.000    |
+    /// | 100k     | 68.7 ms   | 12.4 ms | 292 s     | 3.1 s      | 0.944    |
+    ///
+    /// So the index only pays above ~50k sections — hence
+    /// `ann_min_sections = 50_000`. Above that it costs one background build
+    /// per revision (all cores), ~3 s to reload after a restart, and roughly
+    /// doubles the snapshot's resident memory (the exact arena is kept as the
+    /// fallback). Set `off` to refuse all of that.
+    #[serde(default)]
+    pub ann: AnnMode,
+    /// `ann = "auto"` builds the index from this many stored vectors up.
+    /// Below it the exact scan is both faster and exact (measured: the ANN
+    /// only wins above ~50k; it is still slower at 10k).
+    #[serde(default = "default_embed_ann_min_sections")]
+    pub ann_min_sections: usize,
+    /// ANN search breadth: higher finds more of the true neighbours and costs
+    /// more per query. The dial for the recall/latency trade-off — the
+    /// measured recall above is what 128 buys at 100k.
+    #[serde(default = "default_embed_ann_ef_search")]
+    pub ann_ef_search: usize,
 }
 
 /// Rerank-stage provider overrides (PRD §50 V0.5), used when
@@ -155,6 +251,34 @@ impl LlmConfig {
             base_url: self.base_url.clone(),
             api_key_env: self.api_key_env.clone(),
             timeout_seconds: self.timeout_seconds,
+        }
+    }
+}
+
+impl Default for EmbeddingConfig {
+    ///
+    /// A derived `Default` would zero every numeric knob, and that is the
+    /// value a workspace gets whenever there is no `[embedding]` section at
+    /// all — `Config::default()`, a missing `config.toml`, or a config file
+    /// that simply never mentions `[embedding]`. In that case the documented
+    /// defaults (concurrency 1, batch 16, retries 3, snapshot cache 100_000)
+    /// were silently replaced by 0: no retries, batch 0, and the server's
+    /// vector snapshot cache switched off while the docs promised it was on.
+    fn default() -> Self {
+        Self {
+            provider: String::new(),
+            base_url: String::new(),
+            api_key_env: String::new(),
+            model: String::new(),
+            timeout_seconds: 0,
+            max_concurrency: default_embed_max_concurrency(),
+            batch_size: default_embed_batch_size(),
+            max_retries: default_embed_max_retries(),
+            requests_per_minute: default_embed_requests_per_minute(),
+            snapshot_cache_sections: default_embed_snapshot_cache_sections(),
+            ann: AnnMode::default(),
+            ann_min_sections: default_embed_ann_min_sections(),
+            ann_ef_search: default_embed_ann_ef_search(),
         }
     }
 }
@@ -359,6 +483,12 @@ pub struct ServerConfig {
     /// budget on restart, which must never come as a surprise.
     #[serde(default)]
     pub resume_interrupted_jobs: bool,
+    /// Re-enqueue EMBED jobs interrupted by a server restart. A separate
+    /// switch (embedding spend is often larger than a build's): off by
+    /// default, and it additionally requires `[embedding] model` to be set —
+    /// a resumed backfill must target the same model as before.
+    #[serde(default)]
+    pub resume_embed_jobs: bool,
 }
 
 fn default_max_queued_jobs() -> u32 {
@@ -369,6 +499,34 @@ fn default_max_body_bytes() -> u32 {
 }
 fn default_rate_limit_per_minute() -> u32 {
     120
+}
+
+fn default_embed_max_concurrency() -> u32 {
+    1
+}
+
+fn default_embed_batch_size() -> u32 {
+    16
+}
+
+fn default_embed_max_retries() -> u32 {
+    3
+}
+
+fn default_embed_requests_per_minute() -> u32 {
+    0
+}
+
+fn default_embed_snapshot_cache_sections() -> usize {
+    100_000
+}
+
+fn default_embed_ann_min_sections() -> usize {
+    50_000
+}
+
+fn default_embed_ann_ef_search() -> usize {
+    128
 }
 
 fn default_project_name() -> String {
@@ -542,6 +700,7 @@ impl Default for ServerConfig {
             max_body_bytes: default_max_body_bytes(),
             rate_limit_per_minute: default_rate_limit_per_minute(),
             resume_interrupted_jobs: false,
+            resume_embed_jobs: false,
         }
     }
 }
@@ -634,7 +793,7 @@ impl Config {
     /// construction: config only stores env-var names (PRD §32).
     pub fn effective_summary(&self) -> String {
         format!(
-            "project.name = {}\nproject.wiki_dir = {}\nsource.root = {}\nsource.include = {:?}\nsource.exclude = {:?}\nllm.provider = {}\nllm.base_url = {}\nllm.model = {}\nllm.api_key_env = <env name: redacted>\nllm.max_concurrency = {}\nembedding.provider = {}\nembedding.base_url = {}\nembedding.model = {}\nembedding.api_key_env = <env name: redacted>\nsearch.rerank = {}\nsearch.source_mode = {}\nrerank.base_url = {}\nrerank.model = {}\nrerank.api_key_env = <env name: redacted>\nanalysis.max_input_tokens = {}\nanalysis.max_plan_input_tokens = {}\nanalysis.max_rejected_claim_ratio = {}\nplanning.hierarchical = {}\nplanning.max_cluster_nodes = {}\nplanning.reconcile_rounds = {}\nbuild.incremental = {}\nbuild.keep_generations = {}\nserver.bind = {}\nserver.remote_enabled = {}",
+            "project.name = {}\nproject.wiki_dir = {}\nsource.root = {}\nsource.include = {:?}\nsource.exclude = {:?}\nllm.provider = {}\nllm.base_url = {}\nllm.model = {}\nllm.api_key_env = <env name: redacted>\nllm.max_concurrency = {}\nembedding.provider = {}\nembedding.base_url = {}\nembedding.model = {}\nembedding.max_concurrency = {}\nembedding.api_key_env = <env name: redacted>\nsearch.rerank = {}\nsearch.source_mode = {}\nrerank.base_url = {}\nrerank.model = {}\nrerank.api_key_env = <env name: redacted>\nanalysis.max_input_tokens = {}\nanalysis.max_plan_input_tokens = {}\nanalysis.max_rejected_claim_ratio = {}\nplanning.hierarchical = {}\nplanning.max_cluster_nodes = {}\nplanning.reconcile_rounds = {}\nbuild.incremental = {}\nbuild.keep_generations = {}\nserver.bind = {}\nserver.remote_enabled = {}",
             self.project.name,
             self.project.wiki_dir.display(),
             self.source.root.display(),
@@ -647,6 +806,7 @@ impl Config {
             self.embedding.resolved_provider(&self.llm),
             if self.embedding.base_url.is_empty() { &self.llm.base_url } else { &self.embedding.base_url },
             if self.embedding.model.is_empty() { "<unset>" } else { &self.embedding.model },
+            self.embedding.max_concurrency,
             self.search.rerank,
             self.search.source_mode,
             if self.rerank.base_url.is_empty() { &self.llm.base_url } else { &self.rerank.base_url },
@@ -747,6 +907,57 @@ mod tests {
         let cfg = Config::parse_toml("[planning]\nreconcile_rounds = 2\n").unwrap();
         assert_eq!(cfg.planning.reconcile_rounds, 2);
         assert_eq!(cfg.planning.effective_reconcile_rounds(), 2);
+    }
+
+    /// The two scale-up knobs must be settable from a real config file AND
+    /// keep their back-compatible defaults when the section is silent.
+    #[test]
+    fn embedding_pacing_and_snapshot_cache_parse_from_toml() {
+        let silent = Config::parse_toml("[embedding]\nmodel = \"m\"\n").unwrap();
+        assert_eq!(
+            silent.embedding.requests_per_minute, 0,
+            "unpaced by default"
+        );
+        assert_eq!(silent.embedding.snapshot_cache_sections, 100_000);
+
+        let tuned = Config::parse_toml(
+            "[embedding]\nrequests_per_minute = 60\nsnapshot_cache_sections = 0\n",
+        )
+        .unwrap();
+        assert_eq!(tuned.embedding.requests_per_minute, 60);
+        assert_eq!(
+            tuned.embedding.snapshot_cache_sections, 0,
+            "0 disables the cache"
+        );
+
+        let defaults = Config::default();
+        assert_eq!(defaults.embedding.requests_per_minute, 0);
+        assert_eq!(defaults.embedding.snapshot_cache_sections, 100_000);
+
+        // The case that used to lose every knob: no `[embedding]` section at
+        // all. `Config::default()` (missing config.toml) and a parsed file
+        // that never mentions [embedding] must agree with the documented
+        // defaults, not with a zeroed struct.
+        let no_section = Config::parse_toml("[project]\nname = \"x\"\n").unwrap();
+        assert_eq!(no_section.embedding.snapshot_cache_sections, 100_000);
+        assert_eq!(no_section.embedding.max_concurrency, 1);
+        assert_eq!(no_section.embedding.batch_size, 16);
+        assert_eq!(no_section.embedding.max_retries, 3);
+        assert_eq!(
+            no_section.embedding.ann,
+            AnnMode::Auto,
+            "auto is the shipped search path"
+        );
+        assert_eq!(
+            no_section.embedding.ann_min_sections, 50_000,
+            "the measured crossover between the exact scan and HNSW"
+        );
+        assert_eq!(no_section.embedding.ann_ef_search, 128);
+        assert_eq!(
+            no_section.embedding.snapshot_cache_sections,
+            defaults.embedding.snapshot_cache_sections,
+            "derived Default and serde defaults must not diverge"
+        );
     }
 
     #[test]
@@ -861,6 +1072,14 @@ max_rejected_claim_ratio = 0.10
                 api_key_env: "EMBED_KEY".into(),
                 model: "bge-m3".into(),
                 timeout_seconds: 30,
+                max_concurrency: 2,
+                batch_size: 32,
+                max_retries: 1,
+                requests_per_minute: 300,
+                snapshot_cache_sections: 5_000,
+                ann: AnnMode::Off,
+                ann_min_sections: 1_000,
+                ann_ef_search: 64,
             },
             rerank: RerankConfig {
                 base_url: "https://rerank.example.com/v1".into(),

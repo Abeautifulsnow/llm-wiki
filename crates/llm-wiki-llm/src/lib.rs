@@ -8,6 +8,7 @@
 
 pub mod fake;
 pub mod openai;
+pub mod rate_limit;
 pub mod rerank;
 pub mod structured;
 
@@ -15,6 +16,7 @@ mod transport;
 
 pub use fake::FakeLlmProvider;
 pub use openai::{ChatProbeOutcome, OpenAiCompatibleProvider};
+pub use rate_limit::RateLimiter;
 
 pub mod embedding;
 

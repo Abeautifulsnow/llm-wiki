@@ -21,6 +21,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 unicode-normalization = { workspace = true }
 tokio = { workspace = true }
+hnsw_rs = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }

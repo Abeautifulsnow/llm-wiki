@@ -119,6 +119,10 @@ enum Command {
         /// Sections per embedding request.
         #[arg(long, default_value_t = 16)]
         batch: usize,
+        /// In-flight embedding requests (falls back to
+        /// `[embedding] max_concurrency`; 1 = serial).
+        #[arg(long)]
+        concurrency: Option<usize>,
     },
     /// Lint the currently published generation (PRD §36): citation integrity,
     /// links, orphans, unsupported sections, duplicates, hand edits.
@@ -190,7 +194,11 @@ fn run(command: Command, json: bool) -> Result<(), WikiError> {
             embedding_model,
             json,
         ),
-        Command::Embed { model, batch } => embed(&workspace, model.as_deref(), batch, json),
+        Command::Embed {
+            model,
+            batch,
+            concurrency,
+        } => embed(&workspace, model.as_deref(), batch, concurrency, json),
         Command::Lint { semantic } => lint(&workspace, semantic, json),
         Command::Serve { host, port } => serve(&workspace, host, port, json),
     }
@@ -273,6 +281,40 @@ timeout_seconds = 120
 # model = ""
 # timeout_seconds = 0
 
+# Outbound requests per minute, paced ACROSS concurrent batches so raising
+# max_concurrency cannot overshoot the provider's quota (LW-002). 0 = unpaced.
+# requests_per_minute = 0
+# Batches in flight per backfill (LW-002). 1 = serial, the historical default.
+# Measured (2000 sections, batch 8, 20ms provider latency): 251 requests take
+# 7.82s at 1, 1.98s at 4, 1.03s at 8 — same request count, no extra spend.
+# max_concurrency = 1
+# batch_size = 16
+# max_retries = 3
+
+# Vectors the SERVER keeps resident for hybrid retrieval (LW-001): the active
+# generation's vectors for one model are loaded once and reused until the
+# generation or the embeddings change. 0 disables the cache. ~3 KiB per vector
+# at dim=768, so 100000 is a ~300 MiB ceiling.
+# snapshot_cache_sections = 100000
+
+# Nearest-neighbour search path (LW-001 中期 / PR-5): "off" always scans
+# exactly, "auto" (default) keeps the exact scan below ann_min_sections and
+# builds an HNSW index above it, "on" always builds one. The index is produced
+# OFF the query path — a background thread adopts the graph persisted for this
+# generation/model/revision or builds and dumps it — and any failure falls back
+# to the exact scan, so this trades recall, CPU and memory for query latency,
+# never correctness. Measured (768-dim, 20 reps, release):
+#   1k:   exact 0.4ms → ann 0.8ms,  build 0.1s,  reload 8ms,   recall@8 1.000
+#   10k:  exact 4.3ms → ann 4.7ms,  build 4.3s,  reload 106ms, recall@8 1.000
+#   100k: exact 68.7ms → ann 12.4ms, build 292s, reload 3.1s,  recall@8 0.944
+# The index only pays above ~50k sections, which is what ann_min_sections
+# encodes. Above that it costs one all-core background build per revision and
+# roughly doubles the snapshot's memory (the exact arena is kept as the
+# fallback). Set "off" to refuse all of that.
+# ann = "auto"
+# ann_min_sections = 50000
+# ann_ef_search = 128
+
 # Used when [search] rerank = "cohere-compatible" (Cohere/Jina-style
 # POST {base_url}/rerank — vLLM, Jina, SiliconFlow, Voyage, …).
 [rerank]
@@ -318,6 +360,9 @@ rate_limit_per_minute = 120
 # Re-run build jobs interrupted by a server restart (spends LLM budget on
 # restart — enable deliberately).
 resume_interrupted_jobs = false
+# Re-run EMBED jobs interrupted by a server restart (a separate switch:
+# embedding spend is often larger; additionally requires [embedding] model).
+resume_embed_jobs = false
 "#
         .to_owned(),
     )
@@ -761,7 +806,8 @@ fn build_embedding_provider(
                 endpoint.timeout_seconds,
                 2,
             )
-            .map_err(|e| WikiError::Llm(e.to_string()))?;
+            .map_err(|e| WikiError::Llm(e.to_string()))?
+            .with_rate_limit(config.embedding.requests_per_minute);
             Ok(Arc::new(provider))
         }
         other => Err(WikiError::Config(format!(
@@ -836,8 +882,15 @@ fn ask(
     Ok(())
 }
 
-/// `llm-wiki embed` (§19.3): incremental embedding backfill.
-fn embed(workspace: &Path, model: Option<&str>, batch: usize, json: bool) -> Result<(), WikiError> {
+/// `llm-wiki embed` (§19.3): incremental embedding backfill, with bounded
+/// in-flight batches (`--concurrency` → `[embedding] max_concurrency`).
+fn embed(
+    workspace: &Path,
+    model: Option<&str>,
+    batch: usize,
+    concurrency: Option<usize>,
+    json: bool,
+) -> Result<(), WikiError> {
     let config = load_config(workspace)?;
     let model = embedding_model(model, &config)?;
     let embedding_provider = build_embedding_provider(&config)?;
@@ -845,12 +898,20 @@ fn embed(workspace: &Path, model: Option<&str>, batch: usize, json: bool) -> Res
         .enable_all()
         .build()
         .map_err(|e| WikiError::Llm(format!("cannot start async runtime: {e}")))?;
+    let options = llm_wiki_compiler::EmbedOptions {
+        batch_size: batch,
+        max_concurrency: concurrency
+            .unwrap_or(config.embedding.max_concurrency.max(1) as usize)
+            .max(1),
+        max_retries: config.embedding.max_retries,
+        ..llm_wiki_compiler::EmbedOptions::serial(batch)
+    };
     let Some(report) = runtime.block_on(llm_wiki_compiler::run_embed(
         workspace,
         &config,
         embedding_provider,
         &model,
-        batch,
+        options,
     ))?
     else {
         if json {
@@ -865,8 +926,20 @@ fn embed(workspace: &Path, model: Option<&str>, batch: usize, json: bool) -> Res
         return Ok(());
     }
     println!(
-        "embeddings [{}]: {} section(s), {} already covered, {} embedded",
-        report.model, report.total_sections, report.covered_before, report.embedded
+        "embeddings [{}]: {} section(s), {} already covered, {} embedded{}",
+        report.model,
+        report.total_sections,
+        report.covered_before,
+        report.embedded,
+        if report.retries > 0 {
+            format!(
+                " ({} retr{} after transient failures)",
+                report.retries,
+                if report.retries == 1 { "y" } else { "ies" }
+            )
+        } else {
+            String::new()
+        }
     );
     Ok(())
 }

@@ -30,10 +30,10 @@ use llm_wiki_storage::{
 };
 
 use crate::error::ApiError;
-use crate::jobs::spawn_build_job;
+use crate::jobs::{spawn_build_job, spawn_embed_job};
 use crate::middleware::RequestId;
 use crate::rerank::api_reranker_from_config;
-use crate::state::{ActiveJob, SharedState};
+use crate::state::{ActiveJob, JobManager, SharedState};
 use crate::PROTOCOL_VERSION;
 
 // ---------------------------------------------------------------------------
@@ -49,19 +49,24 @@ fn parse_body<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, ApiErro
 }
 
 /// Blocks on a SQLite closure; storage errors map to 500.
+///
+/// The `WikiError → ApiError` conversion happens HERE, in the request scope —
+/// not inside the blocking closure: the `REQUEST_ID` task-local does not
+/// cross `spawn_blocking`, and scrubbed errors must log their detail with the
+/// request id.
 async fn db<F, T>(state: &SharedState, f: F) -> Result<T, ApiError>
 where
     F: FnOnce(&llm_wiki_storage::Connection) -> llm_wiki_core::error::Result<T> + Send + 'static,
     T: Send + 'static,
 {
     let path = state.db_path();
-    let output = tokio::task::spawn_blocking(move || -> Result<T, ApiError> {
-        let conn = open(&path).map_err(ApiError::from)?;
-        f(&conn).map_err(ApiError::from)
+    let output = tokio::task::spawn_blocking(move || -> llm_wiki_core::error::Result<T> {
+        let conn = open(&path)?;
+        f(&conn)
     })
     .await
     .map_err(|e| ApiError::internal(format!("task join: {e}")))?;
-    output
+    output.map_err(ApiError::from)
 }
 
 fn job_json(record: &llm_wiki_storage::ServerJobRecord) -> serde_json::Value {
@@ -73,11 +78,36 @@ fn job_json(record: &llm_wiki_storage::ServerJobRecord) -> serde_json::Value {
         "build_id": record.build_id.as_ref().map(|b| b.as_str()),
         "failure_code": record.failure_code,
         "retryable": record.retryable,
-        "error": record.error,
+        "error": public_job_error(record),
+        "progress": record
+            .progress_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok()),
         "created_at": record.created_at,
         "started_at": record.started_at,
         "finished_at": record.finished_at,
     })
+}
+
+/// The client-safe view of a job's `error` column. The stored text is the
+/// raw `WikiError` string — the same class of internals the HTTP error body
+/// scrubs (SQL, paths, upstream bodies) — so `/v1/jobs` derives stable text
+/// from `failure_code` instead. `CANCELLED`/`INTERRUPTED`/`REPLAN_REQUIRED`
+/// carry our own operational strings (or client-actionable text) and pass
+/// through. The full detail stays in the DB column and the log (searchable
+/// by job id).
+fn public_job_error(record: &llm_wiki_storage::ServerJobRecord) -> Option<String> {
+    let raw = record.error.as_deref();
+    match record.failure_code.as_deref() {
+        Some(code) if code == llm_wiki_storage::FAILURE_LLM => {
+            Some("upstream model request failed".into())
+        }
+        Some(code) if code == llm_wiki_storage::FAILURE_INTERNAL => {
+            Some("internal error; see server logs".into())
+        }
+        // Our own operational strings / client-actionable text.
+        Some(_) | None => raw.map(str::to_owned),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -99,16 +129,16 @@ pub async fn status(
     State(state): State<SharedState>,
     Extension(request_id): Extension<RequestId>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let path = state.db_path();
     let workspace_name = state.config().project.name.clone();
     let request_id = request_id.0.as_str().to_owned();
-    let payload = tokio::task::spawn_blocking(move || {
-        let conn = open(&path).map_err(ApiError::from)?;
-        let sources = count_sources(&conn).map_err(ApiError::from)?;
-        let latest = latest_build(&conn).map_err(ApiError::from)?;
-        let active = get_active_build_id(&conn).map_err(ApiError::from)?;
-        let jobs = count_jobs_by_status(&conn, JOB_STATUSES).map_err(ApiError::from)?;
-        Result::<_, ApiError>::Ok(json!({
+    // `db()` converts the WikiError OUTSIDE the blocking task, so scrubbed
+    // storage errors still log with this request's id.
+    let payload = db(&state, move |conn| {
+        let sources = count_sources(conn)?;
+        let latest = latest_build(conn)?;
+        let active = get_active_build_id(conn)?;
+        let jobs = count_jobs_by_status(conn, JOB_STATUSES)?;
+        Ok(json!({
             "protocol_version": PROTOCOL_VERSION,
             "request_id": request_id,
             "workspace": workspace_name,
@@ -122,8 +152,7 @@ pub async fn status(
             "jobs": jobs,
         }))
     })
-    .await
-    .map_err(|e| ApiError::internal(format!("task join: {e}")))??;
+    .await?;
     Ok(Json(payload))
 }
 
@@ -232,6 +261,7 @@ pub async fn build(
         error: None,
         request_id: None,
         idempotency_key,
+        progress_json: None,
         created_at: chrono::Utc::now().to_rfc3339(),
         started_at: None,
         finished_at: None,
@@ -327,7 +357,7 @@ pub struct JobFilter {
 /// stop at the next pipeline checkpoint; QUEUED jobs cancel immediately;
 /// terminal jobs are a 409.
 ///
-/// Cancellation NEVER releases the build slot (#I01): a cancelled pipeline
+/// Cancellation NEVER releases the job's slot (#I01): a cancelled pipeline
 /// is still unwinding toward its checkpoint, and only the job task itself
 /// frees the slot when its pipeline has ended — otherwise a new build could
 /// be admitted against a workspace that still has a live pipeline.
@@ -340,12 +370,13 @@ pub async fn cancel_job(
     let record = db(&state, move |conn| storage_get_job(conn, &lookup_id))
         .await?
         .ok_or_else(|| ApiError::not_found(format!("no job {job_id}")))?;
+    let slot = slot_for(&state, &record.kind);
     match record.status.as_str() {
         "QUEUED" => {
             // Signal the in-memory flag too: the task may be between the
             // accept and its RUNNING transition; the flag makes its first
             // pipeline checkpoint bail out.
-            if let Some(cancel) = state.0.jobs.cancel_flag_of(&job_id).await {
+            if let Some(cancel) = slot.cancel_flag_of(&job_id).await {
                 cancel.cancel();
             }
             let cancel_id = job_id.clone();
@@ -367,10 +398,10 @@ pub async fn cancel_job(
             } else {
                 // Lost the race: the task flipped the row to RUNNING between
                 // our read and write — fall through to the cooperative path.
-                cancel_running(&state, &job_id).await
+                cancel_running(slot, &job_id).await
             }
         }
-        "RUNNING" => cancel_running(&state, &job_id).await,
+        "RUNNING" => cancel_running(slot, &job_id).await,
         other => Err(ApiError::conflict(
             "job_not_cancellable",
             format!("job is already terminal ({other})"),
@@ -378,15 +409,25 @@ pub async fn cancel_job(
     }
 }
 
+/// The slot manager owning a job's cancel flag: embed jobs occupy the embed
+/// slot, every other kind the build slot.
+fn slot_for<'a>(state: &'a SharedState, kind: &str) -> &'a JobManager {
+    if kind == "embed" {
+        &state.0.embed_jobs
+    } else {
+        &state.0.jobs
+    }
+}
+
 /// Signals a RUNNING job's cancel flag without releasing its slot.
 fn cancel_running<'a>(
-    state: &'a SharedState,
+    jobs: &'a JobManager,
     job_id: &'a JobId,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<Json<serde_json::Value>, ApiError>> + Send + 'a>,
 > {
     Box::pin(async move {
-        let Some(cancel) = state.0.jobs.cancel_flag_of(job_id).await else {
+        let Some(cancel) = jobs.cancel_flag_of(job_id).await else {
             return Err(ApiError::conflict(
                 "job_not_cancellable",
                 "the job is RUNNING but not owned by this server instance",
@@ -503,11 +544,15 @@ async fn search_wiki(
     let full_text = state.config().search.full_text;
     // FTS + graph stay behind the blocking pool (the search crate's own
     // blocking hop needs a live runtime, which the async context provides).
+    // The WikiError → ApiError conversion stays OUTSIDE the blocking task:
+    // the REQUEST_ID task-local does not cross spawn_blocking, and scrubbed
+    // errors must log their detail with the request id.
     let path = state.db_path();
-    let conn = tokio::task::spawn_blocking(move || open(&path).map_err(ApiError::from))
+    let conn = tokio::task::spawn_blocking(move || open(&path))
         .await
-        .map_err(|e| ApiError::internal(format!("task join: {e}")))?;
-    let fts = SqliteFullTextSearch::new(conn?, full_text);
+        .map_err(|e| ApiError::internal(format!("task join: {e}")))?
+        .map_err(ApiError::from)?;
+    let fts = SqliteFullTextSearch::new(conn, full_text);
     if !fts.has_published().map_err(ApiError::from)? {
         return Err(ApiError::nothing_published());
     }
@@ -586,20 +631,15 @@ async fn search_fused(
     limit: usize,
     mode: SearchSourceMode,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let path = state.db_path();
-    let outcome = tokio::task::spawn_blocking(move || {
-        let conn = open(&path).map_err(ApiError::from)?;
-        let generation = get_active_build_id(&conn).map_err(ApiError::from)?;
+    let (generation, fused, citation_counts) = db(&state, move |conn| {
+        let generation = get_active_build_id(conn)?;
         // Over-fetch per side (the wiki path's limit+1 shape) so `truncated`
         // stays honest after the top-level merge.
-        let fused = fusion::retrieve(&conn, &query, fusion_mode(mode), limit + 1)
-            .map_err(ApiError::from)?;
-        let counts = citation_counts(&conn).map_err(ApiError::from)?;
-        Ok::<_, ApiError>((generation, fused, counts))
+        let fused = fusion::retrieve(conn, &query, fusion_mode(mode), limit + 1)?;
+        let counts = citation_counts(conn)?;
+        Ok((generation, fused, counts))
     })
-    .await
-    .map_err(|e| ApiError::internal(format!("task join: {e}")))??;
-    let (generation, fused, citation_counts) = outcome;
+    .await?;
 
     let truncated = fused.entries.len() > limit;
     let hits_json: Vec<serde_json::Value> = fused
@@ -689,22 +729,25 @@ fn requested_budget(over: Option<&ContextBudgetRequest>) -> llm_wiki_search::Con
 }
 
 /// The §19.3 vector candidates for one query, split by Send-ness: the
-/// coverage check and cosine scoring run on the blocking pool; the embed
-/// call is the only async piece, and an uncovered workspace never spends it.
+/// snapshot load and cosine scoring run on the blocking pool; the embed call
+/// is the only async piece, and an uncovered workspace never spends it.
+///
+/// The snapshot comes from the shared cache (LW-001), so the whole vector
+/// layer is read once per (generation, embeddings revision) rather than once
+/// per query — and the scoring needs no second connection.
 async fn vector_candidates_for(
     state: &SharedState,
     query: &str,
 ) -> Result<Vec<llm_wiki_search::VectorCandidate>, ApiError> {
     let (embedding_provider, model) = hybrid_context(state, None)?;
-    let coverage_path = state.db_path();
-    let model_for_coverage = model.clone();
-    let covered = tokio::task::spawn_blocking(move || {
-        let conn = open(&coverage_path).map_err(ApiError::from)?;
-        llm_wiki_compiler::embedding_coverage(&conn, &model_for_coverage).map_err(ApiError::from)
-    })
-    .await
-    .map_err(|e| ApiError::internal(format!("task join: {e}")))?;
-    if !covered? {
+    let cache = state.0.vector_cache.clone();
+    let model_for_load = model.clone();
+    let snapshot = db(state, move |conn| cache.get_or_load(conn, &model_for_load)).await?;
+    if !snapshot.covered() {
+        tracing::warn!(
+            model = %model,
+            "no embeddings stored for this model; run an embed backfill for hybrid retrieval"
+        );
         return Ok(Vec::new());
     }
     let hybrid = llm_wiki_compiler::HybridContext {
@@ -714,14 +757,7 @@ async fn vector_candidates_for(
     let query_vector = llm_wiki_compiler::embed_query_vector(&hybrid, query)
         .await
         .map_err(ApiError::from)?;
-    let path = state.db_path();
-    tokio::task::spawn_blocking(move || {
-        let conn = open(&path).map_err(ApiError::from)?;
-        llm_wiki_compiler::top_cosine_candidates(&conn, &model, query_vector.as_deref())
-            .map_err(ApiError::from)
-    })
-    .await
-    .map_err(|e| ApiError::internal(format!("task join: {e}")))?
+    Ok(snapshot.top_candidates(query_vector.as_deref()))
 }
 
 /// `POST /v1/context` (PRD §24/§30, the Agent-integration surface): the
@@ -753,24 +789,24 @@ pub async fn context(
         Vec::new()
     };
 
-    let path = state.db_path();
     let query = request.query.clone();
-    let assembled = tokio::task::spawn_blocking(move || {
-        let conn = open(&path).map_err(ApiError::from)?;
-        let generation = get_active_build_id(&conn).map_err(ApiError::from)?;
+    let (generation, assembled) = db(&state, move |conn| {
+        let generation = get_active_build_id(conn)?;
         // Wiki mode keeps the legacy builder untouched (fused = None);
         // source/fusion run the PR3 fused retrieval first, per-side limit =
         // the chunk budget (PRD §1.2).
         let fused = if mode == SearchSourceMode::Wiki {
             None
         } else {
-            Some(
-                fusion::retrieve(&conn, &query, fusion_mode(mode), budget.max_chunks)
-                    .map_err(ApiError::from)?,
-            )
+            Some(fusion::retrieve(
+                conn,
+                &query,
+                fusion_mode(mode),
+                budget.max_chunks,
+            )?)
         };
         llm_wiki_search::build_context_with_sources(
-            &conn,
+            conn,
             &query,
             &budget,
             &vector,
@@ -778,11 +814,8 @@ pub async fn context(
             fused.as_ref(),
         )
         .map(|assembled| (generation, assembled))
-        .map_err(ApiError::from)
     })
-    .await
-    .map_err(|e| ApiError::internal(format!("task join: {e}")))??;
-    let (generation, assembled) = assembled;
+    .await?;
 
     let chunks: Vec<serde_json::Value> = assembled
         .chunks
@@ -965,7 +998,15 @@ fn hybrid_context(
                 endpoint.timeout_seconds,
                 2,
             )
-            .map_err(|e| ApiError::bad_request(format!("embedding provider init failed: {e}")))?,
+            .map_err(|e| {
+                ApiError::scrubbed(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "embedding provider init failed; check [embedding] config",
+                    format!("embedding provider init failed: {e}"),
+                )
+            })?
+            .with_rate_limit(config.embedding.requests_per_minute),
         ),
         other => {
             return Err(ApiError::bad_request(format!(
@@ -1191,18 +1232,22 @@ pub async fn embed(
     } else {
         parse_body(&body)?
     };
-    let batch = request.batch.unwrap_or(16).clamp(1, 64);
+    let config_batch = state.config().embedding.batch_size.max(1) as usize;
+    let batch = request.batch.unwrap_or(config_batch).clamp(1, 64);
     let (embedding_provider, model) = hybrid_context(&state, request.model.as_deref())?;
-
-    let _permit = state
-        .0
-        .llm_permits
-        .acquire()
-        .await
-        .map_err(|e| ApiError::internal(format!("llm semaphore: {e}")))?;
 
     let workspace = state.0.workspace.clone();
     let config = state.0.config.clone();
+    // In-flight batches draw from the SHARED LLM semaphore (one permit per
+    // provider call): embedding is accounted against the same budget as
+    // builds and queries — no whole-run permit that undercounts a concurrent
+    // backfill.
+    let options = llm_wiki_compiler::EmbedOptions {
+        batch_size: batch,
+        max_retries: state.config().embedding.max_retries,
+        permits: Some(state.0.llm_permits.clone()),
+        ..llm_wiki_compiler::EmbedOptions::serial(batch)
+    };
     // run_embed holds its SQLite connection across awaits (a !Send future by
     // design): give it the blocking pool with a block_on handle.
     let report = tokio::task::spawn_blocking(move || {
@@ -1211,7 +1256,7 @@ pub async fn embed(
             &config,
             embedding_provider,
             &model,
-            batch,
+            options,
         ))
     })
     .await
@@ -1230,4 +1275,137 @@ pub async fn embed(
         "covered_before": report.covered_before,
         "embedded": report.embedded,
     })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EmbedJobRequest {
+    /// Embedding model override (falls back to $LLM_WIKI_EMBEDDING_MODEL).
+    pub model: Option<String>,
+    /// Sections per embedding request (default: `[embedding] batch_size`).
+    pub batch: Option<usize>,
+}
+
+/// `POST /v1/embed/jobs` — the async, persistent, cancellable counterpart of
+/// `POST /v1/embed` (which stays synchronous for the frozen V1 contract):
+/// returns `202 + job_id` immediately; progress and cancellation ride the
+/// generic `/v1/jobs` surface. One embed job at a time (its OWN slot,
+/// independent of the build lock); idempotency keys are scoped
+/// `embed:{generation}:{model}:{key}` so a replay resolves to the SAME job
+/// while a new generation or model starts a fresh one.
+///
+/// Length note: ~100 lines — thin transport (resolve model → admission →
+/// idempotency → insert → claim slot → spawn), mirroring `build`; no nesting
+/// beyond the claim/conflict branches.
+pub async fn embed_job(
+    State(state): State<SharedState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    let request: EmbedJobRequest = if body.iter().all(|b| b.is_ascii_whitespace()) {
+        EmbedJobRequest {
+            model: None,
+            batch: None,
+        }
+    } else {
+        parse_body(&body)?
+    };
+    let (provider, model) = hybrid_context(&state, request.model.as_deref())?;
+    let generation = db(&state, get_active_build_id)
+        .await?
+        .ok_or_else(ApiError::nothing_published)?;
+
+    let client_key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    // The key scopes to (generation, model): a replay must not resolve to a
+    // job over a different vector space.
+    let idempotency_key =
+        client_key.map(|key| format!("embed:{}:{model}:{key}", generation.as_str()));
+    // Replay BEFORE the queue cap (same order as `build`): a client retrying
+    // with the same key must get its original job back even when the queue is
+    // full, never a 429 for work that was already accepted.
+    if let Some(replayed) = replay_idempotent(&state, idempotency_key.clone()).await? {
+        return Ok(replayed);
+    }
+
+    let queued = db(&state, |conn| count_jobs_by_status(conn, &["QUEUED"]))
+        .await?
+        .remove("QUEUED")
+        .unwrap_or(0);
+    let cap = state.config().server.max_queued_jobs;
+    if queued >= cap {
+        return Err(ApiError::queue_full(cap));
+    }
+
+    let batch = request
+        .batch
+        .unwrap_or(state.config().embedding.batch_size.max(1) as usize)
+        .clamp(1, 64);
+
+    let job_id = JobId::generate();
+    let record = llm_wiki_storage::ServerJobRecord {
+        job_id: job_id.clone(),
+        kind: "embed".into(),
+        status: "QUEUED".into(),
+        phase: None,
+        build_id: None,
+        failure_code: None,
+        retryable: false,
+        error: None,
+        request_id: None,
+        idempotency_key,
+        progress_json: None,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        started_at: None,
+        finished_at: None,
+    };
+    db(&state, move |conn| insert_job(conn, &record)).await?;
+
+    let cancel = CancelFlag::new();
+    if !state
+        .0
+        .embed_jobs
+        .start(ActiveJob {
+            job_id: job_id.clone(),
+            cancel: cancel.clone(),
+        })
+        .await
+    {
+        // An embed job claimed the slot between the check and the claim:
+        // drop the queued row back out and report the conflict.
+        let superseded = job_id.clone();
+        db(&state, move |conn| {
+            finish_job(
+                conn,
+                &superseded,
+                "CANCELLED",
+                Some(FAILURE_CANCELLED),
+                true,
+                Some("superseded by a concurrently started embed job"),
+            )
+        })
+        .await?;
+        return Err(ApiError::conflict(
+            "embed_already_running",
+            "an embed job is already running; one backfill at a time",
+        ));
+    }
+
+    spawn_embed_job(
+        state.clone(),
+        job_id.clone(),
+        cancel,
+        provider,
+        model,
+        batch,
+    );
+    tracing::info!(job = %job_id, "embed job queued");
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({"job_id": job_id.as_str(), "status": "queued"})),
+    )
+        .into_response())
 }

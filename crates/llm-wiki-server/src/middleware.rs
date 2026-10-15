@@ -25,10 +25,19 @@ use crate::state::SharedState;
 #[derive(Debug, Clone)]
 pub struct RequestId(pub Arc<String>);
 
+// The current request's id, readable from anywhere polled within the
+// request scope. Error scrubbing uses it to log the internal detail that the
+// response body no longer carries. It does NOT cross `spawn_blocking` /
+// `tokio::spawn` boundaries — which is why `db()` converts `WikiError`
+// outside its blocking closure.
+tokio::task_local! {
+    pub static REQUEST_ID: Arc<String>;
+}
+
 pub async fn request_id(mut req: Request, next: Next) -> Response {
     let id = Arc::new(format!("req_{}", ulid::Ulid::new()));
     req.extensions_mut().insert(RequestId(id.clone()));
-    let mut response = next.run(req).await;
+    let mut response = REQUEST_ID.scope(id.clone(), next.run(req)).await;
     if let Ok(value) = axum::http::HeaderValue::from_str(&id) {
         response.headers_mut().insert("x-request-id", value);
     }

@@ -248,6 +248,7 @@ async fn cancel_a_queued_job_immediately_and_a_running_job_via_the_flag() {
         error: None,
         request_id: None,
         idempotency_key: None,
+        progress_json: None,
         created_at: chrono::Utc::now().to_rfc3339(),
         started_at: Some(chrono::Utc::now().to_rfc3339()),
         finished_at: None,
@@ -314,6 +315,7 @@ async fn list_jobs_is_cursor_paginated() {
             error: None,
             request_id: None,
             idempotency_key: None,
+            progress_json: None,
             created_at: format!("2026-01-0{}T00:00:00+00:00", i + 1),
             started_at: None,
             finished_at: None,
@@ -430,6 +432,7 @@ fn job_row(job_id: &JobId, status: &str) -> ServerJobRecord {
         error: None,
         request_id: None,
         idempotency_key: None,
+        progress_json: None,
         created_at: chrono::Utc::now().to_rfc3339(),
         started_at: None,
         finished_at: None,
@@ -714,6 +717,396 @@ async fn embed_endpoint_runs_the_backfill() {
     // Uncovered generation: the endpoint issued at most one embed call.
     assert!(calls.load(AtomicOrdering::SeqCst) <= 1, "{body}");
     std::env::remove_var("LLM_WIKI_EMBEDDING_MODEL");
+}
+
+/// A slow embedding provider: each call sleeps, so RUNNING windows are wide
+/// enough to observe admission conflicts and cooperative cancellation.
+struct SlowEmbeddings {
+    per_call: std::time::Duration,
+}
+
+#[async_trait::async_trait]
+impl EmbeddingProvider for SlowEmbeddings {
+    async fn embed(&self, _model: &str, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedLlmError> {
+        tokio::time::sleep(self.per_call).await;
+        Ok(texts.iter().map(|_| vec![0.5_f32; 8]).collect())
+    }
+}
+
+/// A published generation whose single page carries `sections` H2 sections —
+/// the cancel/conflict test needs multiple batches (batch=1), and the plain
+/// seed yields only one section.
+fn seed_embed_generation(workspace: &std::path::Path, sections: usize) -> BuildId {
+    let db_path = workspace.join(".llm-wiki").join("state.db");
+    let mut conn = open(&db_path).unwrap();
+    let build_id = start_build(&mut conn, &llm_wiki_storage::BuildDraft::default()).unwrap();
+    let mut content = String::from("# Fixture\n\nIntro.\n\n");
+    for i in 0..sections {
+        content.push_str(&format!(
+            "## Part {i}\n\nBody {i} carries marker m{i}qz.\n\n"
+        ));
+    }
+    let page = WikiPageRecord {
+        page_id: WikiPageId::generate(),
+        slug: "fixture".into(),
+        title: "Fixture".into(),
+        category: "concepts".into(),
+        language: "en".into(),
+        body_hash: sha256_hex(content.as_bytes()),
+        content,
+        knowledge_refs: Vec::new(),
+        citations: Vec::new(),
+        links: Vec::new(),
+    };
+    persist_generation(&mut conn, &build_id, &[page]).unwrap();
+    llm_wiki_storage::activate_build(&mut conn, &build_id).unwrap();
+    // Sections land in wiki_page_text with the index; the unconditional
+    // rebuild (not the diff-based activate_with_search_index) guarantees
+    // rows even when the build is already active.
+    llm_wiki_storage::rebuild_search_index(&conn, &build_id, llm_wiki_storage::default_tokenizer())
+        .unwrap();
+    std::fs::create_dir_all(workspace.join("wiki")).unwrap();
+    write_current_pointer(&PublishPaths::new(&workspace.join("wiki")), &build_id).unwrap();
+    build_id
+}
+
+/// `POST /v1/embed/jobs` (0014): 202 + job_id, terminal COMPLETED with the
+/// `progress` counters mirrored onto the job row.
+#[tokio::test]
+async fn embed_job_lifecycle_completes_with_progress() {
+    let workspace = fixture_workspace("embed-job");
+    let (build_id, _) = seed_published_generation(&workspace);
+    // Sections live in wiki_page_text, written by the search-index rebuild —
+    // the basic seed only persists the page row (total_sections would be 0).
+    {
+        let conn = open(&workspace.join(".llm-wiki").join("state.db")).unwrap();
+        llm_wiki_storage::rebuild_search_index(
+            &conn,
+            &build_id,
+            llm_wiki_storage::default_tokenizer(),
+        )
+        .unwrap();
+    }
+    let state = state_with_provider(
+        workspace,
+        Arc::new(FakeLlmProvider::fixed("fake-server", "x")),
+    )
+    .with_embedding_provider(Arc::new(CountingEmbeddings {
+        calls: Arc::new(AtomicUsize::new(0)),
+    }));
+    let app = build_router(state);
+    let (status, body) = post(
+        app.clone(),
+        "/v1/embed/jobs",
+        r#"{"model":"fake-embed"}"#,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let job_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["job_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let (status, body) = get(app.clone(), &format!("/v1/jobs/{job_id}")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if !matches!(payload["status"].as_str(), Some("QUEUED" | "RUNNING")) {
+            assert_eq!(payload["status"], "COMPLETED", "{body}");
+            assert_eq!(payload["kind"], "embed", "{body}");
+            assert!(payload["error"].is_null(), "{body}");
+            assert!(
+                payload["progress"]["embedded"].is_u64() && payload["progress"]["total"].is_u64(),
+                "final counters mirrored: {body}"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "job never terminalized"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Idempotency keys scope to (generation, model): a replay resolves to the
+/// SAME job row; the same key under a different model starts a fresh one.
+#[tokio::test]
+async fn embed_job_idempotency_replays_and_scopes_by_model() {
+    let workspace = fixture_workspace("embed-job-idem");
+    let (build_id, _) = seed_published_generation(&workspace);
+    {
+        let conn = open(&workspace.join(".llm-wiki").join("state.db")).unwrap();
+        llm_wiki_storage::rebuild_search_index(
+            &conn,
+            &build_id,
+            llm_wiki_storage::default_tokenizer(),
+        )
+        .unwrap();
+    }
+    let state = state_with_provider(
+        workspace,
+        Arc::new(FakeLlmProvider::fixed("fake-server", "x")),
+    )
+    .with_embedding_provider(Arc::new(CountingEmbeddings {
+        calls: Arc::new(AtomicUsize::new(0)),
+    }));
+
+    let app = build_router(state);
+    let (status, body) = post(
+        app.clone(),
+        "/v1/embed/jobs",
+        r#"{"model":"fake-embed"}"#,
+        Some("client-k"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let first = serde_json::from_str::<serde_json::Value>(&body).unwrap()["job_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let (_, body) = get(app.clone(), &format!("/v1/jobs/{first}")).await;
+        let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if payload["status"] == "COMPLETED" {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "job never completed"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // Same key, same model → the SAME job, replayed (200).
+    let (status, body) = post(
+        app.clone(),
+        "/v1/embed/jobs",
+        r#"{"model":"fake-embed"}"#,
+        Some("client-k"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains(&first) && body.contains("\"replayed\":true"),
+        "{body}"
+    );
+
+    // Same key, DIFFERENT model → a fresh job (different vector space).
+    let (status, body) = post(
+        app.clone(),
+        "/v1/embed/jobs",
+        r#"{"model":"other-model"}"#,
+        Some("client-k"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let second = serde_json::from_str::<serde_json::Value>(&body).unwrap()["job_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(first, second, "model is part of the idempotency scope");
+}
+
+/// Replay is checked BEFORE the queue cap (the same order as `build`): a
+/// client retrying with the same key gets its original job back even while
+/// the queue is full — never a 429 for work that was already accepted.
+#[tokio::test]
+async fn embed_job_replay_wins_over_a_full_queue() {
+    let workspace = fixture_workspace("embed-job-replay-cap");
+    seed_published_generation(&workspace);
+    let state = state_with_provider(
+        workspace,
+        Arc::new(FakeLlmProvider::fixed("fake-server", "x")),
+    )
+    .with_embedding_provider(Arc::new(CountingEmbeddings {
+        calls: Arc::new(AtomicUsize::new(0)),
+    }));
+    let cap = state.config().server.max_queued_jobs;
+    let app = build_router(state.clone());
+
+    let (status, body) = post(
+        app.clone(),
+        "/v1/embed/jobs",
+        r#"{"model":"fake-embed"}"#,
+        Some("cap-key"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let first = serde_json::from_str::<serde_json::Value>(&body).unwrap()["job_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Fill the QUEUED bucket to the cap with filler rows.
+    let conn = open(&state.db_path()).unwrap();
+    for _ in 0..cap {
+        insert_job(&conn, &job_row(&JobId::generate(), "QUEUED")).unwrap();
+    }
+
+    // Same key → the ORIGINAL job, replayed (200), not a queue-full 429.
+    let (status, body) = post(
+        app.clone(),
+        "/v1/embed/jobs",
+        r#"{"model":"fake-embed"}"#,
+        Some("cap-key"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains(&first) && body.contains("\"replayed\":true"),
+        "{body}"
+    );
+
+    // A fresh key with the queue full is still rejected.
+    let (status, body) = post(
+        app.clone(),
+        "/v1/embed/jobs",
+        r#"{"model":"fake-embed"}"#,
+        Some("another-key"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+}
+
+/// One embed at a time: while a slow backfill holds the embed slot a second
+/// submit gets 409; cancelling terminalizes CANCELLED and releases the slot
+/// for the next submit.
+#[tokio::test]
+async fn embed_job_single_slot_conflict_and_cancel() {
+    let workspace = fixture_workspace("embed-job-conflict");
+    seed_embed_generation(&workspace, 6);
+    let state = state_with_provider(
+        workspace,
+        Arc::new(FakeLlmProvider::fixed("fake-server", "x")),
+    )
+    .with_embedding_provider(Arc::new(SlowEmbeddings {
+        per_call: std::time::Duration::from_millis(300),
+    }));
+
+    let app = build_router(state);
+    // batch=1 → multiple serial batches, so the cancel lands between them.
+    let (status, body) = post(
+        app.clone(),
+        "/v1/embed/jobs",
+        r#"{"batch":1,"model":"fake-embed"}"#,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let job_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["job_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Wait for RUNNING, then the slot is held.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let (_, body) = get(app.clone(), &format!("/v1/jobs/{job_id}")).await;
+        if body.contains("\"RUNNING\"") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "job never started; last body: {body}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let (status, body) = post(
+        app.clone(),
+        "/v1/embed/jobs",
+        r#"{"model":"fake-embed"}"#,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("embed_already_running"), "{body}");
+
+    // Cooperative cancel → terminal CANCELLED, then the slot frees.
+    let (status, body) = post(app.clone(), &format!("/v1/jobs/{job_id}/cancel"), "", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let (_, body) = get(app.clone(), &format!("/v1/jobs/{job_id}")).await;
+        let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if !matches!(payload["status"].as_str(), Some("QUEUED" | "RUNNING")) {
+            assert_eq!(payload["status"], "CANCELLED", "{body}");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "job never terminalized"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let (status, body) = post(
+        app.clone(),
+        "/v1/embed/jobs",
+        r#"{"model":"fake-embed"}"#,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+}
+
+/// Scrubbing (review #S04): a FAILED job's stored `error` (the raw upstream
+/// failure text) stays in the DB for operators, but `/v1/jobs/{id}` derives
+/// stable text from `failure_code` instead of echoing it.
+#[tokio::test]
+async fn failed_job_error_is_scrubbed_in_the_jobs_api() {
+    let workspace = fixture_workspace("job-error-scrub");
+    let handler = Arc::new(
+        move |_request: &llm_wiki_llm::LlmRequest| -> Result<String, LlmError> {
+            Err(LlmError::Api {
+                code: 500,
+                message: "secret upstream detail E:/abs/path".into(),
+            })
+        },
+    );
+    let provider: Arc<dyn LlmProvider> = Arc::new(FakeLlmProvider::new("fake-server", handler));
+    let state = state_with_provider(workspace, provider);
+
+    let app = build_router(state.clone());
+    let (status, body) = post(app, "/v1/build", "{}", None).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let job_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["job_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Wait for the scripted failure to terminalize, then confirm the DB
+    // column kept the full detail.
+    let conn = open(&state.db_path()).unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let stored_error = loop {
+        let record = get_job(&conn, &JobId::parse(&job_id).unwrap())
+            .unwrap()
+            .unwrap();
+        if !matches!(record.status.as_str(), "QUEUED" | "RUNNING") {
+            assert_eq!(record.status, "FAILED");
+            break record.error.unwrap_or_default();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "job never terminalized"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert!(
+        stored_error.contains("secret upstream detail"),
+        "the DB keeps the full detail: {stored_error}"
+    );
+
+    let app = build_router(state);
+    let (status, body) = get(app, &format!("/v1/jobs/{job_id}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body.contains("secret upstream detail"), "{body}");
+    assert!(!body.contains("E:/abs/path"), "{body}");
+    assert!(body.contains("upstream model request failed"), "{body}");
 }
 
 /// Auto-resume (config-gated): recover_interrupted_jobs re-enqueues and
