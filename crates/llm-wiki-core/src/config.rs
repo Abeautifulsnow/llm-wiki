@@ -148,6 +148,13 @@ pub struct EmbeddingConfig {
     /// behavior — a safe default for low-quota providers. The HTTP server
     /// accounts in-flight batches against its shared LLM semaphore; this
     /// caps the CLI/local fallback.
+    ///
+    /// Measured (LW-002 harness, 2000 sections, batch 8, 20 ms provider
+    /// latency, release): 251 requests take 7.82 s at 1, 1.98 s at 4 (3.94×)
+    /// and 1.03 s at 8 (7.62×), with the request count unchanged — parallel
+    /// batches do not cost extra provider spend. Above ~8 the single-writer
+    /// store and the provider's own quota are what limit the gain, so pair a
+    /// raise with `requests_per_minute` when the provider meters requests.
     #[serde(default = "default_embed_max_concurrency")]
     pub max_concurrency: u32,
     /// Sections per embedding request; CLI `--batch` and the HTTP request

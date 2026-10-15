@@ -1115,6 +1115,7 @@ dependencies = [
 name = "llm-wiki-evals"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "llm-wiki-compiler",
  "llm-wiki-core",

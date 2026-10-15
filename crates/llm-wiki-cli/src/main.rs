@@ -284,6 +284,9 @@ timeout_seconds = 120
 # Outbound requests per minute, paced ACROSS concurrent batches so raising
 # max_concurrency cannot overshoot the provider's quota (LW-002). 0 = unpaced.
 # requests_per_minute = 0
+# Batches in flight per backfill (LW-002). 1 = serial, the historical default.
+# Measured (2000 sections, batch 8, 20ms provider latency): 251 requests take
+# 7.82s at 1, 1.98s at 4, 1.03s at 8 — same request count, no extra spend.
 # max_concurrency = 1
 # batch_size = 16
 # max_retries = 3
