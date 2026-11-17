@@ -5,6 +5,7 @@
 //! and the end-to-end `run_build` orchestration (§29/§31). Depends on
 //! core/llm/markdown/storage — never the reverse.
 
+pub mod aggregate;
 pub mod analysis;
 pub mod ask;
 pub mod build;
@@ -23,6 +24,11 @@ pub mod semantic_lint;
 pub mod vector_cache;
 pub mod vector_index;
 
+pub use aggregate::{
+    aggregate_pages, dominant_language, domain_summary_requests, is_aggregate_category,
+    AggregateOptions, AggregateOutcome, DomainSummaryRequest, CATEGORY_DOMAIN, CATEGORY_INDEX,
+    CATEGORY_OVERVIEW, PLANNER_CATEGORIES, SLUG_INDEX, SLUG_OVERVIEW,
+};
 pub use analysis::{
     AnalysisOutcome, AnalysisSection, AnalyzedDocument, DocumentAnalyzer, VerifiedRelation,
 };

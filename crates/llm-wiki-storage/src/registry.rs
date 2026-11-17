@@ -136,6 +136,40 @@ pub fn get_entry(conn: &Connection, id: &KnowledgeNodeId) -> Result<Option<Regis
     }
 }
 
+/// Display labels for every ACTIVE registry node, keyed by node id.
+///
+/// The aggregation pass (V0.6) needs human-readable names for a domain's key
+/// concepts; resolving them one at a time would be N round-trips per build.
+/// Ordering is by id so the map is deterministic, and the label falls back to
+/// `canonical_key` when `canonical_name` is NULL or empty.
+pub fn load_active_labels(
+    conn: &Connection,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, COALESCE(NULLIF(canonical_name, ''), canonical_key)
+             FROM knowledge_registry WHERE status = 'active' ORDER BY id",
+        )
+        .map_err(|e| WikiError::Storage(format!("prepare load_active_labels: {e}")))?;
+    let mut rows = stmt
+        .query([])
+        .map_err(|e| WikiError::Storage(format!("load_active_labels: {e}")))?;
+    let mut labels = std::collections::BTreeMap::new();
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| WikiError::Storage(format!("load_active_labels: {e}")))?
+    {
+        let id: String = row
+            .get(0)
+            .map_err(|e| WikiError::Storage(format!("load_active_labels: {e}")))?;
+        let label: String = row
+            .get(1)
+            .map_err(|e| WikiError::Storage(format!("load_active_labels: {e}")))?;
+        labels.insert(id, label);
+    }
+    Ok(labels)
+}
+
 /// Resolves a canonical key to its current primary node, following
 /// `merged_into` chains (bounded to guard against data corruption).
 pub fn resolve(conn: &Connection, kind: NodeKind, key: &str) -> Result<Option<KnowledgeNodeId>> {

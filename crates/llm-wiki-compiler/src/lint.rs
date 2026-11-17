@@ -289,6 +289,13 @@ fn check_orphans(
 
 fn check_sections(pages: &[llm_wiki_storage::GenerationPageView], report: &mut LintReport) {
     for page in pages {
+        // Aggregate pages (V0.6) are navigation, not knowledge: their bodies
+        // are link lists and page counts, deliberately citation-free. The
+        // "substantive prose without citations" rule (PRD §36) is about
+        // grounded claims, so it must not fire on them.
+        if crate::aggregate::is_aggregate_category(&page.category) {
+            continue;
+        }
         let parsed = parse_document(&page.content, &format!("{}.md", page.slug));
         for section in &parsed.sections {
             // Only H2/H3 sections are linted (PRD §36); the H1 title and any

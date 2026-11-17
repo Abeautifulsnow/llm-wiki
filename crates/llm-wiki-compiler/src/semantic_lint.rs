@@ -196,8 +196,12 @@ pub async fn run_semantic_lint(
     let max_output = config.llm.max_output_tokens;
     let language = "the sources' language".to_owned();
 
+    // Aggregate pages (V0.6) are navigation, not knowledge: link lists and
+    // counts carry no semantic claim to review, and feeding them in would add
+    // knowledge-gap noise (a domain page references many nodes by design).
     let reviews: Vec<PageReview> = pages
         .iter()
+        .filter(|page| !crate::aggregate::is_aggregate_category(&page.category))
         .map(|page| {
             let mut claims: Vec<(String, String)> = Vec::new();
             let mut cited: BTreeSet<String> = BTreeSet::new();

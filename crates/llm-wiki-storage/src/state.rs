@@ -24,6 +24,9 @@ pub const BUILD_STATUSES: &[&str] = &[
     "ANALYZING",
     "PLANNING",
     "COMPILING",
+    // V0.6: the deterministic aggregate layer (overview/domain/index) is
+    // built between compilation and publish.
+    "AGGREGATING",
     "INDEXING",
     "READY",
     "COMPLETED",

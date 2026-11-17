@@ -48,6 +48,18 @@ pub const NODE_TYPE_CONCEPT: &str = "concept";
 pub const RELATION_LINKS_TO: &str = "links_to";
 /// The page ↔ semantic bridge edge (audit FIX-009): page → entity/concept.
 pub const RELATION_CONTAINS: &str = "contains";
+/// Aggregate-membership edge (V0.6, PRD §14.2/§17): domain page → member page.
+/// It answers "what does this domain contain", while `links_to` on the same
+/// pair answers "what does this page reference" — same endpoints, different
+/// question, so both edges are kept.
+pub const RELATION_AGGREGATES: &str = "aggregates";
+
+/// `category` value of an aggregate domain page (V0.6).
+///
+/// Pinned here (rather than imported from the compiler) because storage must
+/// not depend on the compiler crate; `llm_wiki_compiler::aggregate::CATEGORY_DOMAIN`
+/// re-exports this constant, so there is still exactly one source of truth.
+pub const CATEGORY_DOMAIN: &str = "domain";
 
 /// §22 graph-expansion defaults: hybrid retrieval expands at most one hop
 /// and at most ten nodes ("防止上下文爆炸"). The query-side expansion uses
@@ -105,6 +117,7 @@ pub fn rebuild_graph(tx: &Transaction, build_id: &BuildId) -> Result<GraphStats>
     let registry_nodes = insert_registry_nodes(tx)?;
     nodes += registry_nodes.len();
     edges += insert_links_to_edges(tx, build_id)?;
+    edges += insert_aggregates_edges(tx, build_id)?;
     edges += insert_contains_edges(tx, build_id, &registry_nodes)?;
     let skipped_edges = insert_relation_edges(tx, &registry_nodes, &mut edges)?;
 
@@ -175,7 +188,9 @@ fn registry_rows(conn: &Connection) -> Result<Vec<(String, String, String)>> {
 }
 
 /// Phase 2: one node per ACTIVE `entity`/`concept` registry entry (§17 node
-/// vocabulary; claims/topics never enter). Returns the map from RAW registry
+/// vocabulary; claims/topics never enter — a `topic` fills its slot in the
+/// REGISTRY (`domain:<category>`, V0.6) and is reached through its domain
+/// page's `aggregates` edges, not as a graph node). Returns the map from RAW registry
 /// id to graph node id — a registry id carries no kind, the graph node does,
 /// and this map is what relation endpoints are resolved against.
 fn insert_registry_nodes(tx: &Transaction) -> Result<BTreeMap<String, String>> {
@@ -228,6 +243,51 @@ fn insert_links_to_edges(tx: &Transaction, build_id: &BuildId) -> Result<usize> 
                 format!("link:{link_id}"),
                 format!("page:{from_page}"),
                 RELATION_LINKS_TO,
+                format!("page:{to_page}"),
+            ])
+            .map_err(db)?;
+        inserted += 1;
+    }
+    Ok(inserted)
+}
+
+/// Phase 3.6 (V0.6): one `aggregates` edge per domain-page → member-page pair.
+///
+/// The pairs come from the ALREADY persisted `page_links` (a domain page links
+/// each of its members), restricted to rows whose source page carries the
+/// domain category — no schema change, no new node type.
+/// Returns the edges inserted.
+fn insert_aggregates_edges(tx: &Transaction, build_id: &BuildId) -> Result<usize> {
+    let mut stmt = tx
+        .prepare(
+            "SELECT l.from_page_id, l.to_page_id
+             FROM page_links l
+             JOIN wiki_pages p ON p.build_id = l.build_id AND p.page_id = l.from_page_id
+             WHERE l.build_id = ?1 AND p.category = ?2
+             ORDER BY l.from_page_id, l.to_page_id",
+        )
+        .map_err(|e| WikiError::Storage(format!("prepare graph aggregates: {e}")))?;
+    let pairs: Vec<(String, String)> = stmt
+        .query_map(params![build_id.as_str(), CATEGORY_DOMAIN], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| WikiError::Storage(format!("graph aggregates: {e}")))?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(db)?;
+    drop(stmt);
+    let mut insert_edge = tx
+        .prepare(
+            "INSERT INTO graph_edges (id, source_id, relation_type, target_id)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .map_err(|e| WikiError::Storage(format!("prepare graph aggregates insert: {e}")))?;
+    let mut inserted = 0usize;
+    for (from_page, to_page) in pairs {
+        insert_edge
+            .execute(params![
+                format!("aggregates:{from_page}:{to_page}"),
+                format!("page:{from_page}"),
+                RELATION_AGGREGATES,
                 format!("page:{to_page}"),
             ])
             .map_err(db)?;

@@ -36,6 +36,11 @@ Key properties (see `docs/llm-wiki-prd.md` for the full spec):
 - **Agent-ready** — a frozen HTTP protocol (v1) with a dependency-free
   TypeScript SDK exposes search, budgeted context retrieval and grounded
   Q&A to agents.
+- **Navigable** — a deterministic aggregation pass (V0.6) adds an overview, a
+  global index and one page per category on top of the flat page set, so a
+  wiki can be entered and drilled down (`overview → domain → page`) instead of
+  read as a pile of unrelated files. Zero LLM calls, zero schema change:
+  aggregate pages are ordinary pages carrying a reserved `category`.
 
 ## Quick start
 
@@ -203,6 +208,13 @@ source_mode = "wiki"                # retrieval corpus: "source" | "wiki" | "fus
 [build]
 incremental = true
 keep_generations = 3                # retained past generations; current always kept
+
+[aggregate]                          # V0.6 aggregation layer (overview/index/domain)
+llm_summary = false                 # opt-in: 2-5 sentence summary per domain page
+                                    # (off = the layer never calls a model)
+top_hub_pages = 10                  # overview lists the N most-cited pages
+top_concepts = 12                   # a domain page lists the N most-shared concepts
+max_summary_pages = 40              # larger domains skip the summary
 
 [server]
 bind = "127.0.0.1"
@@ -373,5 +385,6 @@ Workspace layout: `crates/` holds ten Rust crates (`core`, `source`,
 in the build fingerprint.
 
 Status: incremental build + explicit replan + CJK full-text search +
-wiki graph (V0.2), vector retrieval (V0.3), HTTP service (V0.4) and hybrid
-retrieval with rerank + the agent protocol/SDK (V0.5) are implemented.
+wiki graph (V0.2), vector retrieval (V0.3), HTTP service (V0.4), hybrid
+retrieval with rerank + the agent protocol/SDK (V0.5) and the deterministic
+aggregation layer (V0.6) are implemented.

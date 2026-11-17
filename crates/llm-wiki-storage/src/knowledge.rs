@@ -28,13 +28,19 @@ pub fn load_knowledge_base(conn: &Connection) -> Result<KnowledgeBase> {
 }
 
 /// Active registry nodes of every plannable kind, ordered by id.
+///
+/// `topic` is deliberately EXCLUDED. A topic is an aggregate organisation unit
+/// (`domain:<category>`, created by the V0.6 aggregation pass, PRD §14.2), not
+/// a fact extracted from sources. Planning must cover every node it is handed,
+/// so admitting topics would fail the plan with `MISSING_NODE_COVERAGE` — the
+/// planner has no business assigning source knowledge to a domain node.
 fn load_registry_nodes(conn: &Connection) -> Result<BTreeMap<KnowledgeNodeId, PlanNode>> {
     let mut nodes: BTreeMap<KnowledgeNodeId, PlanNode> = BTreeMap::new();
     let mut stmt = conn
         .prepare(
             "SELECT id, node_kind, canonical_key, canonical_name, entity_type, description
              FROM knowledge_registry
-             WHERE status = 'active' AND node_kind IN ('entity', 'concept', 'topic', 'claim')
+             WHERE status = 'active' AND node_kind IN ('entity', 'concept', 'claim')
              ORDER BY id",
         )
         .map_err(|e| WikiError::Storage(format!("prepare nodes: {e}")))?;

@@ -30,6 +30,11 @@ pub struct Config {
     pub search: SearchConfig,
     #[serde(default)]
     pub build: BuildConfig,
+    /// `skip_serializing_if` matters: `config_hash` is the serialized config,
+    /// so emitting a default-only section would change every existing
+    /// workspace's fingerprint and force a `REPLAN_REQUIRED` on upgrade.
+    #[serde(default, skip_serializing_if = "AggregateConfig::is_default")]
+    pub aggregate: AggregateConfig,
     #[serde(default)]
     pub server: ServerConfig,
 }
@@ -459,6 +464,65 @@ pub struct BuildConfig {
     pub keep_generations: u32,
 }
 
+/// The deterministic aggregation layer (V0.6, PRD §14.2): overview, index and
+/// one page per category.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AggregateConfig {
+    /// Ask the model for a 2-5 sentence summary on each domain page.
+    ///
+    /// OFF by default: without it the aggregation layer is fully deterministic
+    /// and costs zero LLM requests. Enabling it costs one request per domain,
+    /// cached by the usual stage cache.
+    #[serde(default)]
+    pub llm_summary: bool,
+    /// How many most-cited pages the overview lists.
+    #[serde(default = "default_top_hub_pages")]
+    pub top_hub_pages: u32,
+    /// How many key concepts a domain page lists.
+    #[serde(default = "default_top_concepts")]
+    pub top_concepts: u32,
+    /// Skip the summary for a domain with more pages than this: beyond it the
+    /// request stops being a summary prompt and starts being the whole wiki.
+    #[serde(default = "default_max_summary_pages")]
+    pub max_summary_pages: u32,
+}
+
+impl Default for AggregateConfig {
+    fn default() -> Self {
+        Self {
+            llm_summary: false,
+            top_hub_pages: default_top_hub_pages(),
+            top_concepts: default_top_concepts(),
+            max_summary_pages: default_max_summary_pages(),
+        }
+    }
+}
+
+impl AggregateConfig {
+    /// True when every field sits at its default. Used by `Config`'s
+    /// `skip_serializing_if` so adding this section alone cannot change
+    /// `config_hash` (and therefore cannot trigger `REPLAN_REQUIRED`).
+    ///
+    /// Compares against `Default::default()` rather than re-listing the fields:
+    /// a field added later is then automatically part of the comparison, which
+    /// is exactly what keeps `config_hash` stable on upgrade.
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+fn default_top_hub_pages() -> u32 {
+    10
+}
+
+fn default_top_concepts() -> u32 {
+    12
+}
+
+fn default_max_summary_pages() -> u32 {
+    40
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     #[serde(default = "default_bind")]
@@ -760,6 +824,16 @@ impl Config {
                     .into(),
             ));
         }
+        if self.aggregate.top_hub_pages < 1 || self.aggregate.top_concepts < 1 {
+            return Err(WikiError::Config(
+                "aggregate.top_hub_pages and aggregate.top_concepts must be >= 1".into(),
+            ));
+        }
+        if self.aggregate.max_summary_pages < 1 {
+            return Err(WikiError::Config(
+                "aggregate.max_summary_pages must be >= 1".into(),
+            ));
+        }
         match self.search.rerank.as_str() {
             "none" => {}
             "cohere-compatible" => {
@@ -883,6 +957,32 @@ fn overlap(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_aggregate_section_stays_out_of_the_serialized_config() {
+        // `config_hash` is the serialized config: emitting a default-only
+        // `[aggregate]` section would change every existing workspace's
+        // fingerprint and force a REPLAN_REQUIRED on upgrade.
+        let config = Config::default();
+        assert!(config.aggregate.is_default());
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(
+            !json.contains("aggregate"),
+            "a default aggregate section must not reach config_hash: {json}"
+        );
+
+        let enabled = Config {
+            aggregate: AggregateConfig {
+                llm_summary: true,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        assert!(!enabled.aggregate.is_default());
+        assert!(serde_json::to_string(&enabled)
+            .unwrap()
+            .contains("aggregate"));
+    }
 
     #[test]
     fn planning_config_defaults_and_bounds() {

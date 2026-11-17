@@ -597,7 +597,12 @@ async fn run_build_publishes_a_readable_generation() {
     // The wiki is readable at wiki_dir via current.json → generation.
     let visible = read_visible_wiki(&wiki_dir);
     assert!(!visible.is_empty());
-    let (_, content) = &visible[0];
+    // Aggregate pages (V0.6, `_agg-*`) sort first and cite nothing by design;
+    // citation expansion is a property of the COMPILED page.
+    let (_, content) = visible
+        .iter()
+        .find(|(slug, _)| !slug.starts_with("_agg-"))
+        .expect("the compiled page is published");
     assert!(content.contains("generated: true"));
     assert!(content.contains("llm-wiki:cite"), "citations are expanded");
 

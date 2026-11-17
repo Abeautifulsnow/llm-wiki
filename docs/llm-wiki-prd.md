@@ -810,6 +810,30 @@ struct WikiPagePlan {
 }
 ```
 
+### 14.2 聚合阶段（V0.6）
+
+规划产出的是**平铺**页面集合：每页只回答「这一页覆盖哪些知识节点」。V0.6 在其后增加一个**确定性**的聚合阶段，把平铺页集合组织成三层结构：
+
+```text
+overview（全景概览：域入口 + 枢纽页）
+   ↓
+domain（按 category 一域一页：页面清单 + 域内关键概念）
+   ↓
+page（规划/编译产出）
+```
+
+聚合页是**普通 wiki_pages 行**，只是 `category` 取保留值 `overview` / `index` / `domain`，因此 FTS、Wiki Graph、`/v1/pages` 与 lint 无需改动即可覆盖。
+
+约束：
+
+- **不进 WikiPlan**：聚合页由确定性算法派生，不参与 build fingerprint 与 replan plan diff。凡是「拿 plan 当输入」的环节（§19.2 增量映射、replan 的 `plan_diff`、语义 lint）都必须显式过滤它们，否则会被误判为 obsolete / retired。
+- **零 LLM**：页数、入度、域内知识节点频次都是机器事实。聚合页不产生 citation，也不承担 §15.1 的 grounding 义务（正文以清单与计数为主，避免无法引用的断言性散文）。
+- **每次重算**：内容依赖整个页集，增量构建不 carry，一律重建。
+- **身份稳定**：page id 按 slug 从上一代 generation 继承（§45：ID 分配一次，不得由名字或内容派生）。全量重建同样从当前已发布代继承，否则链接锚点每轮漂移。
+- **阶段状态**：`AGGREGATING`，位于 COMPILING 与 INDEXING 之间（§31）。
+
+聚合页的链接拓扑必须保证可导航：index 链到全部页面与概览，overview 链到全部域页与索引，域页链到其成员页。这也是消除 `orphan-page`（§36）的手段——被聚合层覆盖的页面天然获得入边。
+
 ---
 
 ## 15. Wiki Compilation
@@ -909,6 +933,7 @@ V0.x 不使用 Neo4j。
 边：
 
 - links_to
+- aggregates（V0.6：域页 → 其成员页；聚合归属，不是语义引用）
 - depends_on
 - part_of
 - uses
@@ -1551,6 +1576,8 @@ PLANNING
   ↓
 COMPILING
   ↓
+AGGREGATING
+  ↓
 INDEXING
   ↓
 COMPLETED
@@ -1607,11 +1634,20 @@ graph = true
 [build]
 incremental = true
 
+# V0.6 聚合层（§14.2）
+[aggregate]
+llm_summary = false       # 域摘要开关；关闭时聚合层完全确定性、零模型请求
+top_hub_pages = 10        # overview 列出的高引用页数
+top_concepts = 12         # 域页列出的域内共享概念数
+max_summary_pages = 40    # 超过该页数的域跳过摘要
+
 [server]
 bind = "127.0.0.1"
 remote_enabled = false
 auth_token_env = "LLM_WIKI_SERVER_TOKEN"
 ```
+
+`[aggregate]` 全部取默认值时，config 序列化会跳过该段（`skip_serializing_if`），因此 `config_hash` 与引入该段之前的版本一致——升级不会凭空触发 `REPLAN_REQUIRED`。域摘要不进 BuildFingerprint：它不改变页面身份与拓扑，改 prompt 只会让 stage cache 失效（缓存 key 含渲染后的 prompt）。
 
 配置优先级固定为 CLI 显式参数 > 环境变量（仅 secrets/部署参数）> 项目 config > 安全默认值。解析后必须输出不含 secret 的 effective config；任何会改变 BuildFingerprint 的配置都必须在 build metadata 中记录。
 
@@ -2166,6 +2202,15 @@ llm-wiki-core
 - rerank abstraction。
 - context builder/token budget。
 - retrieval eval。
+
+### V0.6 — Knowledge Aggregation
+
+- 确定性聚合层：overview / index / 每 category 一页的 domain 页（§14.2）。
+- 聚合页以保留 `category` 落成普通 `wiki_pages` 行，零表结构改动。
+- `AGGREGATING` 构建阶段与 build status（§31）。
+- 域升格为注册表节点 `NodeKind::Topic`（`canonical_key = domain:<category>`），使域成为可被合并、可被引用的一等知识单元。
+- graph 新增 `aggregates` 边（域页 → 成员页，§17）。
+- 可选 LLM 域摘要（默认关闭，需显式开启；关闭时聚合层完全确定性）。
 
 ### V1.0 — Deliverable
 

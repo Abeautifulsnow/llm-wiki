@@ -21,6 +21,25 @@ use crate::hash::sha256_hex;
 use crate::ids::{KnowledgeNodeId, SectionId, SourceId};
 use crate::model::SourceRange;
 
+/// The `category` vocabulary a page plan may use (PRD §14.2, V0.6).
+///
+/// Lives in core because two layers must agree on it: the planner validates
+/// against it (`UNKNOWN_CATEGORY`), and the aggregation layer derives exactly
+/// one domain page — plus one `topic` registry node — per value. MUST stay in
+/// sync with the enum in `prompts/wiki-planning.md`.
+///
+/// Why validation matters: a category the aggregation layer has never seen
+/// would create its `topic` AFTER planning, bump `RegistryRevision` (part of
+/// the plan cache key) and invalidate the next plan — regenerating every page
+/// id and breaking the rebuild determinism promised by §4.8.
+pub const WIKI_CATEGORIES: &[&str] = &[
+    "concepts",
+    "architecture",
+    "security",
+    "guides",
+    "reference",
+];
+
 /// One grounded citation anchor behind a claim node (PRD §12.3): where the
 /// evidence lives and how to re-verify it. Computed by application code —
 /// never taken from LLM output.

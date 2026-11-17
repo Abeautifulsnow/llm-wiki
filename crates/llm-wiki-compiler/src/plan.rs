@@ -1009,6 +1009,33 @@ fn reconcile_payload(
     serde_json::json!({ "clusters": clusters, "proposals": pages }).to_string()
 }
 
+/// Rejects a `category` outside the planner's enum (V0.6, PRD §14.2).
+///
+/// The aggregation layer derives one domain per category and registers it as a
+/// `topic` node. An unforeseen value would create that topic AFTER planning,
+/// bump `RegistryRevision` (part of the plan cache key) and invalidate the next
+/// plan — regenerating every page id, which is exactly the determinism §4.8
+/// promises. Catching it here keeps the failure inside the existing
+/// validation-after-repair loop, where the model can correct itself.
+fn validate_category(page: &RawPage, issues: &mut Vec<String>) {
+    let category = page.category.trim();
+    if category.is_empty() {
+        issues.push("EMPTY_CATEGORY: page category is empty".to_owned());
+        return;
+    }
+    if !llm_wiki_core::plan::WIKI_CATEGORIES
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(category))
+    {
+        issues.push(format!(
+            "UNKNOWN_CATEGORY: page '{}' has category '{}' (allowed: {})",
+            page.title,
+            category,
+            llm_wiki_core::plan::WIKI_CATEGORIES.join(", ")
+        ));
+    }
+}
+
 fn validate_proposals(pages: &[RawPage], allowed: &BTreeSet<String>) -> Vec<String> {
     let mut issues = Vec::new();
     if pages.is_empty() {
@@ -1019,9 +1046,7 @@ fn validate_proposals(pages: &[RawPage], allowed: &BTreeSet<String>) -> Vec<Stri
         if page.title.trim().is_empty() {
             issues.push("EMPTY_TITLE: page title is empty".to_owned());
         }
-        if page.category.trim().is_empty() {
-            issues.push("EMPTY_CATEGORY: page category is empty".to_owned());
-        }
+        validate_category(page, &mut issues);
         if page.knowledge_refs.is_empty() {
             issues.push(format!(
                 "EMPTY_REFS: page '{}' has no knowledge_refs",
@@ -1056,9 +1081,7 @@ fn validate_merged(pages: &[RawPage], proposed: &BTreeSet<String>) -> Vec<String
         if page.title.trim().is_empty() {
             issues.push("EMPTY_TITLE: page title is empty".to_owned());
         }
-        if page.category.trim().is_empty() {
-            issues.push("EMPTY_CATEGORY: page category is empty".to_owned());
-        }
+        validate_category(page, &mut issues);
         if page.purpose.trim().is_empty() {
             issues.push(format!(
                 "EMPTY_PURPOSE: page '{}' has no purpose",

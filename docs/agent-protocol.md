@@ -96,8 +96,13 @@ Request: `{"source_id": "default"}` (only the configured root; header
 ### GET /v1/jobs, GET /v1/jobs/{id}, POST /v1/jobs/{id}/cancel
 
 Job records mirror the §31 state machine (`QUEUED → RUNNING → COMPLETED |
-FAILED | CANCELLED | INTERRUPTED | REPLAN_REQUIRED`) with the live `phase`
-(SCANNING…INDEXING), `failure_code`, `retryable`.
+FAILED | CANCELLED | INTERRUPTED | REPLAN_REQUIRED`) with the live `phase`,
+`failure_code`, `retryable`.
+
+The `phase` vocabulary is **additive**: `SCANNING`, `PARSING`, `ANALYZING`,
+`PLANNING`, `COMPILING`, `AGGREGATING` (added in V0.6), `INDEXING`. Clients
+must treat an unrecognised phase as "still running" rather than an error —
+the set may grow in a minor release.
 
 ### POST /v1/search
 

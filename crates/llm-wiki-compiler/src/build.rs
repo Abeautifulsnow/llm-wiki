@@ -35,15 +35,20 @@ use llm_wiki_source::{ScanDiagnostic, ScanOutput, Scanner, SourceManifest};
 use llm_wiki_storage::{
     apply_section_matches, build_snapshot_hash, carry_source_chunks, finish_build,
     generation_stats, get_active_build_id, insert_plan_decision, latest_completed_build,
-    list_source_active_node_sections, list_sources, load_active_sections, load_generation_pages,
-    load_generation_view, load_knowledge_base, load_plan_input, mark_removed,
+    list_source_active_node_sections, list_sources, load_active_labels, load_active_sections,
+    load_generation_pages, load_generation_view, load_knowledge_base, load_plan_input, mark_removed,
     mark_stale_builds_interrupted, open, persist_generation, replace_source_chunks,
     retire_source_knowledge, start_build, update_build_status, upsert_sources_batch, BuildDraft,
-    ChunkInput, GenerationPageView, GenerationStats, PlanDecision, SourceRecord, SourceUpsert,
-    WikiPageRecord, OUTCOME_FAST_PATH, OUTCOME_LOCAL_UPDATE, OUTCOME_REPLAN_REQUIRED,
-    TRIGGER_FINGERPRINT_CHANGED, TRIGGER_STRUCTURAL_CHANGE,
+    get_or_create_batch, ChunkInput, GenerationPageView, GenerationStats, NodeDraft, NodeKind,
+    PlanDecision, SourceRecord, SourceUpsert, WikiPageRecord, OUTCOME_FAST_PATH,
+    OUTCOME_LOCAL_UPDATE, OUTCOME_REPLAN_REQUIRED, TRIGGER_FINGERPRINT_CHANGED,
+    TRIGGER_STRUCTURAL_CHANGE,
 };
 
+use crate::aggregate::{
+    aggregate_pages, dominant_language, domain_summary_requests, is_aggregate_category,
+    AggregateOptions, DomainSummaryRequest, PLANNER_CATEGORIES,
+};
 use crate::analysis::{AnalysisOutcome, AnalyzedDocument, DocumentAnalyzer};
 use crate::cache::{plan_cache_identity, CacheContext, CacheStats, LlmCache, StageCache};
 use crate::changeset::{
@@ -129,6 +134,7 @@ pub const BUILD_PHASES: &[&str] = &[
     "ANALYZING",
     "PLANNING",
     "COMPILING",
+    "AGGREGATING",
     "INDEXING",
 ];
 
@@ -546,9 +552,19 @@ fn map_incremental_or_fail(
     change_set: &ChangeSet,
     modified_ids: BTreeSet<SourceId>,
 ) -> Result<MappedIncremental> {
+    // Aggregate pages (V0.6) belong to NO plan. Feeding them to the §19.2
+    // mapping would classify them as obsolete (they never appear in a plan)
+    // and inflate `obsolete`/`carried`; they are rebuilt from scratch once the
+    // final page set is assembled.
+    let plan_pages: Vec<GenerationPageView> = prev_pages
+        .iter()
+        .filter(|page| !is_aggregate_category(&page.category))
+        .cloned()
+        .collect();
+
     let new_kb = load_knowledge_base(conn)?;
     let mapping = map_incremental_change(&MappingInput {
-        prev_pages: prev_pages.clone(),
+        prev_pages: plan_pages,
         // The PRE-analysis knowledge state: what counts as "brand-new" is
         // decided against it, never against the post-analysis base.
         prev_kb,
@@ -566,7 +582,13 @@ fn map_incremental_or_fail(
         } => {
             // Load the previous generation's pages again for the assembly
             // step (the mapping consumed the view; page data is unchanged).
-            let pages = load_generation_view(conn, prev_build_id)?;
+            // Aggregate pages are excluded here too: they must not count as
+            // survivors (that would corrupt `carried`) and must not be carried
+            // into the final set.
+            let pages: Vec<GenerationPageView> = load_generation_view(conn, prev_build_id)?
+                .into_iter()
+                .filter(|page| !is_aggregate_category(&page.category))
+                .collect();
             Ok((new_kb, recompile, updated_refs, obsolete, pages))
         }
         MappingDecision::ReplanRequired { trigger, reason } => {
@@ -634,7 +656,9 @@ async fn compile_and_publish_incremental(
     let compiled = compiler
         .compile_plan_subset(plan, new_kb, build_id, &recompile)
         .await?;
-    let llm_request_count = llm_request_count + compiled.llm_request_count;
+    // Shadowed into a mutable binding: the aggregate pass below adds its own
+    // model requests (domain summaries) to the running total.
+    let mut llm_request_count = llm_request_count + compiled.llm_request_count;
     if compiled.pages.len() != recompile.len() {
         return Err(WikiError::Compilation(format!(
             "partial compile produced {} page(s) for {} affected page(s)",
@@ -683,11 +707,23 @@ async fn compile_and_publish_incremental(
         ),
     )?;
 
+    // Aggregate ids are inherited by slug from the PREVIOUS generation. They
+    // cannot be read from `prev_pages` here: that view was already filtered
+    // down to plan pages (§19.2 would otherwise mark aggregate pages obsolete).
+    // The aggregate layer is rebuilt every build, but its identity must not
+    // drift (PRD §45 — an id is assigned once, never derived).
+    let previous_aggregate_ids: std::collections::BTreeMap<String, WikiPageId> =
+        load_generation_view(conn, prev_build_id)?
+            .into_iter()
+            .filter(|page| is_aggregate_category(&page.category))
+            .map(|page| (page.slug.clone(), page.page_id.clone()))
+            .collect();
+
     // ---- Final page set: recompiled records + carried rows copied VERBATIM
     // from the previous generation (content/body_hash/refs/citations/links;
     // the frontmatter keeps the ORIGINAL build id — never rewritten, so the
     // on-disk file is byte-identical and §36 lint stays consistent). ----
-    let new_pages = merge_compiled_and_carried(
+    let mut new_pages = merge_compiled_and_carried(
         prev_pages,
         &obsolete,
         &compiled.pages,
@@ -699,6 +735,21 @@ async fn compile_and_publish_incremental(
             "every page became obsolete; refusing to publish an empty generation".into(),
         ));
     }
+
+    // ---- Aggregate (V0.6, §14.2): recomputed from the FINAL page set, never
+    // carried — any page addition or removal invalidates a domain page's
+    // contents, so a verbatim carry would be stale by construction.
+    control.phase(conn, "AGGREGATING")?;
+    let aggregate_report = append_aggregate_pages(
+        conn,
+        build_id,
+        &mut new_pages,
+        &previous_aggregate_ids,
+        &aggregate_options(config),
+        summary_config(config, &provider, cache),
+    )
+    .await?;
+    llm_request_count += aggregate_report.llm_requests;
 
     // ---- Index + Publish (§35, unchanged contract): new immutable
     // generation, pointer swap, previous generation intact on failure.
@@ -743,6 +794,298 @@ async fn compile_and_publish_incremental(
         obsolete: obsolete.len(),
     };
     Ok((stats, llm_request_count, summary))
+}
+
+/// Appends the deterministic aggregate layer (V0.6, §14.2) to `pages`.
+///
+/// Aggregate pages (overview / per-domain / index) are recomputed from scratch
+/// on every build: their contents depend on the whole page set, so a carried
+/// copy would be stale by construction. Identity is preserved by reusing
+/// `previous_ids` (slug → page id) from the previous generation — PRD §45 keeps
+/// ids assigned-once and never derived from a name, so a page that already
+/// existed MUST keep its id and only a new one calls `WikiPageId::generate`.
+///
+/// Extra inputs for the opt-in domain summary (V0.6 Phase 3).
+pub(crate) struct SummaryConfig<'a> {
+    pub provider: &'a Arc<dyn LlmProvider>,
+    /// Already coerced to `dyn StageCache` by the caller, so the summary path
+    /// shares the pipeline's cache instance and its hit accounting.
+    pub cache: Arc<dyn StageCache>,
+    pub max_output_tokens: u32,
+    /// Domains larger than this skip the summary (the payload would stop being
+    /// a summary prompt and start being the whole wiki).
+    pub max_pages: usize,
+    /// Bounded parallelism for the per-domain requests, mirroring the
+    /// semantic-lint pass (`llm.max_concurrency`).
+    pub max_concurrency: usize,
+}
+
+/// What one aggregation pass produced.
+pub(crate) struct AggregatePassReport {
+    /// Model requests actually spent (0 on cache hits and when the summary is
+    /// disabled — the deterministic path never calls a model).
+    pub llm_requests: u32,
+}
+
+/// Aggregation tuning derived from `[aggregate]` in the config.
+fn aggregate_options(config: &Config) -> AggregateOptions {
+    AggregateOptions {
+        top_hub_pages: config.aggregate.top_hub_pages as usize,
+        top_concepts: config.aggregate.top_concepts as usize,
+        schema_version: 1,
+        summaries: std::collections::BTreeMap::new(),
+    }
+}
+
+/// Summary inputs, or `None` when the opt-in is off — the deterministic path
+/// must stay model-free, so this is the single place the switch is read.
+fn summary_config<'a>(
+    config: &Config,
+    provider: &'a Arc<dyn LlmProvider>,
+    cache: &Arc<LlmCache>,
+) -> Option<SummaryConfig<'a>> {
+    config.aggregate.llm_summary.then(|| SummaryConfig {
+        provider,
+        cache: Arc::clone(cache) as Arc<dyn StageCache>,
+        max_output_tokens: config.llm.max_output_tokens,
+        max_pages: config.aggregate.max_summary_pages as usize,
+        max_concurrency: config.llm.max_concurrency.max(1) as usize,
+    })
+}
+
+/// Returns the domains produced and the model requests spent.
+pub(crate) async fn append_aggregate_pages(
+    conn: &mut rusqlite::Connection,
+    build_id: &BuildId,
+    pages: &mut Vec<WikiPageRecord>,
+    previous_ids: &std::collections::BTreeMap<String, WikiPageId>,
+    options: &AggregateOptions,
+    summary: Option<SummaryConfig<'_>>,
+) -> Result<AggregatePassReport> {
+    // Defence in depth: the callers never pass stale aggregate pages through,
+    // but retaining them here would silently create fake categories.
+    pages.retain(|page| !is_aggregate_category(&page.category));
+
+    // V0.6: every domain becomes a `topic` registry node, so "the domain" is a
+    // first-class knowledge unit (mergeable, referenceable, revisioned) rather
+    // than a string carried by pages. `get_or_create_batch` resolves ACTIVE
+    // nodes without bumping the revision, so a rebuild with the same
+    // categories costs zero revisions — only a genuinely new domain does.
+    let mut categories: Vec<String> = pages.iter().map(|page| page.category.clone()).collect();
+    categories.sort();
+    categories.dedup();
+    let topics: std::collections::BTreeMap<String, KnowledgeNodeId> = if categories.is_empty() {
+        std::collections::BTreeMap::new()
+    } else {
+        let drafts: Vec<NodeDraft> = categories
+            .iter()
+            .map(|category| NodeDraft {
+                kind: NodeKind::Topic,
+                // Namespaced so a topic can never collide with an entity or
+                // concept that happens to normalise to the same key.
+                canonical_key: format!("domain:{category}"),
+                canonical_name: category.clone(),
+                entity_type: None,
+                description: Some(format!(
+                    "aggregate domain '{category}' (V0.6 deterministic aggregation)"
+                )),
+            })
+            .collect();
+        let ids = get_or_create_batch(conn, &drafts, Some(build_id.as_str()))?;
+        categories
+            .iter()
+            .zip(ids)
+            .map(|(category, id)| (category.clone(), id))
+            .collect()
+    };
+
+    let labels = load_active_labels(conn)?;
+    let mut outcome = aggregate_pages(pages, &labels, &topics, previous_ids, build_id, options);
+    let mut llm_requests = 0u32;
+
+    // ---- Phase 3 (opt-in): one cached summary request per domain ----
+    if let Some(summary) = summary {
+        let (summaries, calls) =
+            generate_domain_summaries(pages, &labels, options, &summary).await?;
+        llm_requests += calls;
+        if !summaries.is_empty() {
+            // Re-render with the summaries. The ids just assigned are fed back
+            // as `previous`, so the second pass reuses them instead of calling
+            // `WikiPageId::generate` again.
+            let assigned: std::collections::BTreeMap<String, WikiPageId> = outcome
+                .pages
+                .iter()
+                .map(|page| (page.slug.clone(), page.page_id.clone()))
+                .collect();
+            let mut with_summaries = options.clone();
+            with_summaries.summaries = summaries;
+            outcome = aggregate_pages(
+                pages,
+                &labels,
+                &topics,
+                &assigned,
+                build_id,
+                &with_summaries,
+            );
+        }
+    }
+
+    pages.extend(outcome.pages);
+    Ok(AggregatePassReport { llm_requests })
+}
+
+/// Asks the model for one summary paragraph per domain (V0.6 Phase 3).
+///
+/// Every request goes through the stage cache, and the cache key covers the
+/// rendered prompt — so editing `document-synthesis.md` invalidates it without
+/// touching the build fingerprint (a summary never changes page identity).
+async fn generate_domain_summaries(
+    pages: &[WikiPageRecord],
+    labels: &std::collections::BTreeMap<String, String>,
+    options: &AggregateOptions,
+    summary: &SummaryConfig<'_>,
+) -> Result<(std::collections::BTreeMap<String, String>, u32)> {
+    let language = dominant_language(pages);
+    let requests = domain_summary_requests(pages, labels, &language, options.top_concepts);
+    let mut pending: Vec<DomainSummaryRequest> = Vec::with_capacity(requests.len());
+    for request in requests {
+        if request.page_titles.len() > summary.max_pages {
+            tracing::info!(
+                domain = %request.category,
+                pages = request.page_titles.len(),
+                "domain exceeds aggregate.max_summary_pages; summary skipped"
+            );
+            continue;
+        }
+        pending.push(request);
+    }
+    if pending.is_empty() {
+        return Ok((std::collections::BTreeMap::new(), 0));
+    }
+
+    let prompt = load_prompt("document-synthesis", None)?;
+    let stage = prompt.stage_block("domain-summary")?;
+    let provider = Arc::clone(summary.provider);
+    let cache = Arc::clone(&summary.cache);
+    let max_output = summary.max_output_tokens;
+    let concurrency = summary.max_concurrency.max(1);
+
+    // Bounded-parallel, mirroring the semantic-lint pass (PRD 搂27): domains are
+    // independent, so a serial loop would stack one model latency per domain on
+    // the build's critical path for no reason.
+    let mut out: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let mut calls = 0u32;
+    let mut next = 0usize;
+    let mut join_set = tokio::task::JoinSet::new();
+    while next < pending.len() || !join_set.is_empty() {
+        while next < pending.len() && join_set.len() < concurrency {
+            let request = pending[next].clone();
+            next += 1;
+            let stage = stage.clone();
+            let provider = Arc::clone(&provider);
+            let cache = Arc::clone(&cache);
+            let language = language.clone();
+            join_set.spawn(async move {
+                summarize_domain(&provider, &cache, &stage, &language, max_output, request).await
+            });
+        }
+        if let Some(joined) = join_set.join_next().await {
+            let (category, text, added) = joined.map_err(|error| {
+                WikiError::Compilation(format!("domain summary task failed: {error}"))
+            })??;
+            calls += added;
+            if let Some(text) = text {
+                out.insert(category, text);
+            }
+        }
+    }
+    Ok((out, calls))
+}
+
+/// One domain summary request: cache-first, and never remembered unless the
+/// sanitised text survived (PRD §28 — validate, then cache).
+async fn summarize_domain(
+    provider: &Arc<dyn LlmProvider>,
+    cache: &Arc<dyn StageCache>,
+    stage: &PromptDocument,
+    language: &str,
+    max_output: u32,
+    request: DomainSummaryRequest,
+) -> Result<(String, Option<String>, u32)> {
+    let page_count = request.page_titles.len().to_string();
+    let pages_json = serde_json::to_string(&request.page_titles).unwrap_or_default();
+    let concepts_json = serde_json::to_string(&request.concepts).unwrap_or_default();
+    let rendered = stage.render(&[
+        ("LANGUAGE", language),
+        ("DOMAIN", request.title.as_str()),
+        ("PAGE_COUNT", page_count.as_str()),
+        ("PAGES", pages_json.as_str()),
+        ("CONCEPTS", concepts_json.as_str()),
+    ]);
+    let llm_request = llm_wiki_llm::LlmRequest {
+        // Pinned to the prompt name (not the stage name) so cache keys,
+        // telemetry and provider routing all agree on one task identity.
+        task_tag: "document-synthesis".to_owned(),
+        system: None,
+        prompt: rendered.replace("{{REPAIR_NOTES}}", ""),
+        temperature: 0.0,
+        max_output_tokens: max_output,
+        json_mode: false,
+    };
+    let (response, added) =
+        crate::cache::generate_cached(provider, Some(cache), llm_request.clone()).await?;
+    let text = sanitize_summary(&response.text);
+    if text.is_empty() {
+        return Ok((request.category, None, added));
+    }
+    crate::cache::remember_validated(Some(cache), &llm_request, &response);
+    Ok((request.category, Some(text), added))
+}
+
+/// Keeps a model response from turning into markdown structure: the summary is
+/// prose inside a generated page, not a document of its own.
+fn sanitize_summary(raw: &str) -> String {
+    let joined = raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    joined
+        .trim_start_matches(['#', '-', '*', '>', ' '])
+        .trim()
+        .chars()
+        .take(600)
+        .collect()
+}
+
+/// Registers the fixed domain vocabulary as `topic` registry nodes BEFORE any
+/// planning happens.
+///
+/// The plan cache key includes the registry revision (PRD §14), so a topic
+/// created *after* planning would invalidate the next build's plan and
+/// regenerate every page id — breaking the determinism §4.8 promises.
+/// Registering up front keeps the revision stable across rebuilds; the
+/// aggregation pass afterwards only *resolves* these nodes (an unforeseen
+/// category still falls back to creation there, at the cost of one bump).
+pub(crate) fn register_domain_topics(
+    conn: &mut rusqlite::Connection,
+    build_id: &BuildId,
+) -> Result<()> {
+    let drafts: Vec<NodeDraft> = PLANNER_CATEGORIES
+        .iter()
+        .map(|category| NodeDraft {
+            kind: NodeKind::Topic,
+            canonical_key: format!("domain:{category}"),
+            canonical_name: (*category).to_owned(),
+            entity_type: None,
+            description: Some(format!(
+                "aggregate domain '{category}' (V0.6 deterministic aggregation)"
+            )),
+        })
+        .collect();
+    get_or_create_batch(conn, &drafts, Some(build_id.as_str()))?;
+    Ok(())
 }
 
 /// Persists one §19.2 decision row (every judgment is recorded).
@@ -1093,6 +1436,9 @@ async fn build_full_pipeline(
     }
 
     // ---- Plan (§14). ----
+    // Domain topics are registered BEFORE planning so the registry revision
+    // (part of the plan cache key) is already final for this build.
+    register_domain_topics(conn, build_id)?;
     control.phase(conn, "PLANNING")?;
     let (base, registry_revision) = load_plan_input(conn)?;
     let planner_config = PlannerConfig {
@@ -1137,18 +1483,44 @@ async fn build_full_pipeline(
         ));
     }
 
+    // ---- Aggregate (V0.6, §14.2): deterministic overview/domain/index pages.
+    // A full rebuild still inherits aggregate ids from the currently published
+    // generation: page identity must survive a rebuild (§4.8), and plan pages
+    // keep theirs through the plan cache — the aggregate layer must match.
+    control.phase(conn, "AGGREGATING")?;
+    let mut final_pages = generation.pages;
+    let previous_aggregate_ids: std::collections::BTreeMap<String, WikiPageId> =
+        match get_active_build_id(conn)? {
+            Some(previous) => load_generation_view(conn, &previous)?
+                .into_iter()
+                .filter(|page| is_aggregate_category(&page.category))
+                .map(|page| (page.slug.clone(), page.page_id.clone()))
+                .collect(),
+            None => std::collections::BTreeMap::new(),
+        };
+    let aggregate_report = append_aggregate_pages(
+        conn,
+        build_id,
+        &mut final_pages,
+        &previous_aggregate_ids,
+        &aggregate_options(config),
+        summary_config(config, &provider, cache),
+    )
+    .await?;
+    llm_request_count += aggregate_report.llm_requests;
+
     // ---- Index (§31): machine-side generation rows in one transaction.
     // Past this point the build is in its critical section — no more cancel
     // checkpoints; the publish must complete or recover via the journal. ----
     control.phase(conn, "INDEXING")?;
-    let stats = persist_generation(conn, build_id, &generation.pages)?;
+    let stats = persist_generation(conn, build_id, &final_pages)?;
 
     // ---- Publish (§35): READY → pointer swap → COMPLETED. ----
     publish(
         conn,
         wiki_dir,
         build_id,
-        &generation.pages,
+        &final_pages,
         config.build.keep_generations,
     )?;
 
@@ -1236,6 +1608,9 @@ async fn build_incremental(
 
     // ---- Deterministic mapping attempt (§19.2 fixed order). Zero planner
     // LLM calls: the current plan's page identities are reused. ----
+    // Same reasoning as the full path: topics before any revision-sensitive
+    // step, so an incremental build does not shift the plan cache key.
+    register_domain_topics(conn, build_id)?;
     control.phase(conn, "PLANNING")?;
     let (new_kb, recompile, updated_refs, obsolete, prev_pages) = map_incremental_or_fail(
         conn,
@@ -1848,6 +2223,20 @@ pub(crate) fn warn_diagnostic(diagnostic: &ScanDiagnostic) {
 mod tests {
     use super::*;
     use llm_wiki_storage::list_plan_decisions;
+
+    #[test]
+    fn sanitize_summary_flattens_markdown_and_caps_length() {
+        assert_eq!(sanitize_summary("  Plain prose.  "), "Plain prose.");
+        // Markdown structure would corrupt a generated page body, so headings
+        // and list markers are flattened into one prose line.
+        assert_eq!(
+            sanitize_summary("# Heading\n\n- bullet one\n- bullet two"),
+            "Heading - bullet one - bullet two"
+        );
+        assert_eq!(sanitize_summary("   \n\n  "), "");
+        let long = "x".repeat(900);
+        assert_eq!(sanitize_summary(&long).chars().count(), 600);
+    }
 
     #[test]
     fn replan_required_maps_to_replan_status_and_everything_else_to_failed() {

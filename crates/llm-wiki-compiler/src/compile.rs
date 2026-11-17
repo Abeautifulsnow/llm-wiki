@@ -715,19 +715,22 @@ fn resolve_links(body: &str, title_to_id: &BTreeMap<String, WikiPageId>) -> Vec<
     records
 }
 
-struct FrontmatterInput<'a> {
-    page_id: &'a str,
-    slug: &'a str,
-    title: &'a str,
-    category: &'a str,
-    schema_version: u32,
-    language: &'a str,
-    build_id: &'a str,
-    sources: &'a [String],
+/// Inputs of one page's app-owned frontmatter. `pub(crate)` because the
+/// aggregation pass (V0.6) renders aggregate pages through the exact same
+/// contract as compiled pages — one frontmatter writer, no drift.
+pub(crate) struct FrontmatterInput<'a> {
+    pub(crate) page_id: &'a str,
+    pub(crate) slug: &'a str,
+    pub(crate) title: &'a str,
+    pub(crate) category: &'a str,
+    pub(crate) schema_version: u32,
+    pub(crate) language: &'a str,
+    pub(crate) build_id: &'a str,
+    pub(crate) sources: &'a [String],
 }
 
 /// Renders app-owned frontmatter (PRD §15.2).
-fn render_frontmatter(input: &FrontmatterInput<'_>) -> String {
+pub(crate) fn render_frontmatter(input: &FrontmatterInput<'_>) -> String {
     let mut out = String::from("---\n");
     out.push_str(&format!("schema_version: {}\n", input.schema_version));
     out.push_str("generated: true\n");

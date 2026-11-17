@@ -73,8 +73,8 @@ pub use page_id_map::{
     MAP_KIND_RETIRE, MAP_KIND_SPLIT,
 };
 pub use registry::{
-    canonical_key, current_revision, get_entry, get_or_create, get_or_create_batch, merge, resolve,
-    retire, NodeDraft, NodeKind, RegistryEntry,
+    canonical_key, current_revision, get_entry, get_or_create, get_or_create_batch,
+    load_active_labels, merge, resolve, retire, NodeDraft, NodeKind, RegistryEntry,
 };
 pub use search_index::{
     activate_build_with_search_index, active_section_hashes, clear_search_index, default_tokenizer,

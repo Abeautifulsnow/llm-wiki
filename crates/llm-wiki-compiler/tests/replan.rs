@@ -422,7 +422,13 @@ async fn executed_replan_merges_pages_under_the_dominant_predecessor_id() {
         old_pointer,
         "the merge published a new generation"
     );
-    let pages = llm_wiki_storage::load_generation_view(&conn, &new_active).unwrap();
+    // Plan pages only: the aggregate layer (V0.6) always adds overview/index
+    // and one domain page per category on top of the replanned set.
+    let pages: Vec<_> = llm_wiki_storage::load_generation_view(&conn, &new_active)
+        .unwrap()
+        .into_iter()
+        .filter(|page| !llm_wiki_compiler::is_aggregate_category(&page.category))
+        .collect();
     assert_eq!(pages.len(), 1, "two pages merged into one: {pages:?}");
     // Dominant predecessor: Beta (both beta facts unchanged → overlap 2 vs
     // Alpha's 1, since the rewritten alpha fact is a NEW node).
@@ -471,13 +477,16 @@ async fn executed_replan_splits_pages_with_fresh_ids_and_records_successors() {
         .await
         .unwrap();
     let old_conn = open(&db_path).unwrap();
-    let old_pages = llm_wiki_storage::load_generation_view(
+    let old_pages: Vec<_> = llm_wiki_storage::load_generation_view(
         &old_conn,
         &llm_wiki_storage::get_active_build_id(&old_conn)
             .unwrap()
             .unwrap(),
     )
-    .unwrap();
+    .unwrap()
+    .into_iter()
+    .filter(|page| !llm_wiki_compiler::is_aggregate_category(&page.category))
+    .collect();
     let alpha_id = old_pages[0].page_id.clone();
     assert_eq!(old_pages.len(), 1);
     drop(old_conn);
@@ -511,7 +520,11 @@ async fn executed_replan_splits_pages_with_fresh_ids_and_records_successors() {
     let new_active = llm_wiki_storage::get_active_build_id(&conn)
         .unwrap()
         .unwrap();
-    let pages = llm_wiki_storage::load_generation_view(&conn, &new_active).unwrap();
+    let pages: Vec<_> = llm_wiki_storage::load_generation_view(&conn, &new_active)
+        .unwrap()
+        .into_iter()
+        .filter(|page| !llm_wiki_compiler::is_aggregate_category(&page.category))
+        .collect();
     assert_eq!(pages.len(), 2);
     assert!(
         pages.iter().all(|page| page.page_id != alpha_id),
@@ -587,7 +600,11 @@ async fn executed_replan_keeps_modified_ids_and_carries_unchanged_pages_verbatim
     let new_active = llm_wiki_storage::get_active_build_id(&conn)
         .unwrap()
         .unwrap();
-    let pages = llm_wiki_storage::load_generation_view(&conn, &new_active).unwrap();
+    let pages: Vec<_> = llm_wiki_storage::load_generation_view(&conn, &new_active)
+        .unwrap()
+        .into_iter()
+        .filter(|page| !llm_wiki_compiler::is_aggregate_category(&page.category))
+        .collect();
     assert_eq!(pages.len(), 2);
 
     // Modified page: SAME WikiPageId, recompiled (title unchanged here, but

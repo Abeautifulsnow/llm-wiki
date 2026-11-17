@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use llm_wiki_compiler::{run_build, BuildReport};
+use llm_wiki_compiler::{is_aggregate_category, run_build, BuildReport};
 use llm_wiki_core::config::Config;
 use llm_wiki_llm::{FakeLlmProvider, LlmError, LlmProvider, LlmRequest};
 use llm_wiki_storage::{get_active_build_id, list_sources, load_generation_view, open};
@@ -97,6 +97,10 @@ fn golden_llm() -> Arc<dyn LlmProvider> {
     let handler = Arc::new(move |request: &LlmRequest| -> Result<String, LlmError> {
         let prompt = &request.prompt;
         match request.task_tag.as_str() {
+            // V0.6 Phase 3: domain summaries are plain prose, never JSON.
+            "document-synthesis" => {
+                Ok("This domain groups the fixture's compiled pages.".to_owned())
+            }
             "document-analysis" => {
                 let section_ids = json_string_values(prompt, "section_id");
                 let contents = json_string_values(prompt, "content");
@@ -241,14 +245,31 @@ async fn golden_test_data_docs_structure() {
     assert_eq!(build_id, report.build_id);
     let view = load_generation_view(&conn, &build_id).unwrap();
 
-    // Page set: the fake plans exactly one page over the corpus knowledge.
+    // Page set: the fake plans exactly one knowledge page over the corpus;
+    // the deterministic aggregate layer (V0.6) adds an overview, an index and
+    // one page per category — 3 extra pages for a single `concepts` page.
     assert_eq!(
         view.len(),
-        1,
+        4,
         "page set: {:?}",
         view.iter().map(|p| &p.title).collect::<Vec<_>>()
     );
-    let page = &view[0];
+    let aggregate_titles: Vec<&str> = view
+        .iter()
+        .filter(|page| is_aggregate_category(&page.category))
+        .map(|page| page.title.as_str())
+        .collect();
+    // `load_generation_view` orders by slug: `_agg-domain-*` < `_agg-index`
+    // < `_agg-overview`.
+    assert_eq!(
+        aggregate_titles,
+        vec!["Domain: concepts", "Index", "Overview"],
+        "aggregate layer: one domain per category plus overview and index"
+    );
+    let page = view
+        .iter()
+        .find(|page| !is_aggregate_category(&page.category))
+        .expect("the compiled page survives aggregation");
     assert_eq!(page.title, "Golden Platform");
     assert_eq!(page.slug, "golden-platform");
     assert_eq!(page.category, "concepts");
@@ -292,10 +313,15 @@ async fn golden_test_data_docs_structure() {
     assert!(claim_count >= 5, "corpus claims registered: {claim_count}");
     assert!(!page.knowledge_refs.is_empty());
 
-    // WikiLink structure: one page → no outbound links; every link row the
-    // pipeline DID create would resolve inside the generation (none here).
+    // WikiLink structure: the compiled page has no outbound links, but the
+    // aggregate layer (V0.6) reaches it from its domain page AND from the
+    // index — giving every page an inbound edge is exactly what that pass
+    // exists for.
     assert!(page.links.is_empty());
-    assert_eq!(page.inbound_links, 0);
+    assert_eq!(
+        page.inbound_links, 2,
+        "domain page + index both link the compiled page"
+    );
 
     // The published file on disk carries app-owned frontmatter and the
     // expanded citation comments (never bare LLM output).
@@ -307,11 +333,121 @@ async fn golden_test_data_docs_structure() {
         .unwrap()
         .flatten()
         .collect();
-    assert_eq!(files.len(), 1);
-    let body = std::fs::read_to_string(files[0].path()).unwrap();
+    assert_eq!(files.len(), 4, "1 compiled page + overview + index + domain");
+    let file_names: Vec<String> = files
+        .iter()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        file_names.iter().any(|name| name == "_agg-overview.md"),
+        "aggregate pages are published as ordinary markdown: {file_names:?}"
+    );
+    let compiled = files
+        .iter()
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .contains("golden-platform")
+        })
+        .expect("the compiled page file exists");
+    let body = std::fs::read_to_string(compiled.path()).unwrap();
     assert!(body.contains("generated: true"));
     assert!(body.contains("schema_version: 1"));
     assert!(body.contains("llm-wiki:cite"), "citations are expanded");
+
+    // ---- V0.6 Phase 2: the domain is a first-class `topic` registry node ----
+    let domain_page = view
+        .iter()
+        .find(|page| page.category == "domain")
+        .expect("one domain page per category");
+    let first_ref = domain_page
+        .knowledge_refs
+        .first()
+        .expect("a domain page references its own topic");
+    let ref_kind: String = conn
+        .query_row(
+            "SELECT node_kind FROM knowledge_registry WHERE id = ?1",
+            [first_ref.as_str()],
+            |row| row.get(0),
+        )
+        .expect("the leading ref is a registered node");
+    assert_eq!(
+        ref_kind, "topic",
+        "the domain leads with its topic node, then its key concepts"
+    );
+
+    // ---- V0.6 Phase 2: the graph carries `aggregates`, not just `links_to` ----
+    let aggregates_edges: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM graph_edges WHERE relation_type = 'aggregates'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("graph_edges is queryable");
+    assert_eq!(
+        aggregates_edges, 1,
+        "the single domain page aggregates its single member page"
+    );
+
+    // Domain topics are registered BEFORE planning (the plan cache key carries
+    // the registry revision), so a rebuild cannot shift them.
+    let domain_topics: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM knowledge_registry
+             WHERE node_kind = 'topic' AND status = 'active'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("knowledge_registry is queryable");
+    assert!(
+        domain_topics >= 1,
+        "the domain vocabulary is registered as topic nodes"
+    );
+}
+
+/// V0.6 Phase 3: the domain summary is opt-in, lands in the domain body and is
+/// cached like any other stage.
+#[tokio::test]
+async fn domain_summaries_are_opt_in() {
+    let workspace = workspace_for(
+        "golden-summary",
+        &repo_root().join("test-data").join("docs"),
+    );
+    let config_path = workspace.join(".llm-wiki").join("config.toml");
+    let base = std::fs::read_to_string(&config_path).unwrap();
+    std::fs::write(
+        &config_path,
+        format!("{base}\n[aggregate]\nllm_summary = true\n"),
+    )
+    .unwrap();
+    let config = Config::load(&workspace).unwrap();
+    assert!(config.aggregate.llm_summary, "the opt-in is read from config");
+
+    let report: BuildReport = run_build(&workspace, &config, golden_llm())
+        .await
+        .expect("build with summaries succeeds");
+
+    let conn = open(&workspace.join(".llm-wiki").join("state.db")).unwrap();
+    let view = load_generation_view(&conn, &report.build_id).unwrap();
+    let domain = view
+        .iter()
+        .find(|page| page.category == "domain")
+        .expect("a domain page exists");
+    let summary_at = domain
+        .content
+        .find("This domain groups")
+        .unwrap_or_else(|| panic!("the opt-in summary is in the body: {}", domain.content));
+    let pages_at = domain.content.find("## Pages").unwrap_or(usize::MAX);
+    assert!(summary_at < pages_at, "the summary precedes the page list");
+
+    // No source change: the fast path returns the published generation, so the
+    // cached summary costs zero requests.
+    let second = run_build(&workspace, &config, golden_llm()).await.unwrap();
+    assert_eq!(
+        second.llm_request_count, 0,
+        "a cached summary costs no requests"
+    );
 }
 
 /// Real-LLM E2E (PRD §54): `#[ignore]`-gated; only runs when

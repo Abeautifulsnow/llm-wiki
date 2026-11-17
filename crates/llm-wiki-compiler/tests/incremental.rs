@@ -370,7 +370,12 @@ async fn modified_source_recompiles_only_its_page_and_carries_the_rest() {
         .await
         .unwrap();
     assert!(first.incremental.is_none(), "first build is a full build");
-    assert_eq!(first.pages, 2, "runtime + security pages");
+    // 2 compiled pages + 2 domain pages (their categories differ) + overview + index.
+    assert_eq!(
+        first.pages,
+        6,
+        "runtime + security pages, plus the aggregate layer"
+    );
     let ids_first = page_ids_by_slug(&conn_of(&workspace), &first.build_id);
     let content_first = content_by_slug(&conn_of(&workspace), &first.build_id);
 
@@ -635,8 +640,17 @@ async fn deleted_source_leaves_no_ghost_claims_and_drops_the_obsolete_page() {
     let conn = conn_of(&workspace);
     // The new generation has exactly the surviving page, byte-identical.
     let view = load_generation_view(&conn, &second.build_id).unwrap();
-    assert_eq!(view.len(), 1, "the emptied page is excluded (§19.3.5)");
-    assert_eq!(view[0].slug, "runtime-platform");
+    assert_eq!(
+        view.len(),
+        4,
+        "the emptied page is excluded (§19.3.5); the survivor keeps its domain + overview + index"
+    );
+    // `load_generation_view` orders by slug, so the aggregate pages (`_agg-*`)
+    // come first — look the surviving page up instead of indexing.
+    assert!(
+        view.iter().any(|page| page.slug == "runtime-platform"),
+        "the carried page survives"
+    );
     let content_second = content_by_slug(&conn, &second.build_id);
     assert_eq!(
         content_first["runtime-platform"], content_second["runtime-platform"],
@@ -977,7 +991,11 @@ async fn restored_source_reactivates_knowledge_and_replans_for_the_lost_page() {
     let full = llm_wiki_compiler::run_build(&workspace, &config_full, incremental_llm())
         .await
         .unwrap();
-    assert_eq!(full.pages, 2, "the security page is rebuilt");
+    assert_eq!(
+        full.pages,
+        6,
+        "the security page is rebuilt, plus the aggregate layer"
+    );
     let restored_view = load_generation_view(&conn_of(&workspace), &full.build_id).unwrap();
     assert!(
         restored_view
@@ -1006,7 +1024,11 @@ async fn incremental_publish_keeps_unchanged_sources_searchable_in_source_fts() 
     let first = llm_wiki_compiler::run_build(&workspace, &config, provider.clone())
         .await
         .unwrap();
-    assert_eq!(first.pages, 2, "runtime + security pages");
+    assert_eq!(
+        first.pages,
+        6,
+        "runtime + security pages, plus the aggregate layer"
+    );
 
     // Modify ONE source (runtime.md); security.md stays byte-identical.
     seed_runtime_doc(
