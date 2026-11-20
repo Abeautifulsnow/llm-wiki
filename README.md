@@ -59,6 +59,7 @@ llm-wiki search "单点登录"           # CJK full-text search over the compile
 llm-wiki ask "认证流程是怎样的？"     # grounded answer with verified citations
 llm-wiki lint                       # broken links, stale citations, hand edits, …
 llm-wiki status                     # sources, builds, active generation
+llm-wiki browse                     # single-file read-only browser → wiki/browse.html
 llm-wiki doctor                     # config / db / publish / FTS5 availability
 llm-wiki doctor --live              # …plus a real request per configured endpoint
 ```
@@ -66,6 +67,21 @@ llm-wiki doctor --live              # …plus a real request per configured endp
 Output lives under `wiki/generations/{build_id}/*.md` with a `current.json`
 pointer — plain Markdown any LLM or agent can consume directly. All working
 state (config + SQLite `state.db`) lives under `.llm-wiki/`.
+
+### Reading the wiki
+
+`llm-wiki browse` inlines the active generation into one dependency-free HTML
+file (`wiki/browse.html`): three-level navigation (overview → domain → index),
+Markdown rendering, local full-text search, and citation anchors that jump to
+the source list under each page. Open it by double-clicking — no server, no
+network, no build step. Served over HTTP it additionally upgrades its search
+box to `/v1/search` (and falls back to the inlined copy when the API is
+unreachable).
+
+The Markdown stays the source of truth: Obsidian, Typora or a plain editor open
+`wiki/generations/{build_id}/` just as well, with `overview.md` as the entry
+point. Regenerate the browse page after each publish — it is a snapshot, not a
+live view.
 
 ### Changing model, prompt or config
 

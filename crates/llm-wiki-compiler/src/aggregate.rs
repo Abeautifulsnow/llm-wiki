@@ -64,6 +64,21 @@ pub const SLUG_OVERVIEW: &str = "_agg-overview";
 /// Slug of the global index page.
 pub const SLUG_INDEX: &str = "_agg-index";
 
+/// Reserved slug prefix of every domain page (`_agg-domain-<category>`).
+///
+/// Public because consumers outside this crate must also tell a domain page
+/// from an ordinary one — `llm-wiki browse` builds its three-level navigation
+/// from it, and a private copy would silently drift if the format changed.
+pub const DOMAIN_SLUG_PREFIX: &str = "_agg-domain-";
+
+/// The source `category` a domain page stands for, derived from its slug.
+///
+/// `None` for every other page, and for the degenerate `domain-other` slug
+/// (an empty category, which plan validation no longer permits).
+pub fn domain_category(slug: &str) -> Option<&str> {
+    slug.strip_prefix(DOMAIN_SLUG_PREFIX)
+}
+
 /// True when a page was produced by this pass rather than by the
 /// planner/compiler.
 ///
@@ -650,7 +665,7 @@ fn domain_slug(category: &str) -> String {
     if slug.is_empty() {
         format!("{CATEGORY_DOMAIN}-other")
     } else {
-        format!("_agg-{CATEGORY_DOMAIN}-{slug}")
+        format!("{DOMAIN_SLUG_PREFIX}{slug}")
     }
 }
 

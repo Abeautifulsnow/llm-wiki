@@ -2,6 +2,7 @@
 //! `llm-wiki` CLI. Per PRD §7.7 this crate only parses arguments and calls
 //! application services; all logic lives in the library crates.
 
+mod browse;
 mod output;
 
 use std::path::{Path, PathBuf};
@@ -145,6 +146,16 @@ enum Command {
         #[arg(long, default_value_t = 8080)]
         port: u16,
     },
+    /// Generate a single-file read-only browser for the published wiki.
+    ///
+    /// Inlines the active generation into one HTML file (three-level nav,
+    /// Markdown rendering, local full-text search, citation anchors), so the
+    /// wiki opens by double-clicking it — no server and no network needed.
+    Browse {
+        /// Output path (defaults to `<wiki_dir>/browse.html`).
+        #[arg(long)]
+        output: Option<String>,
+    },
 }
 
 fn main() {
@@ -201,6 +212,7 @@ fn run(command: Command, json: bool) -> Result<(), WikiError> {
         } => embed(&workspace, model.as_deref(), batch, concurrency, json),
         Command::Lint { semantic } => lint(&workspace, semantic, json),
         Command::Serve { host, port } => serve(&workspace, host, port, json),
+        Command::Browse { output } => browse::run(&workspace, output.as_deref(), json),
     }
 }
 

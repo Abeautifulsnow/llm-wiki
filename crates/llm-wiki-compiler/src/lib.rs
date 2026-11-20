@@ -25,9 +25,10 @@ pub mod vector_cache;
 pub mod vector_index;
 
 pub use aggregate::{
-    aggregate_pages, dominant_language, domain_summary_requests, is_aggregate_category,
-    AggregateOptions, AggregateOutcome, DomainSummaryRequest, CATEGORY_DOMAIN, CATEGORY_INDEX,
-    CATEGORY_OVERVIEW, PLANNER_CATEGORIES, SLUG_INDEX, SLUG_OVERVIEW,
+    aggregate_pages, dominant_language, domain_category, domain_summary_requests,
+    is_aggregate_category, AggregateOptions, AggregateOutcome, DomainSummaryRequest,
+    CATEGORY_DOMAIN, CATEGORY_INDEX, CATEGORY_OVERVIEW, DOMAIN_SLUG_PREFIX, PLANNER_CATEGORIES,
+    SLUG_INDEX, SLUG_OVERVIEW,
 };
 pub use analysis::{
     AnalysisOutcome, AnalysisSection, AnalyzedDocument, DocumentAnalyzer, VerifiedRelation,
