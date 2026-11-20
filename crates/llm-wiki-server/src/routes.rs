@@ -138,6 +138,11 @@ pub async fn status(
         let latest = latest_build(conn)?;
         let active = get_active_build_id(conn)?;
         let jobs = count_jobs_by_status(conn, JOB_STATUSES)?;
+        // Version facts (V0.6 ops guard): surfaces a workspace that an upgrade
+        // left behind, so a gateway or a cron check can find it without reading
+        // logs. `generation_stale` is the one to alert on.
+        let versions = llm_wiki_storage::check_workspace_versions(conn)?;
+        let generation_stale = versions.generation_is_stale(env!("CARGO_PKG_VERSION"));
         Ok(json!({
             "protocol_version": PROTOCOL_VERSION,
             "request_id": request_id,
@@ -150,6 +155,17 @@ pub async fn status(
             })),
             "active_build_id": active.as_ref().map(|b| b.as_str()),
             "jobs": jobs,
+            "versions": {
+                "db_schema": versions.db_schema_version,
+                "supported_schema": versions.supported_schema_version,
+                "generation_compiler": versions.generation_compiler_version,
+                // Which build contract the active generation was compiled
+                // against. Diagnostic only: a change here is handled by the
+                // build-time fingerprint guard, not by the server.
+                "generation_schema": versions.generation_schema_version,
+                "binary": env!("CARGO_PKG_VERSION"),
+                "generation_stale": generation_stale,
+            },
         }))
     })
     .await?;

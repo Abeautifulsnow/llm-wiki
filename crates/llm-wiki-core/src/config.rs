@@ -553,6 +553,20 @@ pub struct ServerConfig {
     /// a resumed backfill must target the same model as before.
     #[serde(default)]
     pub resume_embed_jobs: bool,
+    /// Refuse to start when the published generation was compiled by a
+    /// DIFFERENT binary version.
+    ///
+    /// Off by default: an upgrade leaves the previous generation in place until
+    /// the next build, so refusing to serve it would turn a routine upgrade
+    /// into an outage. A stale generation is still grounded and correct — it
+    /// just predates this binary's pipeline — so the default is a loud warning
+    /// plus `generation_stale: true` in `/v1/status`. Enable this when every
+    /// workspace must be rebuilt before it may serve again.
+    ///
+    /// A state db written by a NEWER schema is fatal regardless of this flag:
+    /// this binary cannot read its tables.
+    #[serde(default)]
+    pub strict_version_check: bool,
 }
 
 fn default_max_queued_jobs() -> u32 {
@@ -765,6 +779,7 @@ impl Default for ServerConfig {
             rate_limit_per_minute: default_rate_limit_per_minute(),
             resume_interrupted_jobs: false,
             resume_embed_jobs: false,
+            strict_version_check: false,
         }
     }
 }

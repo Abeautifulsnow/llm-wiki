@@ -91,6 +91,93 @@ pub fn validate_security(config: &Config, host: &str) -> Result<()> {
 
 /// Runs the HTTP server until Ctrl-C. Startup recovery marks QUEUED/RUNNING
 /// jobs INTERRUPTED (PRD §31: no fake RUNNING state across restarts).
+/// Startup version guard for the workspace this server owns.
+///
+/// Two questions, two severities: STRUCTURE (can this binary read the db?) is
+/// fatal, CONTENT (was the published generation compiled by this binary?) is
+/// graded by `server.strict_version_check`. Both log the concrete versions —
+/// the whole point is that this mismatch is otherwise silent: pages keep
+/// serving, just missing whatever the newer pipeline started producing.
+fn verify_workspace_versions(
+    conn: &llm_wiki_storage::Connection,
+    config: &Config,
+) -> Result<()> {
+    let versions = llm_wiki_storage::check_workspace_versions(conn)?;
+    check_db_schema(&versions)?;
+    check_generation(&versions, config)
+}
+
+/// Structural compatibility.
+///
+/// A db written by a NEWER release is fatal, and `server.strict_version_check`
+/// does not apply: migrations only move forward, so the tables this binary
+/// knows may already have been replaced — reading them would fail at the first
+/// query instead of here.
+fn check_db_schema(versions: &llm_wiki_storage::WorkspaceVersions) -> Result<()> {
+    if versions.db_is_from_the_future() {
+        tracing::error!(
+            db_schema = versions.db_schema_version,
+            supported = versions.supported_schema_version,
+            "workspace state db was written by a newer release"
+        );
+        return Err(WikiError::Storage(format!(
+            "state db schema v{} is newer than this binary supports (v{}); \
+             upgrade the binary or restore a matching backup",
+            versions.db_schema_version, versions.supported_schema_version
+        )));
+    }
+    if versions.db_is_from_the_past() {
+        tracing::info!(
+            from = versions.db_schema_version,
+            to = versions.supported_schema_version,
+            "workspace state db migrated forward"
+        );
+    }
+    Ok(())
+}
+
+/// Content freshness.
+///
+/// A generation compiled by another binary version is still grounded and
+/// correct — it just predates this pipeline — so the default is a loud warning;
+/// `server.strict_version_check` makes it fatal.
+///
+/// The comparison is a crate VERSION STRING, not a binary digest: two builds of
+/// the same version number are indistinguishable here. That is deliberate (the
+/// guard must not force a rebuild on every recompile), and it means a workspace
+/// rebuilt without a version bump will not register as stale.
+fn check_generation(
+    versions: &llm_wiki_storage::WorkspaceVersions,
+    config: &Config,
+) -> Result<()> {
+    let binary_version = env!("CARGO_PKG_VERSION");
+    if !versions.generation_is_stale(binary_version) {
+        return Ok(());
+    }
+    let compiled_by = versions
+        .generation_compiler_version
+        .as_deref()
+        .unwrap_or("<unknown>");
+    if config.server.strict_version_check {
+        tracing::error!(
+            compiled_by,
+            binary_version,
+            "published generation predates this binary and strict_version_check is on"
+        );
+        return Err(WikiError::Storage(format!(
+            "workspace generation was compiled by {compiled_by}, this binary is \
+             {binary_version}; run `llm-wiki build` first or disable \
+             server.strict_version_check"
+        )));
+    }
+    tracing::warn!(
+        compiled_by,
+        binary_version,
+        "published generation predates this binary; serving it as-is — rebuild to pick up the new pipeline"
+    );
+    Ok(())
+}
+
 pub async fn serve(options: ServeOptions) -> Result<()> {
     let body_limit = options.config.server.max_body_bytes as usize;
     let remote_enabled = options.config.server.remote_enabled;
@@ -105,6 +192,9 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
     let db_path = state.db_path();
     if db_path.exists() {
         let conn = llm_wiki_storage::open(&db_path)?;
+        // Version guard BEFORE any recovery work: a db this binary cannot read
+        // must fail here, not halfway through a job mutation.
+        verify_workspace_versions(&conn, state.config())?;
         let recovered = llm_wiki_storage::mark_stale_jobs_interrupted(&conn)?;
         if recovered > 0 {
             tracing::warn!(
@@ -214,4 +304,84 @@ pub fn build_router(state: SharedState) -> Router {
 /// Convenience for tests and embedders: a workspace's state db path.
 pub fn state_db_path(workspace: &Path) -> PathBuf {
     workspace.join(".llm-wiki").join("state.db")
+}
+
+#[cfg(test)]
+mod version_guard_tests {
+    use super::*;
+
+    #[test]
+    fn newer_schema_refuses_to_start() {
+        let conn = llm_wiki_storage::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA user_version = 999;").unwrap();
+        let error = verify_workspace_versions(&conn, &Config::default())
+            .expect_err("a state db from the future must not be served");
+        assert!(
+            error.to_string().contains("newer than this binary"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn matching_versions_start_cleanly() {
+        let conn = llm_wiki_storage::open_in_memory().unwrap();
+        verify_workspace_versions(&conn, &Config::default())
+            .expect("a fresh workspace starts cleanly");
+    }
+
+    /// One COMPLETED build compiled by `version`, activated as the generation.
+    fn workspace_with_generation(version: &str) -> llm_wiki_storage::Connection {
+        let mut conn = llm_wiki_storage::open_in_memory().unwrap();
+        let build_id = llm_wiki_storage::start_build(
+            &mut conn,
+            &llm_wiki_storage::BuildDraft {
+                source_snapshot_hash: None,
+                model: Some("fake".to_owned()),
+                prompt_version: None,
+                compiler_version: Some(version.to_owned()),
+                parser_version: None,
+                schema_version: Some("1".to_owned()),
+                config_hash: None,
+                build_fingerprint: None,
+            },
+        )
+        .unwrap();
+        llm_wiki_storage::finish_build(&mut conn, &build_id, "COMPLETED", None, None).unwrap();
+        llm_wiki_storage::activate_build(&mut conn, &build_id).unwrap();
+        conn
+    }
+
+    #[test]
+    fn stale_generation_is_fatal_only_in_strict_mode() {
+        let conn = workspace_with_generation("0.0.1");
+        let versions = llm_wiki_storage::check_workspace_versions(&conn).unwrap();
+        assert!(versions.generation_is_stale(env!("CARGO_PKG_VERSION")));
+
+        // Default: the old generation keeps serving, loudly.
+        check_generation(&versions, &Config::default())
+            .expect("a stale generation still serves by default");
+
+        // Opt-in: refuse until it is rebuilt.
+        let mut strict = Config::default();
+        strict.server.strict_version_check = true;
+        let error = check_generation(&versions, &strict)
+            .expect_err("strict mode must refuse a stale generation");
+        assert!(error.to_string().contains("0.0.1"), "{error}");
+    }
+
+    #[test]
+    fn active_pointer_to_a_missing_build_counts_as_stale() {
+        let mut conn = llm_wiki_storage::open_in_memory().unwrap();
+        // The pointer names a build whose row does not exist: unknown, so it
+        // must be reported rather than assumed current.
+        let ghost = llm_wiki_core::ids::BuildId::generate();
+        llm_wiki_storage::set_active_build(&mut conn, Some(&ghost)).unwrap();
+
+        let versions = llm_wiki_storage::check_workspace_versions(&conn).unwrap();
+        assert_eq!(
+            versions.active_build_id.as_ref().map(|id| id.as_str()),
+            Some(ghost.as_str())
+        );
+        assert!(versions.generation_is_stale(env!("CARGO_PKG_VERSION")));
+    }
 }

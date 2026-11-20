@@ -23,6 +23,7 @@ pub mod search_index;
 pub mod sections;
 pub mod sources;
 pub mod state;
+pub mod version_guard;
 pub mod wiki;
 
 pub use analysis::{
@@ -91,6 +92,7 @@ pub use state::{
     mark_stale_builds_interrupted, set_active_build, set_state, update_build_status,
     ACTIVE_BUILD_KEY, BUILD_STATUSES,
 };
+pub use version_guard::{check_workspace_versions, WorkspaceVersions};
 pub use wiki::{
     generation_page_sources, generation_stats, load_generation_page_view, load_generation_pages,
     load_generation_view, persist_generation, GenerationPageView, GenerationStats,

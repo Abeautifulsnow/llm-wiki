@@ -225,6 +225,8 @@ max_body_bytes = 1048576            # 1 MiB request cap
 rate_limit_per_minute = 120         # per-caller, remote mode only; 0 disables
 resume_interrupted_jobs = false     # re-run build jobs interrupted by a restart
                                     # (spends LLM budget on restart — enable deliberately)
+strict_version_check = false        # refuse to start when the published generation
+                                    # was compiled by another binary version
 ```
 
 Validation rules enforced before any build: `source.root` and `wiki_dir`
@@ -232,6 +234,28 @@ must not overlap (checked lexically, case-folded); `llm.model` must be set;
 `search.rerank = "cohere-compatible"` requires `[rerank] model`; numeric
 bounds (`max_concurrency ≥ 1`, `timeout_seconds > 0`, `keep_generations ≥ 1`,
 `max_cluster_nodes ≥ 2`, `max_rejected_claim_ratio` within `[0, 1]`).
+
+### Workspace version guard
+
+`llm-wiki serve` checks the workspace it is about to open, because a deployment
+that serves many workspaces (one directory each) can upgrade the binary while
+leaving some of them behind.
+
+Two different failures, two different severities:
+
+- **The state db was written by a NEWER schema** — migrations only move forward,
+  so this binary cannot read the tables it would find. Fatal, and
+  `server.strict_version_check` does **not** apply: there is nothing to serve.
+- **The published generation was compiled by a DIFFERENT binary version** — the
+  wiki is still grounded and correct, it just predates the current pipeline. The
+  default is a loud warning plus `versions.generation_stale: true` in
+  `/v1/status`; set `server.strict_version_check = true` to make it a startup
+  failure instead (then every workspace must be rebuilt before it may serve).
+
+The comparison is a crate **version string**, not a binary digest: rebuilding
+the same version number is indistinguishable, by design — otherwise every
+recompile would force a rebuild of every workspace. Bump the version when you
+want the guard to notice; that is the contract.
 
 ### Secrets
 
@@ -301,7 +325,7 @@ carry `protocol_version`, `request_id` and `x-request-id`.
 
 | Endpoint | Method | Purpose |
 |---|---|---|
-| `/v1/status` | GET | Sources, latest build, active generation, job counts. |
+| `/v1/status` | GET | Sources, latest build, active generation, job counts, and the version guard (`versions.generation_stale` flags a workspace an upgrade left behind). |
 | `/v1/build` | POST | Queue a build job (202). Honors `Idempotency-Key` (same key → same job, `replayed: true`); one build at a time; queue cap applies. |
 | `/v1/jobs` · `/v1/jobs/{id}` | GET | List (cursor-paginated, `?status=` filter) / inspect jobs. |
 | `/v1/jobs/{id}/cancel` | POST | Cooperative cancel: QUEUED cancels immediately, RUNNING stops at the next pipeline checkpoint, terminal → 409. |

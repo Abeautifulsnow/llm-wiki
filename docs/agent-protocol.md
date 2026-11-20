@@ -82,9 +82,37 @@ ACTIVE generation) and the raw **sources** (chunked original documents).
   "sources": 42,
   "latest_build": {"build_id": "bld_…", "status": "COMPLETED", "started_at": "…"},
   "active_build_id": "bld_…" | null,
-  "jobs": {"QUEUED": 0, "RUNNING": 0, "COMPLETED": 3, "...": 0}
+  "jobs": {"QUEUED": 0, "RUNNING": 0, "COMPLETED": 3, "...": 0},
+  "versions": {
+    "db_schema": 14,
+    "supported_schema": 14,
+    "generation_compiler": "0.1.0",
+    "generation_schema": "1",
+    "binary": "0.1.0",
+    "generation_stale": false
+  }
 }
 ```
+
+The `versions` object is the workspace version guard (V0.6, additive). It exists
+for deployments that serve many workspaces from one binary version: after an
+upgrade, a workspace nobody rebuilt keeps serving its old generation, and that
+mismatch is otherwise invisible.
+
+- `db_schema` vs `supported_schema`: the state db's `PRAGMA user_version` versus
+  the migration count this binary knows. `db_schema > supported_schema` means the
+  workspace was written by a NEWER release; the server refuses to start in that
+  case (`server.strict_version_check` does not apply — the tables are unreadable).
+- `generation_compiler` vs `binary`: the `compiler_version` recorded on the
+  active build versus the running binary. A difference means the published wiki
+  predates this pipeline.
+- `generation_stale`: the one to alert on. `true` when a generation is published
+  and its compiler version differs from `binary`, or when the active build row is
+  missing (unknown is reported, never assumed current).
+
+`generation_stale: true` alone never means the content is wrong — it means the
+workspace needs a rebuild to pick up the current pipeline. Set
+`server.strict_version_check = true` to turn it into a startup failure instead.
 
 ### POST /v1/build
 
