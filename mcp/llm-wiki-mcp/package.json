@@ -1,0 +1,41 @@
+{
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "^4.6.7"
+  },
+  "name": "@llm-wiki/mcp",
+  "version": "0.3.0",
+  "private": true,
+  "description": "MCP server for llm-wiki (stdio; SDK build + zero-dependency fallback)",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "llm-wiki-mcp": "./server.sdk.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.sdk.mjs",
+    "start:zero-dep": "node server.mjs",
+    "test": "node --test test/handshake.test.mjs test/sdk-cross.test.mjs test/behaviour.test.mjs"
+  },
+  "files": [
+    "server.mjs",
+    "server.sdk.mjs",
+    "lib",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Abeautifulsnow/llm-wiki.git",
+    "directory": "mcp/llm-wiki-mcp"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "llm-wiki",
+    "knowledge-base",
+    "retrieval"
+  ]
+}
